@@ -343,7 +343,7 @@ impl Transport for SimulatorTransport {
 fn simulated_status(sequence: u64) -> DeviceStatus {
     let motors = (0..6)
         .map(|index| {
-            let phase = sequence as f64 / 8.0 + index as f64 * 0.7;
+            let phase = sequence as f64 / 2.6 + index as f64 * 0.7;
             protocol::MotorData {
                 position_mm: 24.0 + phase.sin() * 7.0 + index as f64 * 0.8,
                 velocity_mm_per_sec: 8.0 + phase.cos() * 2.2,
@@ -355,7 +355,7 @@ fn simulated_status(sequence: u64) -> DeviceStatus {
 
     let sensors = (0..6)
         .map(|index| {
-            let phase = sequence as f64 / 5.0 + index as f64;
+            let phase = sequence as f64 / 1.8 + index as f64;
             protocol::SensorData {
                 x: 32.0 + phase.sin() * 3.2,
                 y: 18.0 + phase.cos() * 2.1,
@@ -369,8 +369,8 @@ fn simulated_status(sequence: u64) -> DeviceStatus {
         num_sensors: sensors.len() as u8,
         motors,
         sensors,
-        bend_angle1_deg: (sequence as f64 / 6.0).sin() * 46.8 + 15.6,
-        bend_angle2_deg: (sequence as f64 / 6.0 + 0.6).sin() * 38.4 + 12.8,
+        bend_angle1_deg: (sequence as f64 / 2.0).sin() * 46.8 + 15.6,
+        bend_angle2_deg: (sequence as f64 / 2.0 + 0.6).sin() * 38.4 + 12.8,
         system_state: 1,
     }
 }

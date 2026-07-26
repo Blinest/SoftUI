@@ -64,7 +64,8 @@ impl LiveDataRing {
 
     pub(crate) fn window(&self, count: usize) -> Vec<DeviceSnapshot> {
         let count = count.min(self.buffer.len());
-        self.buffer.iter().rev().take(count).cloned().collect()
+        let start = self.buffer.len().saturating_sub(count);
+        self.buffer.iter().skip(start).cloned().collect()
     }
 
     pub(crate) fn stats(&self) -> FrameStats {

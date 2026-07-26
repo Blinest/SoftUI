@@ -392,6 +392,7 @@ export interface RuntimeSnapshot {
   };
   charts: {
     windowSize: number;
+    timestamps: number[];
     channels: Array<{
       name: string;
       unit: string;

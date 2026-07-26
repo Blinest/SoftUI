@@ -328,6 +328,7 @@ struct LiveSection {
 #[serde(rename_all = "camelCase")]
 struct ChartSection {
     window_size: usize,
+    timestamps: Vec<f64>,
     channels: Vec<ChartChannel>,
 }
 
@@ -507,19 +508,44 @@ fn adapt_bend(angle_deg: f64, direction: &str, seq: u64) -> BendState {
 }
 
 fn make_frame(seq: u64, connected: bool) -> DeviceSnapshot {
+    if !connected {
+        // 未连接时直接生成最小帧，跳过模拟器 handshake
+        let motors = (0..6)
+            .map(|i| adapt_motor((i + 1) as u32, &protocol::MotorData {
+                position_mm: 0.0, velocity_mm_per_sec: 0.0,
+                acceleration_mm_per_sec2: 0.0, status: 0,
+            }))
+            .collect::<Vec<_>>();
+        let sensors = (0..6)
+            .map(|i| adapt_sensor((i + 1) as u32, &protocol::SensorData { x: 0.0, y: 0.0, z: 0.0 }, seq))
+            .collect::<Vec<_>>();
+        return DeviceSnapshot {
+            device_id: "softui-sim-01".to_string(),
+            connection_id: "conn-01".to_string(),
+            received_at_ms: now_ms(),
+            sequence: seq,
+            protocol_version: "Legacy V1".to_string(),
+            system_enabled: false,
+            motors,
+            sensors,
+            bend: BendSnapshot {
+                section1: adapt_bend(0.0, "up", seq),
+                section2: adapt_bend(0.0, "right", seq),
+            },
+            quality: FrameStatus {
+                status: FrameQuality::Warning,
+                latency_ms: 52,
+                dropped_frames: seq / 240,
+                checksum_ok: true,
+            },
+        };
+    }
     let simulator = transport::SimulatorTransport::with_seed(seq).expect("simulator should start");
     let mut runtime = device::DeviceRuntime::new(simulator);
-    let mut status = runtime
+    let status = runtime
         .handshake()
         .expect("simulated runtime should handshake");
-    if !connected {
-        status.system_state = 0;
-    }
-    let quality = if connected {
-        FrameQuality::Ok
-    } else {
-        FrameQuality::Warning
-    };
+    let quality = FrameQuality::Ok;
     let motors = status
         .motors
         .iter()
@@ -547,7 +573,7 @@ fn make_frame(seq: u64, connected: bool) -> DeviceSnapshot {
         },
         quality: FrameStatus {
             status: quality,
-            latency_ms: if connected { 18 } else { 52 },
+            latency_ms: 18,
             dropped_frames: seq / 240,
             checksum_ok: true,
         },
@@ -667,6 +693,7 @@ fn make_charts(seq: u64) -> ChartSection {
 
     ChartSection {
         window_size: 120,
+        timestamps: (0..120).map(|i| (i as f64 - 119.0) * 0.05).collect(),
         channels,
     }
 }
@@ -677,6 +704,10 @@ fn make_charts_from_motors(frames: &[DeviceSnapshot]) -> ChartSection {
     }
     let motor_count = frames[0].motors.len();
     let sensor_count = frames[0].sensors.len();
+    let timestamps: Vec<f64> = frames
+        .iter()
+        .map(|frame| frame.received_at_ms as f64 / 1000.0)
+        .collect();
     let mut channels: Vec<ChartChannel> = Vec::new();
 
     // Motor position channels
@@ -792,6 +823,7 @@ fn make_charts_from_motors(frames: &[DeviceSnapshot]) -> ChartSection {
 
     ChartSection {
         window_size: channels.first().map(|c| c.points.len()).unwrap_or(0),
+        timestamps,
         channels,
     }
 }
@@ -1121,7 +1153,7 @@ impl AppState {
             store: RuntimeStore::load(path),
             profile_store: profiles::ProfileStore::load(profile_path),
             devices,
-            live_ring: Arc::new(Mutex::new(live::LiveDataRing::new(6_000))),
+            live_ring: Arc::new(Mutex::new(live::LiveDataRing::new(600))),
             recorder: Arc::new(Mutex::new(session::SessionRecorder::new(session_dir))),
             playback: Arc::new(Mutex::new(playback::PlaybackEngine::new())),
             control_runtime: Arc::new(Mutex::new(control::ControlRuntime::default())),
@@ -1159,7 +1191,7 @@ impl AppState {
                     snapshot.connection.state = ConnectionState::Ready;
 
                     // Build chart data from playback frame window
-                    let window = pb.frame_window(120);
+                    let window = pb.frame_window(80);
                     if !window.is_empty() {
                         let owned: Vec<DeviceSnapshot> = window.into_iter().cloned().collect();
                         snapshot.charts = make_charts_from_motors(&owned);
@@ -1176,7 +1208,7 @@ impl AppState {
             let live_frames = ring.latest_per_device();
             overlay_live_frames(&mut snapshot, &live_frames);
 
-            let chart_frames = ring.window(120);
+            let chart_frames = ring.window(80);
             if !chart_frames.is_empty() {
                 snapshot.charts = make_charts_from_motors(&chart_frames);
             }

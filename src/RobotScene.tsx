@@ -1,181 +1,163 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { updateSegmentedBoneChain } from "./robot/kinematics";
+import type { SegmentBendRad } from "./robot/kinematics";
+import { createCableVisuals } from "./robot/cables";
+import { createSlottedSkinnedArm } from "./robot/skinnedArm";
+
+const LENGTH_MM = 404.8927;
+const RADIUS_MM = 8.31;
+const BONE_COUNT = 32;
+
+export type BendDirection = "up" | "right" | "down" | "left";
+const DIR_DEG: Record<BendDirection, number> = {
+  up: 0,
+  right: 90,
+  down: 180,
+  left: 270,
+};
 
 interface RobotSceneProps {
   section1AngleDeg: number;
   section2AngleDeg: number;
+  section1Direction?: BendDirection;
+  section2Direction?: BendDirection;
+  showCables?: boolean;
+  showSkeleton?: boolean;
+  animateIdle?: boolean;
 }
 
-function createSegment(
-  group: THREE.Group,
-  length: number,
-  radiusTop: number,
-  radiusBottom: number,
-  material: THREE.Material,
-  bendZ = 0,
-  bendX = 0,
-) {
-  const joint = new THREE.Group();
-  joint.rotation.z = bendZ;
-  joint.rotation.x = bendX;
-  group.add(joint);
-
-  const segment = new THREE.Mesh(new THREE.CylinderGeometry(radiusTop, radiusBottom, length, 24, 1, false), material);
-  segment.position.y = length / 2;
-  joint.add(segment);
-
-  const tip = new THREE.Mesh(new THREE.SphereGeometry(radiusTop * 0.95, 18, 18), material);
-  tip.position.y = length;
-  joint.add(tip);
-
-  return joint;
-}
-
-export default function RobotScene({ section1AngleDeg, section2AngleDeg }: RobotSceneProps) {
+export default function RobotScene({
+  section1AngleDeg,
+  section2AngleDeg,
+  section1Direction = "up",
+  section2Direction = "up",
+  showCables = true,
+  showSkeleton = false,
+  animateIdle = true,
+}: RobotSceneProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const propsRef = useRef({ section1AngleDeg, section2AngleDeg, section1Direction, section2Direction, animateIdle });
+  propsRef.current = { section1AngleDeg, section2AngleDeg, section1Direction, section2Direction, animateIdle };
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host) {
-      return undefined;
-    }
+    if (!host) return;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0f141b);
-    scene.fog = new THREE.Fog(0x0f141b, 4, 10);
-
-    const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
-    camera.position.set(2.8, 1.9, 4.2);
-    camera.lookAt(0, 0.9, 0);
-
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setPixelRatio(window.devicePixelRatio || 1);
-    renderer.setSize(host.clientWidth, host.clientHeight, false);
+    scene.background = new THREE.Color(0x0d1117);
+    const camera = new THREE.PerspectiveCamera(36, host.clientWidth / host.clientHeight, 0.1, 1800);
+    camera.position.set(200, 280, 420);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(host.clientWidth, host.clientHeight);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-    host.replaceChildren(renderer.domElement);
+    host.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 190, 0);
     controls.enableDamping = true;
-    controls.target.set(0, 0.8, 0);
-    controls.minDistance = 2.2;
-    controls.maxDistance = 8;
-    controls.maxPolarAngle = Math.PI / 2.05;
+    controls.maxDistance = 900;
 
-    const ambient = new THREE.AmbientLight(0xdde7f4, 1.5);
-    scene.add(ambient);
-
-    const keyLight = new THREE.DirectionalLight(0x88c8ff, 2.4);
-    keyLight.position.set(3, 4.4, 3.2);
+    scene.add(new THREE.HemisphereLight(0xd9ecff, 0x1d2530, 2.1));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.8);
+    keyLight.position.set(160, 300, 220);
     scene.add(keyLight);
 
-    const fillLight = new THREE.DirectionalLight(0x69f0ae, 0.95);
-    fillLight.position.set(-2, 2.6, 1);
-    scene.add(fillLight);
-
-    const grid = new THREE.GridHelper(8, 16, 0x344251, 0x24303d);
-    grid.position.y = -0.01;
+    const grid = new THREE.GridHelper(220, 22, 0x2d3642, 0x1b232e);
     scene.add(grid);
 
-    const baseMaterial = new THREE.MeshStandardMaterial({
-      color: 0x60758f,
-      metalness: 0.14,
-      roughness: 0.48,
+    const arm = createSlottedSkinnedArm({
+      lengthMm: LENGTH_MM,
+      radiusMm: RADIUS_MM,
+      radialSegments: 72,
+      axialSegments: 220,
+      slotPitchMm: 24.2,
+      slotDuty: 0.42,
+      boneCount: BONE_COUNT,
     });
+    scene.add(arm.mesh, arm.skeletonHelper);
+    arm.skeletonHelper.visible = showSkeleton;
 
-    const accentMaterial = new THREE.MeshStandardMaterial({
-      color: 0x86c8ff,
-      metalness: 0.08,
-      roughness: 0.28,
-      emissive: 0x102539,
+    const cables = createCableVisuals(LENGTH_MM, 0.42);
+    cables.group.visible = showCables;
+    scene.add(cables.group);
+
+    let currentSegments: [SegmentBendRad, SegmentBendRad] = [
+      { angleRad: 0, directionRad: 0 },
+      { angleRad: 0, directionRad: 0 },
+    ];
+    let lastTime = performance.now();
+    let animFrameId = 0;
+
+    const resizeObserver = new ResizeObserver(() => {
+      const w = host.clientWidth;
+      const h = host.clientHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
     });
+    resizeObserver.observe(host);
 
-    const root = new THREE.Group();
-    root.position.set(0, -0.1, 0);
-    scene.add(root);
+    const animate = () => {
+      animFrameId = requestAnimationFrame(animate);
+      const now = performance.now();
+      const dt = Math.min(0.05, (now - lastTime) / 1000);
+      lastTime = now;
 
-    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.5, 0.28, 28), baseMaterial);
-    base.position.y = 0.14;
-    root.add(base);
+      // Smooth target bend angles — read fresh props via ref
+      const p = propsRef.current;
+      const s1dir = DIR_DEG[p.section1Direction] * (Math.PI / 180);
+      const s2dir = DIR_DEG[p.section2Direction] * (Math.PI / 180);
+      const s1angle = THREE.MathUtils.degToRad(
+        THREE.MathUtils.clamp(p.section1AngleDeg, -85, 85),
+      );
+      const s2angle = THREE.MathUtils.degToRad(
+        THREE.MathUtils.clamp(p.section2AngleDeg, -85, 85),
+      );
 
-    const stage = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.28, 0.12, 24), accentMaterial);
-    stage.position.y = 0.36;
-    root.add(stage);
+      const smoothing = 0.2;
+      const lambda = THREE.MathUtils.lerp(22, 3, smoothing);
+      currentSegments = [
+        {
+          angleRad: THREE.MathUtils.damp(currentSegments[0].angleRad, s1angle, lambda, dt),
+          directionRad: THREE.MathUtils.damp(currentSegments[0].directionRad, s1dir, lambda, dt),
+        },
+        {
+          angleRad: THREE.MathUtils.damp(currentSegments[1].angleRad, s2angle, lambda, dt),
+          directionRad: THREE.MathUtils.damp(currentSegments[1].directionRad, s2dir, lambda, dt),
+        },
+      ];
 
-    const section1 = new THREE.Group();
-    section1.position.set(0, 0.44, 0);
-    root.add(section1);
-    createSegment(section1, 1.35, 0.2, 0.26, baseMaterial, THREE.MathUtils.degToRad(section1AngleDeg * 0.6), 0);
+      updateSegmentedBoneChain(arm.bones, LENGTH_MM, currentSegments, "constant");
+      cables.updateSegments(currentSegments, 6.45, true);
 
-    const section1Overlay = new THREE.Mesh(new THREE.TorusGeometry(0.34, 0.03, 12, 36), accentMaterial);
-    section1Overlay.position.set(0, 1.02, 0);
-    section1Overlay.rotation.x = Math.PI / 2;
-    section1.add(section1Overlay);
+      // Gentle idle sway when angles are small
+      if (p.animateIdle && Math.abs(p.section1AngleDeg) < 2 && Math.abs(p.section2AngleDeg) < 2) {
+        const sway = Math.sin(now * 0.001) * 0.02;
+        arm.mesh.rotation.z = sway;
+        arm.mesh.rotation.x = Math.sin(now * 0.0007 + 1) * 0.015;
+      } else {
+        arm.mesh.rotation.z = 0;
+        arm.mesh.rotation.x = 0;
+      }
 
-    const section2 = new THREE.Group();
-    section2.position.set(0, 1.76, 0);
-    root.add(section2);
-    createSegment(section2, 1.08, 0.16, 0.2, accentMaterial, THREE.MathUtils.degToRad(section2AngleDeg * 0.65), 0);
-
-    const endEffector = new THREE.Mesh(new THREE.SphereGeometry(0.12, 20, 20), new THREE.MeshStandardMaterial({
-      color: 0xdbe5ef,
-      metalness: 0.06,
-      roughness: 0.42,
-    }));
-    endEffector.position.set(0, 2.88, 0);
-    root.add(endEffector);
-
-    const targetRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.42, 0.03, 12, 36),
-      new THREE.MeshStandardMaterial({ color: 0x42c97a, emissive: 0x0d2419, roughness: 0.2 }),
-    );
-    targetRing.position.set(0.45, 2.18, 0);
-    targetRing.rotation.x = Math.PI / 2;
-    root.add(targetRing);
-
-    const secondaryRing = new THREE.Mesh(
-      new THREE.TorusGeometry(0.34, 0.025, 12, 36),
-      new THREE.MeshStandardMaterial({ color: 0xffb020, emissive: 0x231506, roughness: 0.26 }),
-    );
-    secondaryRing.position.set(-0.25, 1.24, 0);
-    secondaryRing.rotation.x = Math.PI / 2;
-    root.add(secondaryRing);
-
-    const clock = new THREE.Clock();
-    let animationFrame = 0;
-
-    const render = () => {
-      const elapsed = clock.getElapsedTime();
-      root.rotation.y = Math.sin(elapsed * 0.25) * 0.12;
-      root.position.y = Math.sin(elapsed * 0.9) * 0.02;
-      root.rotation.x = Math.sin(elapsed * 0.18) * 0.03;
       controls.update();
       renderer.render(scene, camera);
-      animationFrame = window.requestAnimationFrame(render);
     };
-
-    const resize = () => {
-      const width = host.clientWidth;
-      const height = host.clientHeight;
-      camera.aspect = width / Math.max(height, 1);
-      camera.updateProjectionMatrix();
-      renderer.setSize(width, height, false);
-      renderer.render(scene, camera);
-    };
-
-    const observer = new ResizeObserver(resize);
-    observer.observe(host);
-    resize();
-    render();
+    animate();
 
     return () => {
-      window.cancelAnimationFrame(animationFrame);
-      observer.disconnect();
+      cancelAnimationFrame(animFrameId);
+      resizeObserver.disconnect();
       controls.dispose();
+      cables.dispose();
+      arm.dispose();
       renderer.dispose();
-      host.replaceChildren();
+      host.removeChild(renderer.domElement);
     };
-  }, [section1AngleDeg, section2AngleDeg]);
+  }, []);
 
   return <div className="robot-scene" ref={hostRef} />;
 }
