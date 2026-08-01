@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { Database, Download, PauseCircle, Play, RefreshCw } from "lucide-react";
-import type { DeviceSnapshot, RuntimeSnapshot, SessionInfo } from "./softuiTypes";
+import type { ChartSection, DeviceSnapshot, RuntimeSnapshot, SessionInfo } from "./softuiTypes";
 
 type ChartKind = "position" | "velocity" | "acceleration" | "bend" | "sensorX" | "sensorY" | "sensorZ";
 
@@ -38,12 +38,12 @@ function downsampleFrames(frames: DeviceSnapshot[], maxPoints: number) {
   return frames.filter((_, index) => index % step === 0);
 }
 
-function chartsFromFrames(frames: DeviceSnapshot[]): RuntimeSnapshot["charts"] | null {
+function chartsFromFrames(frames: DeviceSnapshot[]): ChartSection | null {
   const ordered = downsampleFrames(frames, MAX_RENDER_POINTS);
   const first = ordered[0];
   if (!first) return null;
   const timestamps = ordered.map((frame) => frame.receivedAtMs / 1000);
-  const channels: RuntimeSnapshot["charts"]["channels"] = [];
+  const channels: ChartSection["channels"] = [];
 
   for (const motor of first.motors) {
     channels.push({ name: `Motor ${motor.id} pos`, unit: "mm", channelType: "motor", channelIndex: motor.id, points: ordered.map((frame) => frame.motors.find((item) => item.id === motor.id)?.positionMm ?? 0) });
@@ -63,10 +63,14 @@ function chartsFromFrames(frames: DeviceSnapshot[]): RuntimeSnapshot["charts"] |
   return { windowSize: ordered.length, timestamps, channels };
 }
 
-function fallbackTimestamps(charts: RuntimeSnapshot["charts"]) {
+function fallbackTimestamps(charts: ChartSection) {
   if (charts.timestamps?.length) return charts.timestamps;
   const len = charts.channels[0]?.points.length ?? 0;
   return Array.from({ length: len }, (_, index) => Number(((index - Math.max(len - 1, 0)) * 0.05).toFixed(2)));
+}
+
+function emptyCharts(): ChartSection {
+  return { windowSize: 0, timestamps: [], channels: [] };
 }
 
 function formatValue(value: number | null, unit: string) {
@@ -87,16 +91,16 @@ function formatStatus(error: string, exportPath: string, playbackMode: boolean, 
   return "实时刷新中";
 }
 
-function channelSignature(channels: RuntimeSnapshot["charts"]["channels"]) {
+function channelSignature(channels: ChartSection["channels"]) {
   return channels.map((channel) => channel.name).join("|");
 }
 
-function latestDataKey(timestamps: number[], channels: RuntimeSnapshot["charts"]["channels"]) {
+function latestDataKey(timestamps: number[], channels: ChartSection["channels"]) {
   const lastTime = timestamps[timestamps.length - 1] ?? 0;
   return `${timestamps.length}:${lastTime}:${channels.map((channel) => `${channel.points.length}:${channel.points[channel.points.length - 1] ?? 0}`).join("|")}`;
 }
 
-function axisRanges(timestamps: number[], channels: RuntimeSnapshot["charts"]["channels"]) {
+function axisRanges(timestamps: number[], channels: ChartSection["channels"]) {
   const xMin = timestamps[0] ?? 0;
   const xMax = timestamps[timestamps.length - 1] ?? 1;
   const values = channels.flatMap((channel) => channel.points).filter(Number.isFinite);
@@ -113,7 +117,7 @@ function axisRanges(timestamps: number[], channels: RuntimeSnapshot["charts"]["c
   return { x: { min: xMin, max: xMax > xMin ? xMax : xMin + 1 }, y: { min: yMin, max: yMax } };
 }
 
-function ChartPanel({ config, charts, paused, timeOrigin }: { config: ChartPanelConfig; charts: RuntimeSnapshot["charts"]; paused: boolean; timeOrigin: number }) {
+function ChartPanel({ config, charts, paused, timeOrigin }: { config: ChartPanelConfig; charts: ChartSection; paused: boolean; timeOrigin: number }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
   const lastKeyRef = useRef("");
@@ -243,17 +247,44 @@ function ChartPanel({ config, charts, paused, timeOrigin }: { config: ChartPanel
   );
 }
 
-export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) {
+export default function ChartsPage({ snapshot: _snapshot }: { snapshot: RuntimeSnapshot }) {
   const [paused, setPaused] = useState(false);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("live");
   const [historyFrames, setHistoryFrames] = useState<DeviceSnapshot[]>([]);
+  const [liveFrames, setLiveFrames] = useState<DeviceSnapshot[]>([]);
   const [exportPath, setExportPath] = useState("");
   const [chartError, setChartError] = useState("");
   const [timeOrigin, setTimeOrigin] = useState<number | null>(null);
+  const liveCharts = useMemo(() => chartsFromFrames(liveFrames), [liveFrames]);
   const historyCharts = useMemo(() => chartsFromFrames(historyFrames), [historyFrames]);
-  const activeCharts = selectedSessionId === "live" ? snapshot.charts : historyCharts ?? snapshot.charts;
+  const activeCharts: ChartSection = selectedSessionId === "live" ? liveCharts ?? emptyCharts() : historyCharts ?? emptyCharts();
   const playbackMode = selectedSessionId !== "live";
+
+  // 实时模式：独立高频拉取曲线窗口（100ms），不再依赖整份快照的 charts 字段。
+  useEffect(() => {
+    if (selectedSessionId !== "live" || paused) return;
+    let cancelled = false;
+    let pending = false;
+    const fetchWindow = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const frames = await invoke<DeviceSnapshot[]>("fetch_live_window", { count: 240 });
+        if (!cancelled) setLiveFrames(frames);
+      } catch (error) {
+        if (!cancelled) setChartError(error instanceof Error ? error.message : String(error));
+      } finally {
+        pending = false;
+      }
+    };
+    void fetchWindow();
+    const timer = window.setInterval(fetchWindow, 100);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [paused, selectedSessionId]);
 
   useEffect(() => {
     void invoke<SessionInfo[]>("list_sessions").then(setSessions).catch(() => setSessions([]));

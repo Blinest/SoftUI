@@ -50,6 +50,7 @@ import type {
   LogLevel,
   LegacyMigrationPreview,
   LegacyMigrationReport,
+  LiveLatest,
   PageKey,
   PlaybackStatus,
   RecorderStatus,
@@ -219,8 +220,7 @@ function makeFallbackSnapshot(): RuntimeSnapshot {
       activeProfile: "sim-default",
       lastError: null,
     },
-    live: { selectedDeviceId: "", frames: [] },
-    charts: { windowSize: 0, timestamps: [], channels: [] },
+    live: { selectedDeviceId: "", latest: null },
     model: {
       id: "default-continuum",
       name: "Default continuum robot",
@@ -483,7 +483,7 @@ function WorkspacePage({
   const [sensorThreshold, setSensorThreshold] = useState(10);
   const [commandStatus, setCommandStatus] = useState<{ tone: "ok" | "warn" | "error"; message: string } | null>(null);
 
-  const latestFrame = snapshot.live.frames[0];
+  const latestFrame = snapshot.live.latest;
   const motors = latestFrame?.motors ?? [];
   const sensors = latestFrame?.sensors ?? [];
   const selectedSensor = sensors.find((sensor) => sensor.id === sensorDraft.sensorId) ?? sensors[0];
@@ -863,20 +863,51 @@ function AppShell() {
   // 串口枚举较慢（Windows 可能 2-5 秒），仅保留手动刷新，首次不自动枚举
   // 用户点击"扫描串口"时触发 refreshSerialPorts
 
-  // 曲线页高频刷新，其他页面低频刷新；pending 防止请求堆积
+  // 轻量实时更新：非曲线页高频拉取最新帧 + 统计，只更新 live/dashboard 字段，
+  // 避免整份快照往返与全树重渲染。
+  const fetchLiveLatest = useCallback(async () => {
+    try {
+      const next = await invoke<LiveLatest>("fetch_live_latest");
+      setSnapshot((prev) => ({
+        ...prev,
+        live: { selectedDeviceId: next.selectedDeviceId, latest: next.latest },
+        dashboard: {
+          ...prev.dashboard,
+          sampleRateHz: Math.round(next.stats.frameRateHz),
+          frameRateHz: Math.round(next.stats.frameRateHz),
+        },
+        runtimeDiagnostics: {
+          ...prev.runtimeDiagnostics,
+          storedFrames: next.stats.storedFrames,
+          liveCapacity: next.stats.capacity,
+          totalFrames: next.stats.totalFrames,
+          droppedFrames: next.stats.droppedFrames,
+          frameRateHz: next.stats.frameRateHz,
+        },
+        connection:
+          next.latest != null
+            ? { ...prev.connection, state: "ready", activeProfileName: "Serial runtime", lastMessage: "Serial stream active" }
+            : prev.connection,
+      }));
+    } catch (invokeError) {
+      console.error(invokeError);
+    }
+  }, []);
+
+  // 轻量实时更新：各页面统一 500ms 拉取最新帧 + 统计。
+  // 曲线页的高频曲线数据由 ChartsPage 独立调用 fetch_live_window(100ms) 获取。
   useEffect(() => {
     if (!authenticated) return;
     let pending = false;
-    const intervalMs = currentPage === "Charts" ? 100 : 3000;
     const timer = window.setInterval(() => {
       if (pending) return;
       pending = true;
-      void fetchSnapshot("tick_snapshot").finally(() => {
+      void fetchLiveLatest().finally(() => {
         pending = false;
       });
-    }, intervalMs);
+    }, 500);
     return () => window.clearInterval(timer);
-  }, [currentPage, fetchSnapshot, authenticated]);
+  }, [fetchLiveLatest, authenticated]);
 
   // Poll connected devices list
   const refreshConnectedDevices = useCallback(async () => {
@@ -1299,6 +1330,35 @@ function AppShell() {
     }
   }, [snapshot.calibration.targetAngles, snapshot.live.selectedDeviceId]);
 
+  // 懒加载页面预取：挂载后在空闲时间提前加载各页面 chunk，
+  // 避免首次点击侧边栏时阻塞在动态 import 解析上。
+  useEffect(() => {
+    let cancelled = false;
+    const prefetch = () => {
+      if (cancelled) return;
+      void import("./charts");
+      void import("./pages/SessionsPage");
+      void import("./RobotScene");
+      void import("./PCCCharts");
+    };
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout?: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (idleWindow.requestIdleCallback) {
+      const idle = idleWindow.requestIdleCallback(prefetch, { timeout: 2000 });
+      return () => {
+        cancelled = true;
+        idleWindow.cancelIdleCallback?.(idle);
+      };
+    }
+    const timer = window.setTimeout(prefetch, 500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
   if (!snapshot.authSession.authenticated || snapshot.authSession.mustChangePassword) {
     return (
       <LoginPage
@@ -1434,7 +1494,7 @@ function AppShell() {
 }
 
 function DashboardPage({ snapshot }: { snapshot: RuntimeSnapshot }) {
-  const latestFrame = snapshot.live.frames[0];
+  const latestFrame = snapshot.live.latest;
   const motors = latestFrame?.motors ?? [];
   return (
     <div className="page-grid dashboard-grid">

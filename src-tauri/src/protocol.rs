@@ -217,7 +217,7 @@ pub fn encode_status_frame(status: &DeviceStatus) -> Result<Vec<u8>, ProtocolErr
         return Err(ProtocolError::InvalidLength);
     }
 
-    let total_len = 1 + 1 + status.motors.len() * 7 + status.sensors.len() * 12 + 2 + 2 + 1;
+    let total_len = 1 + 1 + status.motors.len() * 7 + status.sensors.len() * 6 + 2 + 2 + 1;
     let total_len = u8::try_from(total_len).map_err(|_| ProtocolError::InvalidLength)?;
     let mut frame = Vec::with_capacity(total_len as usize + 4);
     frame.extend_from_slice(&[0xBB, 0x02, total_len, status.num_motors, status.num_sensors]);
@@ -232,9 +232,9 @@ pub fn encode_status_frame(status: &DeviceStatus) -> Result<Vec<u8>, ProtocolErr
     }
 
     for sensor in &status.sensors {
-        frame.extend_from_slice(&raw_i32(sensor.x, "sensor_x")?.to_be_bytes());
-        frame.extend_from_slice(&raw_i32(sensor.y, "sensor_y")?.to_be_bytes());
-        frame.extend_from_slice(&raw_i32(sensor.z, "sensor_z")?.to_be_bytes());
+        frame.extend_from_slice(&scaled_i16(sensor.x, "sensor_x")?.to_be_bytes());
+        frame.extend_from_slice(&scaled_i16(sensor.y, "sensor_y")?.to_be_bytes());
+        frame.extend_from_slice(&scaled_i16(sensor.z, "sensor_z")?.to_be_bytes());
     }
 
     frame.extend_from_slice(&scaled_i16(status.bend_angle1_deg, "bend_angle1")?.to_be_bytes());
@@ -261,7 +261,7 @@ pub fn parse_status_frame(frame: &[u8]) -> Result<DeviceStatus, ProtocolError> {
 
     let num_motors = frame[3];
     let num_sensors = frame[4];
-    let expected_data_len = 1 + 1 + num_motors as usize * 7 + num_sensors as usize * 12 + 2 + 2 + 1;
+    let expected_data_len = 1 + 1 + num_motors as usize * 7 + num_sensors as usize * 6 + 2 + 2 + 1;
     if total_len != expected_data_len {
         return Err(ProtocolError::InvalidLength);
     }
@@ -284,9 +284,9 @@ pub fn parse_status_frame(frame: &[u8]) -> Result<DeviceStatus, ProtocolError> {
     let mut sensors = Vec::with_capacity(num_sensors as usize);
     for _ in 0..num_sensors {
         sensors.push(SensorData {
-            x: read_i32(frame, &mut offset)? as f64,
-            y: read_i32(frame, &mut offset)? as f64,
-            z: read_i32(frame, &mut offset)? as f64,
+            x: read_i16(frame, &mut offset)? as f64 / 100.0,
+            y: read_i16(frame, &mut offset)? as f64 / 100.0,
+            z: read_i16(frame, &mut offset)? as f64 / 100.0,
         });
     }
 
@@ -328,18 +328,12 @@ fn scaled_i16(value: f64, field: &'static str) -> Result<i16, ProtocolError> {
     if !value.is_finite() {
         return Err(ProtocolError::ValueOutOfRange(field));
     }
-    let scaled = (value * 100.0).trunc();
+    // 四舍五入避免浮点漂移（如 -4.56*100 = -455.999…，trunc 会丢 1）
+    let scaled = (value * 100.0).round();
     if scaled < i16::MIN as f64 || scaled > i16::MAX as f64 {
         return Err(ProtocolError::ValueOutOfRange(field));
     }
     Ok(scaled as i16)
-}
-
-fn raw_i32(value: f64, field: &'static str) -> Result<i32, ProtocolError> {
-    if !value.is_finite() || value < i32::MIN as f64 || value > i32::MAX as f64 {
-        return Err(ProtocolError::ValueOutOfRange(field));
-    }
-    Ok(value.trunc() as i32)
 }
 
 fn read_u8(frame: &[u8], offset: &mut usize) -> Result<u8, ProtocolError> {
@@ -357,20 +351,6 @@ fn read_i16(frame: &[u8], offset: &mut usize) -> Result<i16, ProtocolError> {
     Ok(value)
 }
 
-fn read_i32(frame: &[u8], offset: &mut usize) -> Result<i32, ProtocolError> {
-    if *offset + 4 > frame.len() {
-        return Err(ProtocolError::InvalidLength);
-    }
-    let value = i32::from_be_bytes([
-        frame[*offset],
-        frame[*offset + 1],
-        frame[*offset + 2],
-        frame[*offset + 3],
-    ]);
-    *offset += 4;
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,9 +362,8 @@ mod tests {
 
     fn sample_status_frame() -> Vec<u8> {
         append_checksum(vec![
-            0xBB, 0x02, 0x1A, 0x01, 0x01, 0x04, 0xD2, 0xFF, 0x06, 0x00, 0x64, 0x01, 0x00, 0x01,
-            0x86, 0xA0, 0xFF, 0xFC, 0xF2, 0xC0, 0x00, 0x04, 0x93, 0xE0, 0x04, 0xD2, 0xFD, 0xC9,
-            0x01,
+            0xBB, 0x02, 0x14, 0x01, 0x01, 0x04, 0xD2, 0xFF, 0x06, 0x00, 0x64, 0x01, 0x00, 0x7B,
+            0xFE, 0x38, 0x03, 0x15, 0x04, 0xD2, 0xFD, 0xC9, 0x01,
         ])
     }
 
@@ -398,9 +377,9 @@ mod tests {
         assert_eq!(status.motors[0].velocity_mm_per_sec, -2.5);
         assert_eq!(status.motors[0].acceleration_mm_per_sec2, 1.0);
         assert_eq!(status.motors[0].status, 1);
-        assert_eq!(status.sensors[0].x, 100000.0);
-        assert_eq!(status.sensors[0].y, -200000.0);
-        assert_eq!(status.sensors[0].z, 300000.0);
+        assert_eq!(status.sensors[0].x, 1.23);
+        assert_eq!(status.sensors[0].y, -4.56);
+        assert_eq!(status.sensors[0].z, 7.89);
         assert_eq!(status.bend_angle1_deg, 12.34);
         assert_eq!(status.bend_angle2_deg, -5.67);
         assert_eq!(status.system_state, 1);
@@ -491,9 +470,9 @@ mod tests {
                 status: 1,
             }],
             sensors: vec![SensorData {
-                x: 123.0,
-                y: -456.0,
-                z: 789.0,
+                x: 1.23,
+                y: -4.56,
+                z: 7.89,
             }],
             bend_angle1_deg: 12.5,
             bend_angle2_deg: -6.75,

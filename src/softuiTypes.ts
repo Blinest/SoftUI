@@ -227,6 +227,32 @@ export interface DiagnosticsSummary {
   lastError?: string | null;
 }
 
+/** 与后端 `fetch_live_latest` 返回对应：最新一帧 + 环形缓冲统计。 */
+export interface LiveLatest {
+  selectedDeviceId: string;
+  latest: DeviceSnapshot | null;
+  stats: {
+    storedFrames: number;
+    capacity: number;
+    totalFrames: number;
+    droppedFrames: number;
+    frameRateHz: number;
+  };
+}
+
+/** 曲线数据结构（`fetch_live_window` / 历史会话 → `chartsFromFrames`）。 */
+export interface ChartSection {
+  windowSize: number;
+  timestamps: number[];
+  channels: Array<{
+    name: string;
+    unit: string;
+    channelType: string;
+    channelIndex: number;
+    points: number[];
+  }>;
+}
+
 export type CycleLifePhase =
   | "idle"
   | "movingUpper"
@@ -388,18 +414,7 @@ export interface RuntimeSnapshot {
   dashboard: DashboardState;
   live: {
     selectedDeviceId: string;
-    frames: DeviceSnapshot[];
-  };
-  charts: {
-    windowSize: number;
-    timestamps: number[];
-    channels: Array<{
-      name: string;
-      unit: string;
-      channelType: string;
-      channelIndex: number;
-      points: number[];
-    }>;
+    latest: DeviceSnapshot | null;
   };
   model: ModelProfile;
   calibration: CalibrationState;

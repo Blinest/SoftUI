@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod control;
 pub mod device;
+pub mod dynamics;
 pub mod live;
 pub mod migration;
 pub mod playback;
@@ -15,7 +16,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -290,7 +291,6 @@ struct RuntimeSnapshot {
     connection: ConnectionSection,
     dashboard: DashboardState,
     live: LiveSection,
-    charts: ChartSection,
     model: ModelProfile,
     calibration: CalibrationState,
     playback: PlaybackState,
@@ -321,7 +321,7 @@ struct ConnectionSection {
 #[serde(rename_all = "camelCase")]
 struct LiveSection {
     selected_device_id: String,
-    frames: Vec<DeviceSnapshot>,
+    latest: Option<DeviceSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +330,15 @@ struct ChartSection {
     window_size: usize,
     timestamps: Vec<f64>,
     channels: Vec<ChartChannel>,
+}
+
+/// 轻量实时响应：最新一帧 + 环形缓冲统计，供非曲线页高频轮询。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveLatest {
+    selected_device_id: String,
+    latest: Option<DeviceSnapshot>,
+    stats: live::FrameStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -626,12 +635,12 @@ fn make_device_frame(
 }
 
 fn overlay_live_frames(snapshot: &mut RuntimeSnapshot, live_frames: &[DeviceSnapshot]) {
-    if live_frames.is_empty() {
+    let Some(first) = live_frames.first() else {
         return;
-    }
+    };
 
-    snapshot.live.selected_device_id = live_frames[0].device_id.clone();
-    snapshot.live.frames = live_frames.to_vec();
+    snapshot.live.selected_device_id = first.device_id.clone();
+    snapshot.live.latest = live_frames.first().cloned();
     snapshot.dashboard.device_count = live_frames.len() as u32;
     snapshot.dashboard.connected_devices = live_frames
         .iter()
@@ -1064,7 +1073,6 @@ fn make_playback_state(data: &PersistedState) -> PlaybackState {
 fn build_snapshot(data: &PersistedState) -> RuntimeSnapshot {
     let seq = data.sequence;
     let frame = make_frame(seq, data.connected);
-    let secondary = make_frame(seq.saturating_add(1), data.connected);
     let app_info = AppInfo {
         name: "SoftUI".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1095,9 +1103,8 @@ fn build_snapshot(data: &PersistedState) -> RuntimeSnapshot {
         dashboard,
         live: LiveSection {
             selected_device_id: frame.device_id.clone(),
-            frames: vec![frame, secondary],
+            latest: Some(frame),
         },
-        charts: make_charts(seq),
         model: make_model_profile(),
         calibration: make_calibration_state(seq, data.connected),
         playback: make_playback_state(data),
@@ -1120,10 +1127,13 @@ struct AppState {
     recorder: Arc<Mutex<session::SessionRecorder>>,
     playback: Arc<Mutex<playback::PlaybackEngine>>,
     control_runtime: Arc<Mutex<control::ControlRuntime>>,
+    dynamics_runtime: Arc<Mutex<dynamics::DynamicsRuntime>>,
     auth_session: Arc<Mutex<auth::AuthSession>>,
     auth_store: auth::AuthStore,
     sqlite: storage::SqliteStore,
     worker_stop: Arc<AtomicBool>,
+    last_synced_log_id: Arc<AtomicUsize>,
+    last_log_sync_ms: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -1157,16 +1167,35 @@ impl AppState {
             recorder: Arc::new(Mutex::new(session::SessionRecorder::new(session_dir))),
             playback: Arc::new(Mutex::new(playback::PlaybackEngine::new())),
             control_runtime: Arc::new(Mutex::new(control::ControlRuntime::default())),
+            dynamics_runtime: Arc::new(Mutex::new(dynamics::DynamicsRuntime::default())),
             auth_session: Arc::new(Mutex::new(auth::AuthSession::default())),
             auth_store: auth::AuthStore::load(auth_path),
             sqlite: storage::SqliteStore::new(sqlite_path),
             worker_stop: Arc::new(AtomicBool::new(false)),
+            last_synced_log_id: Arc::new(AtomicUsize::new(0)),
+            last_log_sync_ms: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn snapshot(&self) -> RuntimeSnapshot {
         let mut snapshot = self.store.snapshot();
-        self.sync_logs_to_sqlite();
+        // 日志落库节流：最多 1s 一次，避免 10Hz 热路径下高频 SQLite 写入。
+        let now = now_ms();
+        let last = self.last_log_sync_ms.load(Ordering::Relaxed) as u64;
+        if now.saturating_sub(last) >= 1_000 {
+            if self
+                .last_log_sync_ms
+                .compare_exchange(
+                    last as usize,
+                    now as usize,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.sync_logs_to_sqlite();
+            }
+        }
         if let Ok(control) = self.control_runtime.lock() {
             snapshot.control_runtime = control.status();
         }
@@ -1184,18 +1213,11 @@ impl AppState {
                         snapshot.control_runtime = control.status();
                     }
                     snapshot.live.selected_device_id = frame.device_id.clone();
-                    snapshot.live.frames = vec![frame.clone()];
+                    snapshot.live.latest = Some(frame.clone());
                     snapshot.dashboard.device_count = 1;
                     snapshot.dashboard.connected_devices = 1;
                     snapshot.dashboard.last_error = None;
                     snapshot.connection.state = ConnectionState::Ready;
-
-                    // Build chart data from playback frame window
-                    let window = pb.frame_window(80);
-                    if !window.is_empty() {
-                        let owned: Vec<DeviceSnapshot> = window.into_iter().cloned().collect();
-                        snapshot.charts = make_charts_from_motors(&owned);
-                    }
 
                     return snapshot;
                 }
@@ -1207,11 +1229,6 @@ impl AppState {
             live_stats = ring.stats();
             let live_frames = ring.latest_per_device();
             overlay_live_frames(&mut snapshot, &live_frames);
-
-            let chart_frames = ring.window(80);
-            if !chart_frames.is_empty() {
-                snapshot.charts = make_charts_from_motors(&chart_frames);
-            }
         }
         if let Ok(devices) = self.devices.lock() {
             let runtimes = devices.runtime_statuses();
@@ -1228,25 +1245,8 @@ impl AppState {
             pb.tick(now);
         }
 
-        let _snapshot = self.store.mutate(|data| {
-            data.sequence = data.sequence.saturating_add(1);
-            data.playback_cursor_ms = data.playback_cursor_ms.saturating_add(1_000);
-            if data.connected && data.sequence % 16 == 0 {
-                data.logs.push(log_entry(
-                    data.sequence,
-                    LogLevel::Debug,
-                    "stream",
-                    "Live snapshot refreshed",
-                    Some("softui-sim-01"),
-                    Some("BB 02 10 01 00 00 00 00 00 23"),
-                ));
-            }
-            if data.logs.len() > 120 {
-                let drain = data.logs.len() - 120;
-                data.logs.drain(0..drain);
-            }
-        });
-
+        // 轻量只读快照：不写盘、不写 SQLite、不构建曲线，
+        // 保持 10Hz 高频轮询下没有落盘/序列化重负载。
         self.snapshot()
     }
 
@@ -1354,14 +1354,28 @@ impl AppState {
         Ok(bundle_dir.to_string_lossy().to_string())
     }
 
+    /// 增量同步新增日志到 SQLite，避免每次全量重放（热路径下开销大）。
+    /// 只同步 id 大于上次同步点的条目；`id` 为 0（引导期）时视为已入库跳过。
+    /// 同时把内存日志裁剪到上限，防止只读快照路径下无限增长。
     fn sync_logs_to_sqlite(&self) {
         let logs = self
             .store
             .data
             .lock()
-            .map(|data| data.logs.clone())
+            .map(|mut data| {
+                if data.logs.len() > 120 {
+                    let drain = data.logs.len() - 120;
+                    data.logs.drain(0..drain);
+                }
+                data.logs.clone()
+            })
             .unwrap_or_default();
+        let mut high_water = self.last_synced_log_id.load(Ordering::Relaxed);
+        let mut dirty = false;
         for entry in logs {
+            if entry.id == 0 || entry.id as usize <= high_water {
+                continue;
+            }
             let _ = self.sqlite.insert_log(&storage::LogRow {
                 id: entry.id,
                 timestamp_ms: entry.timestamp_ms,
@@ -1371,6 +1385,13 @@ impl AppState {
                 device_id: entry.device_id,
                 frame_hex: entry.frame_hex,
             });
+            if entry.id as usize > high_water {
+                high_water = entry.id as usize;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.last_synced_log_id.store(high_water, Ordering::Relaxed);
         }
     }
 
@@ -1573,9 +1594,8 @@ fn snapshot_allows_command(snapshot: &RuntimeSnapshot, safety: CommandSafety) ->
             connected
                 && snapshot
                     .live
-                    .frames
-                    .iter()
-                    .find(|frame| frame.device_id == snapshot.live.selected_device_id)
+                    .latest
+                    .as_ref()
                     .map(|frame| frame.system_enabled)
                     .unwrap_or(false)
         }
@@ -2064,6 +2084,33 @@ fn fetch_live_stats(state: State<'_, AppState>) -> live::FrameStats {
         })
 }
 
+/// 轻量实时响应：最新一帧 + 环形缓冲统计。供总览/工作区等页面高频轮询，
+/// 只序列化一个帧与统计，远小于整份 RuntimeSnapshot。
+#[tauri::command]
+fn fetch_live_latest(state: State<'_, AppState>) -> LiveLatest {
+    let mut latest: Option<DeviceSnapshot> = None;
+    let mut stats = live::FrameStats {
+        stored_frames: 0,
+        capacity: 0,
+        total_frames: 0,
+        dropped_frames: 0,
+        frame_rate_hz: 0.0,
+    };
+    if let Ok(ring) = state.live_ring.lock() {
+        stats = ring.stats();
+        latest = ring.latest_per_device().into_iter().next();
+    }
+    let selected_device_id = latest
+        .as_ref()
+        .map(|frame| frame.device_id.clone())
+        .unwrap_or_default();
+    LiveLatest {
+        selected_device_id,
+        latest,
+        stats,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeviceRuntimeStatusView {
@@ -2411,6 +2458,52 @@ fn stop_cycle_life(
         ));
     });
     Ok(state.snapshot())
+}
+
+// ── Dynamics commands ──
+
+#[tauri::command]
+fn dynamics_status(state: State<'_, AppState>) -> Result<dynamics::DynamicsStatus, String> {
+    state
+        .dynamics_runtime
+        .lock()
+        .map_err(|_| "dynamics runtime poisoned".to_string())
+        .map(|runtime| runtime.status())
+}
+
+#[tauri::command]
+fn compute_live_dynamics(state: State<'_, AppState>) -> Result<dynamics::DynamicsOutput, String> {
+    let status = state
+        .dynamics_runtime
+        .lock()
+        .map_err(|_| "dynamics runtime poisoned".to_string())?
+        .status();
+    status
+        .last_output
+        .ok_or_else(|| "no dynamics output computed yet; wait for device frames".to_string())
+}
+
+#[tauri::command]
+fn update_dynamics_config(
+    state: State<'_, AppState>,
+    config: dynamics::DynamicsConfig,
+) -> Result<dynamics::DynamicsStatus, String> {
+    guard_permission(&state, auth::Permission::ManageSettings)?;
+    state
+        .dynamics_runtime
+        .lock()
+        .map_err(|_| "dynamics runtime poisoned".to_string())?
+        .update_config(config)
+}
+
+#[tauri::command]
+fn reset_dynamics(state: State<'_, AppState>) -> Result<dynamics::DynamicsStatus, String> {
+    guard_permission(&state, auth::Permission::ManageSettings)?;
+    Ok(state
+        .dynamics_runtime
+        .lock()
+        .map_err(|_| "dynamics runtime poisoned".to_string())?
+        .reset())
 }
 
 #[tauri::command]
@@ -2909,7 +3002,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.sensors[0].raw[0],
-            protocol_status.sensors[0].x.trunc()
+            protocol_status.sensors[0].x
         );
         assert_eq!(
             snapshot.bend.section1.angle_deg,
@@ -2919,14 +3012,14 @@ mod tests {
     }
 
     #[test]
-    fn runtime_snapshot_contains_protocol_backed_live_frames() {
+    fn runtime_snapshot_contains_protocol_backed_live_frame() {
         let data = default_persisted_state();
         let snapshot = build_snapshot(&data);
 
-        assert_eq!(snapshot.live.frames.len(), 2);
-        assert_eq!(snapshot.live.frames[0].motors.len(), 6);
-        assert_eq!(snapshot.live.frames[0].sensors.len(), 6);
         assert_eq!(snapshot.live.selected_device_id, "softui-sim-01");
+        let latest = snapshot.live.latest.expect("latest frame");
+        assert_eq!(latest.motors.len(), 6);
+        assert_eq!(latest.sensors.len(), 6);
     }
 
     #[test]
@@ -3072,8 +3165,8 @@ mod tests {
         overlay_live_frames(&mut snapshot, &live);
 
         assert_eq!(snapshot.live.selected_device_id, "serial:COM7");
-        assert_eq!(snapshot.live.frames.len(), 1);
-        assert_eq!(snapshot.live.frames[0].motors.len(), 1);
+        let latest = snapshot.live.latest.expect("latest frame");
+        assert_eq!(latest.motors.len(), 1);
         assert_eq!(snapshot.dashboard.connected_devices, 1);
         assert_eq!(snapshot.connection.active_profile_name, "Serial runtime");
     }
@@ -3127,6 +3220,7 @@ pub fn run() {
             let app_state = AppState::new(state_path);
 
             let bg_devices = app_state.devices.clone();
+            let bg_dynamics = app_state.dynamics_runtime.clone();
             let bg_live_ring = app_state.live_ring.clone();
             let bg_recorder = app_state.recorder.clone();
             let bg_playback = app_state.playback.clone();
@@ -3193,6 +3287,10 @@ pub fn run() {
                                     };
                                     control.step_cycle(feedback, safety, 50);
                                 }
+                                // Step dynamics model for every live frame.
+                                let _ = bg_dynamics.lock().map(|mut dynamics| {
+                                    let _ = dynamics.step_frame(&frame, 50);
+                                });
                                 if !is_playback {
                                     if let Ok(mut rec) = bg_recorder.lock() {
                                         let rec_status = rec.status();
@@ -3233,6 +3331,7 @@ pub fn run() {
             export_diagnostics_bundle,
             export_chart_csv,
             export_session_csv,
+            fetch_live_latest,
             fetch_live_window,
             fetch_live_stats,
             list_connected_devices,
@@ -3244,7 +3343,9 @@ pub fn run() {
             logout,
             calibrate_sensor,
             configure_cycle_life,
+            compute_live_dynamics,
             control_runtime_status,
+            dynamics_status,
             playback_get_frame,
             playback_get_window,
             playback_load,
@@ -3258,6 +3359,7 @@ pub fn run() {
             read_session_frames,
             recorder_status,
             rename_session,
+            reset_dynamics,
             resume_recording,
             send_active_control_tick,
             send_bend_command,
@@ -3274,6 +3376,7 @@ pub fn run() {
             submit_system_control,
             tick_snapshot,
             toggle_connection,
+            update_dynamics_config,
             update_pid_control,
             update_session_metadata,
             update_settings,
