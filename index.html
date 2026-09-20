@@ -1,10 +1,41 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Tauri + React + Typescript</title>
+    <title>SoftUI 上位机</title>
+    <script>
+      // 预水合：主题由后端权威决定，但首帧不能等 IPC 往返，否则浅色下会黑闪。
+      // 读取全部 softui:themePreference* 键，取最近写入的一个。
+      (() => {
+        try {
+          let stored = null;
+          let bestStamp = -1;
+          for (let i = 0; i < localStorage.length; i += 1) {
+            const key = localStorage.key(i);
+            if (!key || !key.startsWith("softui:themePreference")) continue;
+            const stamp = Number(localStorage.getItem(`${key}:stamp`) ?? 0);
+            if (stamp >= bestStamp) {
+              bestStamp = stamp;
+              stored = localStorage.getItem(key);
+            }
+          }
+          const preference =
+            stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+          const theme =
+            preference === "system"
+              ? window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light"
+              : preference;
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+        } catch {
+          /* 保持 data-theme="light" 兜底 */
+        }
+      })();
+    </script>
   </head>
 
   <body>

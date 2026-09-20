@@ -1,5 +1,8 @@
 import { useMemo, useState } from "react";
+
+import { WorkbenchLayout } from "../layouts/WorkbenchLayout";
 import type { RecorderStatus, SessionInfo } from "../softuiTypes";
+import "../styles/sessions.css";
 import { Activity, Database, Download, Play, PauseCircle, SkipForward, Trash2, Edit3, Search, X } from "lucide-react";
 import {
   useReactTable,
@@ -18,8 +21,10 @@ function formatBytes(bytes: number): string {
 }
 
 function formatDurationSecs(secs: number): string {
-  const m = Math.floor(secs / 60);
-  const s = secs % 60;
+  // 秒数是浮点累加出来的，直接取模会露出 2.4000000000000057 这类尾巴。
+  const total = Math.max(0, Math.round(secs));
+  const m = Math.floor(total / 60);
+  const s = total % 60;
   return m > 0 ? `${m}m${s}s` : `${s}s`;
 }
 
@@ -221,10 +226,9 @@ export default function SessionsPage({
     getFilteredRowModel: getFilteredRowModel(),
   });
 
-  return (
-    <div className="sessions-page-layout">
-      {/* Left: Recording control panel */}
-      <aside className="sessions-sidebar">
+  const context = (
+    <>
+      <div className="panel">
         <div className="panel">
           <div className="panel-head">
             <div>
@@ -322,10 +326,13 @@ export default function SessionsPage({
             </div>
           </div>
         </div>
-      </aside>
+      </div>
+    </>
+  );
 
-      {/* Right: Session history table */}
-      <main className="sessions-main">
+  return (
+    <WorkbenchLayout context={context} contextLabel="录制工作台">
+      <>
         <div className="panel wide">
           <div className="panel-head">
             <div>
@@ -392,7 +399,7 @@ export default function SessionsPage({
             </span>
           </div>
         </div>
-      </main>
-    </div>
+      </>
+    </WorkbenchLayout>
   );
 }

@@ -1,0 +1,524 @@
+/* 页面模板：5 个固定布局 + 卡片栅格 + 通用滚动区域。
+ *
+ * 契约：模板自己拥有滚动区（.layout-scroll-region），外层 .app-content 是
+ * overflow:hidden。因此页面内部不会再出现整页滚动条。 */
+
+/* ---- 通用 ---- */
+
+.layout-scroll-region {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+}
+
+/* 卡片栅格专用：自己算高度、自己管超出部分的滚动。
+ *
+ * 两个滚动的父子容器会互相抢滚动条，所以栅格必须落在**没有内边距**的一层里 ——
+ * 内边距会算进 clientWidth/clientHeight，量出来的可视区比实际大一圈，
+ * 卡片最右边一列就会被挤出滚动区。 */
+.layout-fill-region {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+}
+
+/* 设备工作台的分页内容（监控是卡片栅格，其余分页是无内边距面板）；总览页整页都是栅格。
+ * 卡片位置由 CardGrid 按栅格自身的 clientWidth 算，所以这圈边距只能留在
+ * 栅格外面 —— 落在栅格内部会让「算出来的宽度」和「实际可用宽度」差一圈。 */
+.workbench-layout > .layout-fill-region > *,
+.dashboard-layout > .layout-fill-region > * {
+  margin: 12px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- 左侧栏 ---- */
+
+.responsive-rail {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  min-height: 0;
+  min-width: 0;
+}
+
+.responsive-rail-title {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.responsive-rail-title > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.responsive-rail-toggle {
+  display: inline-grid;
+  width: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: var(--surface-panel);
+  color: var(--text-primary);
+}
+
+.responsive-rail-toggle:hover {
+  background: var(--surface-page);
+}
+
+.responsive-rail-scroll {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 10px;
+}
+
+.responsive-rail.is-collapsed .responsive-rail-title {
+  grid-template-columns: 1fr;
+  justify-items: center;
+}
+
+.responsive-rail.is-collapsed .responsive-rail-title > span,
+.responsive-rail.is-collapsed .responsive-rail-scroll {
+  display: none;
+}
+
+/* ---- 总览 ---- */
+
+.dashboard-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+}
+
+/* ---- 设备工作台 ---- */
+
+.workbench-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+}
+
+.workbench-layout:has(.workbench-context.is-collapsed) {
+  grid-template-columns: 42px minmax(0, 1fr);
+}
+
+.workbench-context {
+  grid-row: 1 / -1;
+  min-height: 0;
+}
+
+/* ---- 曲线 ---- */
+
+.chart-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+}
+
+.chart-layout:has(.chart-channels.is-collapsed) {
+  grid-template-columns: 42px minmax(0, 1fr);
+}
+
+.chart-channels {
+  grid-row: 1 / -1;
+}
+
+/* ---- 检索类页面 ---- */
+
+.table-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  padding: 12px;
+  gap: 12px;
+}
+
+.table-layout-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  min-height: 0;
+  min-width: 0;
+}
+
+.table-layout-content > main:only-child {
+  grid-column: 1 / -1;
+}
+
+.table-detail {
+  width: clamp(280px, 26vw, 420px);
+  min-width: 0;
+}
+
+/* ---- 设置 ---- */
+
+.settings-layout {
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+}
+
+.settings-layout:has(.settings-navigation.is-collapsed) {
+  grid-template-columns: 42px minmax(0, 1fr);
+}
+
+.settings-navigation {
+  grid-row: 1 / -1;
+}
+
+/* ---- 卡片栅格 ----
+ *
+ * 列数与列宽由 CardGrid 实测容器宽度后算出来（见 state/layoutStore.ts），
+ * 以 --card-col-width / --card-row-height / --card-gap 三个变量下发。
+ * 卡片是绝对定位 + transform，所以：
+ *   - 换行 = 列数变少后 compactLayout 自然排到下一行，不需要媒体查询；
+ *   - 拖动 / 缩放可以走 transform 过渡，落位是动画而不是瞬间跳变。 */
+
+.feature-page-stack {
+  display: grid;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.card-grid,
+.feature-card-grid {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  /* 高度由 CardGrid 按行数算好写在行内样式上，这一层不能有内边距，
+   * 否则量到的可视区比实际大一圈，最右一列会被挤出滚动区。 */
+}
+
+/* 拖动中：其余卡片要「滑」到新位置（这就是让位动画），所以过渡必须开着，
+ * 只有被拖的那张要跟手，才关掉它的过渡。
+ * 缩放只在松手时提交一次，所以被拉的那张也要走过渡 —— 不关。 */
+body.card-dragging .card-grid .feature-card.is-dragging,
+.card-grid:not(.is-animating) .feature-card {
+  transition: none;
+}
+
+.feature-card {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgb(8 20 29 / 8%);
+}
+
+.card-grid.is-animating .feature-card {
+  transition: transform 200ms cubic-bezier(0.2, 0, 0, 1), width 200ms cubic-bezier(0.2, 0, 0, 1),
+    height 200ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.feature-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* ---- 可编辑（拖动 / 缩放） ---- */
+
+.feature-card-grip {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  opacity: 0.55;
+}
+
+.feature-card-header.is-draggable {
+  cursor: grab;
+  touch-action: none;
+}
+
+.feature-card-header.is-draggable:hover .feature-card-grip {
+  opacity: 1;
+}
+
+body.card-dragging .feature-card-header.is-draggable {
+  cursor: grabbing;
+}
+
+/* 被拖动的卡片浮起来跟着指针走；它原来占的槽位由后面的卡片依次补上。 */
+.feature-card.is-dragging {
+  z-index: 30;
+  cursor: grabbing;
+  opacity: 0.92;
+  box-shadow: 0 14px 30px rgb(8 20 29 / 30%);
+  pointer-events: none;
+}
+
+/* 缩放预览框：拖动右下角时，框住目标大小并标出格数。
+ * 拖动过程不写布局，所以这就是「会变成多大」的唯一提示。 */
+.card-resize-preview {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 25;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 6px;
+  border: 2px solid var(--focus-ring);
+  border-radius: var(--radius-card);
+  /* 半透明实底而不是纯描边：4x4 的预览框会盖住整屏，空心框在里面根本数不清
+   * 边界在哪；填一层淡色，边界和底下的卡片都能看清。 */
+  background: color-mix(in srgb, var(--focus-ring) 14%, var(--surface-panel));
+  box-shadow: 0 0 0 9999px rgb(8 20 29 / 12%);
+  pointer-events: none;
+  /* 尺寸跟着指针跳，加过渡反而糊；只在跨界时轻微跟一下。 */
+  transition: width 110ms ease, height 110ms ease;
+}
+
+.card-resize-preview span {
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--focus-ring);
+  color: var(--text-inverse);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* 落点指示器：拖动时被拖卡片留下的那一格是空的，用它标出「松手会落在哪」。 */
+.card-drop-preview {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 5;
+  border: 1px dashed var(--focus-ring);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--focus-ring) 8%, transparent);
+  pointer-events: none;
+}
+
+/* 缩放把手：只在右下角画三条斜线，命中区域 22px 足够好抓。
+ * 卡片体允许滚动，所以把手必须是卡片的直接子元素、不能放进 .feature-card-body。 */
+.card-resize-handle {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  background-image: linear-gradient(
+    135deg,
+    transparent 0 46%,
+    var(--border-default) 46% 56%,
+    transparent 56% 66%,
+    var(--border-default) 66% 76%,
+    transparent 76%
+  );
+  cursor: nwse-resize;
+  touch-action: none;
+  opacity: 0.75;
+}
+
+.card-resize-handle:hover {
+  opacity: 1;
+}
+
+
+.feature-card-header > div {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.feature-card-header h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feature-card-body {
+  align-content: start;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+.feature-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.feature-metric-grid-wide {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.feature-metric {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.feature-metric span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.feature-metric strong {
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feature-card-primary-state {
+  display: grid;
+  align-content: center;
+  gap: 7px;
+  height: 100%;
+}
+
+.feature-card-primary-state.compact {
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 78px;
+}
+
+.feature-card-primary-state.compact strong {
+  font-size: 15px;
+}
+
+.feature-card-primary-state > span:last-child {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.feature-list {
+  display: grid;
+  gap: 6px;
+}
+
+.feature-list-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-size: 12px;
+}
+
+.feature-list-row > span:last-child,
+.feature-list-row-split > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feature-list-row-split {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.feature-list-row-event {
+  grid-template-columns: auto minmax(60px, auto) minmax(0, 1fr);
+}
+
+.feature-empty-compact {
+  display: grid;
+  min-height: 70px;
+  place-items: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.status-dot.is-error {
+  background: var(--status-error);
+}
+
+.status-dot.is-warn {
+  background: var(--status-warning);
+}
+
+/* ---- 窄屏：左侧栏折成顶部整宽横条 ---- */
+
+@media (max-width: 1119px) {
+  .workbench-layout,
+  .chart-layout,
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr);
+  }
+
+  .workbench-context,
+  .chart-channels,
+  .settings-navigation {
+    grid-row: auto;
+    max-height: 220px;
+  }
+
+  /* 卡片栅格不需要在这里改列数：列数由 CardGrid 实测容器宽度算出来，
+   * 窄屏（左侧栏折到顶部后，任务区反而更宽）会自动换行。 */
+}

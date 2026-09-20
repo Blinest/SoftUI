@@ -1,10 +1,12 @@
 import * as THREE from "three";
-import { sampleConstantCurvature, type SegmentBendRad, samplePiecewiseConstantCurvature } from "./kinematics";
+import type { BackboneOutput } from "../dynamics/svcModel";
+import { samplesFromBackbone, sampleConstantCurvature, type SegmentBendRad, samplePiecewiseConstantCurvature } from "./kinematics";
 
 export interface CableVisuals {
   group: THREE.Group;
   update: (angleRad: number, directionRad: number, cableRadiusMm: number, tubular: boolean) => void;
   updateSegments: (segments: [SegmentBendRad, SegmentBendRad], cableRadiusMm: number, tubular: boolean) => void;
+  updateBackbone: (backbone: BackboneOutput, cableRadiusMm: number, tubular: boolean) => void;
   dispose: () => void;
 }
 
@@ -31,6 +33,10 @@ export function createCableVisuals(lengthMm: number, tubeRadiusMm: number): Cabl
 
   function updateSegments(segments: [SegmentBendRad, SegmentBendRad], cableRadiusMm: number, tubular: boolean): void {
     renderSamples(samplePiecewiseConstantCurvature(lengthMm, segments, 40), cableRadiusMm, tubular);
+  }
+
+  function updateBackbone(backbone: BackboneOutput, cableRadiusMm: number, tubular: boolean): void {
+    renderSamples(samplesFromBackbone(backbone), cableRadiusMm, tubular);
   }
 
   function renderSamples(frame: ReturnType<typeof sampleConstantCurvature>, cableRadiusMm: number, tubular: boolean): void {
@@ -63,6 +69,7 @@ export function createCableVisuals(lengthMm: number, tubeRadiusMm: number): Cabl
     group,
     update,
     updateSegments,
+    updateBackbone,
     dispose: clearObjects,
   };
 }

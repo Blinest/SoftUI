@@ -12,6 +12,7 @@ pub struct DynamicsConfig {
     pub force_base_n: f64,
     pub force_amp_n: [f64; 2],
     pub backbone_points_per_segment: usize,
+    pub max_curvature_per_m: [f64; 2],
 }
 
 impl Default for DynamicsConfig {
@@ -23,6 +24,7 @@ impl Default for DynamicsConfig {
             force_base_n: 4.0,
             force_amp_n: [90.0, 55.0],
             backbone_points_per_segment: 60,
+            max_curvature_per_m: [85.0_f64.to_radians() / 0.200, 85.0_f64.to_radians() / 0.200],
         }
     }
 }
@@ -67,8 +69,8 @@ pub struct SensorDynamicsState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct SectionDynamicsState {
-    pub angle_deg: f64,
+pub struct SectionCurvatureState {
+    pub curvature_per_m: f64,
     pub direction_deg: f64,
 }
 
@@ -80,7 +82,7 @@ pub struct DynamicsInput {
     pub dt_ms: u64,
     pub motors: Vec<MotorDynamicsState>,
     pub sensors: Vec<SensorDynamicsState>,
-    pub sections: Vec<SectionDynamicsState>,
+    pub sections: Vec<SectionCurvatureState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -105,6 +107,11 @@ pub struct DynamicsDiagnostics {
     pub max_curvature_per_m: f64,
     pub all_forces_finite: bool,
     pub force_max_n: f64,
+    pub input_mode: String,
+    pub legacy_angle_derived: bool,
+    pub sensor_derived: bool,
+    pub motor_derived: bool,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -112,7 +119,7 @@ pub struct DynamicsDiagnostics {
 pub struct DynamicsOutput {
     pub device_id: String,
     pub timestamp_ms: u64,
-    pub sections: Vec<SectionDynamicsState>,
+    pub sections: Vec<SectionCurvatureState>,
     pub tendon_forces_n: [f64; 6],
     pub curvature: CurvatureProfile,
     pub tip_pose: TipPose,
@@ -143,38 +150,46 @@ fn cable_indices(segment_index: usize) -> [usize; 3] {
     }
 }
 
-/// Compute per-cable tendon force distribution.
-///
-/// * `config` — model parameters.
-/// * `angle_deg` — absolute bend angle for this segment, in degrees.
-/// * `direction_deg` — bending plane direction, in degrees (0 = up).
-/// * `segment_index` — 0 or 1.
-///
-/// Returns the 6-element force array (some entries are 0 for the other segment's cables).
+/// Convert a legacy bend angle to curvature for protocol/history adapters.
+pub fn curvature_from_legacy_angle_deg(angle_deg: f64, segment_length_m: f64) -> f64 {
+    if !angle_deg.is_finite() || !segment_length_m.is_finite() || segment_length_m <= 0.0 {
+        return 0.0;
+    }
+    angle_deg.to_radians() / segment_length_m
+}
+
+/// Convert curvature back to a protocol bend angle at the hardware boundary.
+pub fn legacy_angle_deg_from_curvature(curvature_per_m: f64, segment_length_m: f64) -> f64 {
+    if !curvature_per_m.is_finite() || !segment_length_m.is_finite() || segment_length_m <= 0.0 {
+        return 0.0;
+    }
+    curvature_per_m * segment_length_m * 180.0 / PI
+}
+
+
+/// Compute per-cable tendon force distribution from section curvature.
 pub fn compute_tendon_forces(
     config: &DynamicsConfig,
-    angle_deg: f64,
+    curvature_per_m: f64,
     direction_deg: f64,
     segment_index: usize,
 ) -> [f64; 6] {
     let mut forces = [0.0f64; 6];
-    if !angle_deg.is_finite() || !direction_deg.is_finite() {
+    if !curvature_per_m.is_finite() || !direction_deg.is_finite() {
         return forces;
     }
 
     let idx = cable_indices(segment_index);
-    let alphas = if segment_index == 0 {
-        &SEG0_ALPHA
-    } else {
-        &SEG1_ALPHA
-    };
-
-    let dir_rad = if segment_index == 0 {
-        if angle_deg >= 0.0 { 0.0 } else { PI }
-    } else {
-        if angle_deg >= 0.0 { PI / 3.0 } else { 4.0 * PI / 3.0 }
-    };
-    let magnitude = (angle_deg.abs() / 85.0).clamp(0.0, 1.0);
+    let alphas = if segment_index == 0 { &SEG0_ALPHA } else { &SEG1_ALPHA };
+    let dir_rad = direction_deg.to_radians() + if curvature_per_m >= 0.0 { 0.0 } else { PI };
+    let max_curvature = config
+        .max_curvature_per_m
+        .get(segment_index)
+        .copied()
+        .unwrap_or(config.max_curvature_per_m[0])
+        .abs()
+        .max(1e-9);
+    let magnitude = (curvature_per_m.abs() / max_curvature).clamp(0.0, 1.0);
     let amp = config.force_amp_n.get(segment_index).copied().unwrap_or(config.force_amp_n[0]);
 
     for j in 0..3 {
@@ -185,19 +200,20 @@ pub fn compute_tendon_forces(
     forces
 }
 
-/// Compute both segments' tendon forces and merge into a single 6-element array.
+/// Compute both sections' tendon forces and merge into a single 6-element array.
 pub fn compute_tendon_forces_dual(
     config: &DynamicsConfig,
-    angle1_deg: f64,
-    angle2_deg: f64,
-    direction1_deg: f64,
-    direction2_deg: f64,
+    sections: &[SectionCurvatureState],
 ) -> [f64; 6] {
+    let zero = SectionCurvatureState { curvature_per_m: 0.0, direction_deg: 0.0 };
+    let s0_ref = sections.get(0).unwrap_or(&zero);
+    let s1_default = SectionCurvatureState { curvature_per_m: 0.0, direction_deg: 60.0 };
+    let s1_ref = sections.get(1).unwrap_or(&s1_default);
     let mut forces = [0.0f64; 6];
-    let s0 = compute_tendon_forces(config, angle1_deg, direction1_deg, 0);
-    let s1 = compute_tendon_forces(config, angle2_deg, direction2_deg, 1);
+    let f0 = compute_tendon_forces(config, s0_ref.curvature_per_m, s0_ref.direction_deg, 0);
+    let f1 = compute_tendon_forces(config, s1_ref.curvature_per_m, s1_ref.direction_deg, 1);
     for i in 0..6 {
-        forces[i] = s0[i] + s1[i];
+        forces[i] = f0[i] + f1[i];
     }
     forces
 }
@@ -272,17 +288,14 @@ fn segment_h_matrix(theta: f64, phi: f64, seg_len: f64, sub_steps: usize) -> [[f
     h
 }
 
-/// Build the full backbone (discrete points + curvature series) from two segment angles.
+/// Build the full backbone (discrete points + curvature series) from section curvature inputs.
 ///
 /// Uses variable-curvature blending between segments (same approach as PCCCharts.tsx).
 pub fn build_backbone(
     config: &DynamicsConfig,
-    angle1_deg: f64,
-    angle2_deg: f64,
-    direction1_deg: f64,
-    direction2_deg: f64,
+    sections: &[SectionCurvatureState],
 ) -> (CurvatureProfile, TipPose) {
-    let forces = compute_tendon_forces_dual(config, angle1_deg, angle2_deg, direction1_deg, direction2_deg);
+    let forces = compute_tendon_forces_dual(config, sections);
     let ei0 = config.ei(0);
 
     // Helper: compute moment from cable forces on a given segment.
@@ -397,6 +410,9 @@ fn build_diagnostics(
     curvature: &CurvatureProfile,
     tendon_forces_n: &[f64; 6],
     input: &DynamicsInput,
+    source: &str,
+    sensor_valid: bool,
+    motor_valid: bool,
 ) -> DynamicsDiagnostics {
     let max_kappa = curvature
         .kappa_abs_per_m
@@ -413,7 +429,196 @@ fn build_diagnostics(
         max_curvature_per_m: max_kappa,
         all_forces_finite,
         force_max_n: force_max,
+        input_mode: if source == "legacyBendFallback" {
+            "legacyAngleDerived".to_string()
+        } else {
+            "sensorMotorDerived".to_string()
+        },
+        legacy_angle_derived: source == "legacyBendFallback",
+        sensor_derived: sensor_valid,
+        motor_derived: motor_valid,
+        source: source.to_string(),
     }
+}
+
+// ── SDM derivation from pressure sensors and motor displacements ──
+
+const GROUP_A_CABLES: [usize; 3] = [0, 2, 4];
+const GROUP_B_CABLES: [usize; 3] = [1, 3, 5];
+const GROUP_A_ALPHAS: [f64; 3] = [0.0, 2.0 * PI / 3.0, 4.0 * PI / 3.0];
+const GROUP_B_ALPHAS: [f64; 3] = [PI / 3.0, PI, 5.0 * PI / 3.0];
+
+fn sensor_value(input: &DynamicsInput, sensor_id: u32, axis: usize) -> Option<f64> {
+    input
+        .sensors
+        .iter()
+        .find(|s| s.id == sensor_id)
+        .and_then(|s| s.force_n.get(axis).copied())
+        .filter(|v| v.is_finite())
+}
+
+fn motor_position(input: &DynamicsInput, motor_id: u32) -> Option<f64> {
+    input
+        .motors
+        .iter()
+        .find(|m| m.id == motor_id)
+        .map(|m| m.position_mm)
+        .filter(|v| v.is_finite())
+}
+
+/// Extract per-cable tendon forces from sensors (sensor id i maps to cable i-1, axis 0).
+pub(crate) fn derive_tendon_forces_from_sensors(input: &DynamicsInput) -> ([f64; 6], usize) {
+    let mut forces = [0.0f64; 6];
+    let mut present = 0usize;
+    for (cable_index, entry) in forces.iter_mut().enumerate() {
+        if let Some(value) = sensor_value(input, (cable_index + 1) as u32, 0) {
+            *entry = value.max(0.0);
+            present += 1;
+        }
+    }
+    (forces, present)
+}
+
+/// Extract per-cable displacements from motor positions (motor id i maps to cable i-1).
+pub(crate) fn derive_cable_displacements_from_motors(input: &DynamicsInput) -> ([f64; 6], usize) {
+    let mut displacements = [0.0f64; 6];
+    let mut present = 0usize;
+    for (cable_index, entry) in displacements.iter_mut().enumerate() {
+        if let Some(value) = motor_position(input, (cable_index + 1) as u32) {
+            *entry = value;
+            present += 1;
+        }
+    }
+    (displacements, present)
+}
+
+fn moment_from_three(forces: &[f64; 3], alphas: &[f64; 3], radius: f64) -> (f64, f64) {
+    let mut mx = 0.0;
+    let mut my = 0.0;
+    for i in 0..3 {
+        mx += radius * forces[i] * -alphas[i].sin();
+        my += radius * forces[i] * alphas[i].cos();
+    }
+    (mx, my)
+}
+
+/// Fuse tendon-force estimate and motor-displacement estimate into per-sample curvature.
+pub(crate) fn derive_fused_curvature(
+    config: &DynamicsConfig,
+    input: &DynamicsInput,
+) -> (CurvatureProfile, [f64; 6], [f64; 6], String, bool, bool) {
+    let (sensor_forces, sensor_count) = derive_tendon_forces_from_sensors(input);
+    let (displacements, motor_count) = derive_cable_displacements_from_motors(input);
+    let sensor_valid = sensor_count >= 3 && sensor_forces.iter().any(|f| *f > 0.0);
+    let motor_valid = motor_count >= 3;
+    let source = if sensor_valid && motor_valid {
+        "sensorMotorFusion"
+    } else if sensor_valid {
+        "forceOnly"
+    } else if motor_valid {
+        "motorOnly"
+    } else {
+        "legacyBendFallback"
+    };
+    let mut curvature = build_backbone(config, &input.sections).0;
+    if source != "legacyBendFallback" {
+        let group_count = config.segment_count();
+        let n_per_group = config.backbone_points_per_segment;
+        let kx_vals = curvature.kx_per_m.clone();
+        let ky_vals = curvature.ky_per_m.clone();
+        let mut fused_kx = kx_vals;
+        let mut fused_ky = ky_vals;
+        for i in 0..(config.segment_count() * config.backbone_points_per_segment + 1) {
+            let group = (i / n_per_group).min(group_count - 1);
+            let local = (i % n_per_group) as f64 / n_per_group as f64;
+            let cables = if group == 0 { &GROUP_A_CABLES } else { &GROUP_B_CABLES };
+            let alphas = if group == 0 { &GROUP_A_ALPHAS } else { &GROUP_B_ALPHAS };
+            let mut forces3 = [0.0f64; 3];
+            for j in 0..3 {
+                forces3[j] = sensor_forces[cables[j]].max(0.0);
+            }
+            let (mx, my) = moment_from_three(&forces3, alphas, config.cable_radius_m);
+            let ei = config.ei(group);
+            let force_kx = (mx / ei) * (1.0 - local);
+            let force_ky = (my / ei) * (1.0 - local);
+
+            let mut disp3 = [0.0f64; 3];
+            for j in 0..3 {
+                disp3[j] = displacements[cables[j]];
+            }
+            let mean = (disp3[0] + disp3[1] + disp3[2]) / 3.0;
+            let c: [f64; 3] = [disp3[0] - mean, disp3[1] - mean, disp3[2] - mean];
+            let mut a = 0.0;
+            let mut b = 0.0;
+            for j in 0..3 {
+                a += c[j] * alphas[j].cos();
+                b += c[j] * alphas[j].sin();
+            }
+            a *= 2.0 / 3.0;
+            b *= 2.0 / 3.0;
+            let rho_mm = a.hypot(b);
+            let phi = b.atan2(a);
+            let seg_len = config.segment_length_m[group];
+            let kappa = rho_mm / (config.cable_radius_m * seg_len);
+            let motor_kx = -kappa * phi.sin();
+            let motor_ky = kappa * phi.cos();
+
+            let (wf, wd) = if source == "forceOnly" { (1.0, 0.0) } else if source == "motorOnly" { (0.0, 1.0) } else { (0.35, 0.65) };
+            let sum = wf + wd;
+            fused_kx[i] = (wf * force_kx + wd * motor_kx) / sum;
+            fused_ky[i] = (wf * force_ky + wd * motor_ky) / sum;
+        }
+        curvature.kx_per_m = fused_kx;
+        curvature.ky_per_m = fused_ky;
+        curvature.kappa_abs_per_m = curvature
+            .kx_per_m
+            .iter()
+            .zip(curvature.ky_per_m.iter())
+            .map(|(kx, ky)| kx.hypot(*ky))
+            .collect();
+    }
+
+    (
+        curvature,
+        sensor_forces,
+        displacements,
+        source.to_string(),
+        sensor_valid,
+        motor_valid,
+    )
+}
+
+/// Integrate a curvature profile into a tip pose.
+pub(crate) fn integrate_backbone_from_profile(curvature: &CurvatureProfile) -> [f64; 3] {
+    if curvature.s_mm.len() < 2 {
+        return [0.0, 0.0, 0.0];
+    }
+    let mut h_curr = [[0.0f64; 4]; 4];
+    h_curr[0][0] = 1.0;
+    h_curr[1][1] = 1.0;
+    h_curr[2][2] = 1.0;
+    h_curr[3][3] = 1.0;
+    let mut tip = [0.0f64; 3];
+    for i in 1..curvature.s_mm.len() {
+        let ds_m = (curvature.s_mm[i] - curvature.s_mm[i - 1]).max(1e-9) / 1000.0;
+        let km = curvature.kappa_abs_per_m[i].max(0.0);
+        let phi = (-curvature.kx_per_m[i]).atan2(curvature.ky_per_m[i]);
+        let theta_step = km * ds_m;
+        let local_p = pcc_pose(theta_step, phi, ds_m, ds_m);
+        let global_p = mat_mul_4(&h_curr, &[local_p[0], local_p[1], local_p[2], 1.0]);
+        tip = [global_p[0], global_p[1], global_p[2]];
+        let micro_h = segment_h_matrix(theta_step, phi, ds_m, 5);
+        let mut new_h = [[0.0; 4]; 4];
+        for r in 0..4 {
+            for c in 0..4 {
+                for k in 0..4 {
+                    new_h[r][c] += h_curr[r][k] * micro_h[k][c];
+                }
+            }
+        }
+        h_curr = new_h;
+    }
+    tip
 }
 
 /// Convert a `crate::DeviceSnapshot` into a `DynamicsInput`.
@@ -452,12 +657,12 @@ pub(crate) fn dynamics_input_from_frame(
     };
 
     let sections = vec![
-        SectionDynamicsState {
-            angle_deg: frame.bend.section1.angle_deg,
+        SectionCurvatureState {
+            curvature_per_m: curvature_from_legacy_angle_deg(frame.bend.section1.angle_deg, DynamicsConfig::default().segment_length_m[0]),
             direction_deg: dir_to_deg(&frame.bend.section1.direction),
         },
-        SectionDynamicsState {
-            angle_deg: frame.bend.section2.angle_deg,
+        SectionCurvatureState {
+            curvature_per_m: curvature_from_legacy_angle_deg(frame.bend.section2.angle_deg, DynamicsConfig::default().segment_length_m[1]),
             direction_deg: dir_to_deg(&frame.bend.section2.direction),
         },
     ];
@@ -514,6 +719,9 @@ impl DynamicsRuntime {
         if config.cable_radius_m <= 0.0 {
             return Err("cable_radius_m must be positive".to_string());
         }
+        if config.max_curvature_per_m.iter().any(|k| !k.is_finite() || *k <= 0.0) {
+            return Err("max_curvature_per_m must be positive and finite".to_string());
+        }
         self.config = config;
         // Force re-computation on next step.
         self.last_output = None;
@@ -537,28 +745,16 @@ impl DynamicsRuntime {
             return Err("DynamicsInput requires at least 2 sections".to_string());
         }
 
-        let sec1 = &input.sections[0];
-        let sec2 = &input.sections[1];
+        // SDM derivation prefers pressure sensors + motor displacements; falls back to legacy bend.
+        let (curvature, measured_forces, _displacements, source, sensor_valid, motor_valid) =
+            derive_fused_curvature(&self.config, &input);
 
-        // Compute output.
-        let forces = compute_tendon_forces_dual(
-            &self.config,
-            sec1.angle_deg,
-            sec2.angle_deg,
-            sec1.direction_deg,
-            sec2.direction_deg,
-        );
-
-        let (curvature, tip_pose) = build_backbone(
-            &self.config,
-            sec1.angle_deg,
-            sec2.angle_deg,
-            sec1.direction_deg,
-            sec2.direction_deg,
-        );
+        let tip_position = integrate_backbone_from_profile(&curvature);
+        let tip_pose = TipPose { position_m: tip_position };
+        let forces = measured_forces;
 
         let sections = input.sections.clone();
-        let diagnostics = build_diagnostics(&curvature, &forces, &input);
+        let diagnostics = build_diagnostics(&curvature, &forces, &input, &source, sensor_valid, motor_valid);
 
         let output = DynamicsOutput {
             device_id: input.device_id.clone(),
@@ -644,10 +840,11 @@ mod tests {
         assert!((config.force_amp_n[0] - 90.0).abs() < 1e-9);
         assert!((config.force_amp_n[1] - 55.0).abs() < 1e-9);
         assert_eq!(config.backbone_points_per_segment, 60);
+        assert!((config.max_curvature_per_m[0] - 85.0_f64.to_radians() / 0.200).abs() < 1e-9);
     }
 
     #[test]
-    fn compute_tendon_forces_zero_angle_returns_base() {
+    fn compute_tendon_forces_zero_curvature_returns_base() {
         let config = DynamicsConfig::default();
         let forces_s0 = compute_tendon_forces(&config, 0.0, 0.0, 0);
         let forces_s1 = compute_tendon_forces(&config, 0.0, 0.0, 1);
@@ -666,9 +863,9 @@ mod tests {
     }
 
     #[test]
-    fn positive_segment_0_bend_loads_cable_0_more_than_cable_2() {
+    fn positive_segment_0_curvature_loads_cable_0_more_than_cable_2() {
         let config = DynamicsConfig::default();
-        let forces = compute_tendon_forces(&config, 60.0, 0.0, 0);
+        let forces = compute_tendon_forces(&config, curvature_from_legacy_angle_deg(60.0, config.segment_length_m[0]), 0.0, 0);
         // Cable 0 (index 0) at alpha=0, direction=0 → cos(0)=1 → max.
         // Cable 2 (index 2) at alpha=2PI/3, direction=0 → cos(2PI/3)=-0.5 → less.
         assert!(
@@ -688,7 +885,7 @@ mod tests {
         let forces = compute_tendon_forces(&config, f64::NAN, 0.0, 0);
         assert!(forces.iter().all(|f| *f == 0.0));
 
-        let forces2 = compute_tendon_forces(&config, 30.0, f64::INFINITY, 1);
+        let forces2 = compute_tendon_forces(&config, curvature_from_legacy_angle_deg(30.0, config.segment_length_m[1]), f64::INFINITY, 1);
         assert!(forces2.iter().all(|f| *f == 0.0));
     }
 
@@ -715,7 +912,11 @@ mod tests {
     #[test]
     fn build_backbone_output_length() {
         let config = DynamicsConfig::default();
-        let (curvature, tip) = build_backbone(&config, 30.0, 20.0, 0.0, 60.0);
+        let sections = vec![
+            SectionCurvatureState { curvature_per_m: curvature_from_legacy_angle_deg(30.0, config.segment_length_m[0]), direction_deg: 0.0 },
+            SectionCurvatureState { curvature_per_m: curvature_from_legacy_angle_deg(20.0, config.segment_length_m[1]), direction_deg: 60.0 },
+        ];
+        let (curvature, tip) = build_backbone(&config, &sections);
 
         let expected_len = 2 * config.backbone_points_per_segment + 1;
         assert_eq!(
@@ -753,7 +954,11 @@ mod tests {
     #[test]
     fn build_backbone_zero_bend_gives_straight_line() {
         let config = DynamicsConfig::default();
-        let (curvature, tip) = build_backbone(&config, 0.0, 0.0, 0.0, 0.0);
+        let sections = vec![
+            SectionCurvatureState { curvature_per_m: 0.0, direction_deg: 0.0 },
+            SectionCurvatureState { curvature_per_m: 0.0, direction_deg: 0.0 },
+        ];
+        let (curvature, tip) = build_backbone(&config, &sections);
 
         // Tip should be roughly at [0, 0, total_length_m].
         let total_m = config.total_length_m();
@@ -793,8 +998,8 @@ mod tests {
         assert_eq!(input.motors.len(), 6);
         assert_eq!(input.sensors.len(), 6);
         assert_eq!(input.sections.len(), 2);
-        assert!((input.sections[0].angle_deg - 15.0).abs() < 1e-9);
-        assert!((input.sections[1].angle_deg - 25.0).abs() < 1e-9);
+        assert!((input.sections[0].curvature_per_m - curvature_from_legacy_angle_deg(15.0, DynamicsConfig::default().segment_length_m[0])).abs() < 1e-9);
+        assert!((input.sections[1].curvature_per_m - curvature_from_legacy_angle_deg(25.0, DynamicsConfig::default().segment_length_m[1])).abs() < 1e-9);
         assert!((input.sections[0].direction_deg - 0.0).abs() < 1e-9);
         assert!((input.sections[1].direction_deg - 90.0).abs() < 1e-9);
     }

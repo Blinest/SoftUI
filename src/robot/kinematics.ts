@@ -1,4 +1,6 @@
 import * as THREE from "three";
+import type { BackboneOutput, BackboneSample } from "../dynamics/svcModel";
+import { buildBackboneFromCurvatureDistribution, mapSvcPointToThreeMm, mapSvcVectorToThree } from "../dynamics/svcModel";
 import type { ContinuumCommand, PoseSample, SegmentBend, TipPose } from "./types";
 
 export const DEG2RAD = Math.PI / 180;
@@ -199,6 +201,96 @@ export function segmentedTipPose(lengthMm: number, segments: [SegmentBendRad, Se
     angleDeg: segments.reduce((acc, item) => acc + item.angleRad, 0) * RAD2DEG,
     directionDeg: segments[segments.length - 1].directionRad * RAD2DEG,
   };
+}
+
+function toPoseSample(sample: BackboneSample): PoseSample {
+  const center = mapSvcPointToThreeMm(sample.pointM);
+  const tangent = mapSvcVectorToThree(sample.tangent);
+  const normal = mapSvcVectorToThree(sample.normal);
+  const binormal = mapSvcVectorToThree(sample.binormal);
+  return {
+    center,
+    tangent,
+    normal,
+    binormal,
+  };
+}
+
+export function samplesFromBackbone(backbone: BackboneOutput): PoseSample[] {
+  return backbone.samples.map(toPoseSample);
+}
+
+export function sampleBackboneAtS(backbone: BackboneOutput, sMm: number): PoseSample {
+  const samples = backbone.samples;
+  if (samples.length === 0) {
+    return { center: [0, 0, 0], tangent: [0, 1, 0], normal: [1, 0, 0], binormal: [0, 0, 1] };
+  }
+  const clamped = clamp(sMm, samples[0].sMm, samples[samples.length - 1].sMm);
+  let nextIndex = samples.findIndex((sample) => sample.sMm >= clamped);
+  if (nextIndex <= 0) return toPoseSample(samples[0]);
+  const next = samples[nextIndex];
+  const prev = samples[nextIndex - 1];
+  const t = (clamped - prev.sMm) / Math.max(next.sMm - prev.sMm, 1e-6);
+  const lerp3 = (a: [number, number, number], b: [number, number, number]): [number, number, number] => [
+    THREE.MathUtils.lerp(a[0], b[0], t),
+    THREE.MathUtils.lerp(a[1], b[1], t),
+    THREE.MathUtils.lerp(a[2], b[2], t),
+  ];
+  const posePrev = toPoseSample(prev);
+  const poseNext = toPoseSample(next);
+  const normalize3 = (v: [number, number, number]): [number, number, number] => {
+    const vector = new THREE.Vector3(...v).normalize();
+    return vector.toArray() as [number, number, number];
+  };
+  return {
+    center: lerp3(posePrev.center, poseNext.center),
+    tangent: normalize3(lerp3(posePrev.tangent, poseNext.tangent)),
+    normal: normalize3(lerp3(posePrev.normal, poseNext.normal)),
+    binormal: normalize3(lerp3(posePrev.binormal, poseNext.binormal)),
+  };
+}
+
+export function updateBoneChainFromBackbone(bones: THREE.Bone[], lengthMm: number, backbone: BackboneOutput): void {
+  if (bones.length === 0) return;
+  const rotationCount = Math.max(1, bones.length - 1);
+  const segmentLength = lengthMm / rotationCount;
+  const yAxis = new THREE.Vector3(0, 1, 0);
+  const worldQuaternions: THREE.Quaternion[] = [];
+
+  bones[0].position.set(0, 0, 0);
+  bones[0].quaternion.identity();
+  worldQuaternions[0] = new THREE.Quaternion();
+
+  for (let index = 1; index < bones.length; index += 1) {
+    const s = (index / rotationCount) * lengthMm;
+    const sample = sampleBackboneAtS(backbone, s);
+    const tangent = new THREE.Vector3(...sample.tangent).normalize();
+    const worldQuaternion = new THREE.Quaternion().setFromUnitVectors(yAxis, tangent);
+    const parentWorld = worldQuaternions[index - 1] ?? new THREE.Quaternion();
+    const localQuaternion = parentWorld.clone().invert().multiply(worldQuaternion).normalize();
+    bones[index].position.set(0, segmentLength, 0);
+    bones[index].quaternion.copy(localQuaternion);
+    worldQuaternions[index] = worldQuaternion;
+  }
+}
+
+export function dampBackbone(current: BackboneOutput | null, target: BackboneOutput, smoothing: number, dt: number): BackboneOutput {
+  if (!current || current.distribution.segments.length !== target.distribution.segments.length) return target;
+  const lambda = THREE.MathUtils.lerp(22, 3, smoothing);
+  const segments = target.distribution.segments.map((segment, index) => {
+    const prev = current.distribution.segments[index];
+    const kxPerM = THREE.MathUtils.damp(prev.kxPerM, segment.kxPerM, lambda, dt);
+    const kyPerM = THREE.MathUtils.damp(prev.kyPerM, segment.kyPerM, lambda, dt);
+    const kappaAbsPerM = Math.hypot(kxPerM, kyPerM);
+    return {
+      ...segment,
+      kxPerM,
+      kyPerM,
+      kappaAbsPerM,
+      phiRad: Math.atan2(-kxPerM, kyPerM),
+    };
+  });
+  return buildBackboneFromCurvatureDistribution({ ...target.distribution, segments });
 }
 
 export function damp(current: number, target: number, smoothing: number, dt: number): number {

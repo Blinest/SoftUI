@@ -1,3 +1,4 @@
+use crate::dynamics;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -6,7 +7,7 @@ pub struct PidConfig {
     pub kp: f64,
     pub ki: f64,
     pub kd: f64,
-    pub deadband_deg: f64,
+    pub deadband_curvature_per_m: f64,
     pub integral_limit: f64,
     pub output_limit: f64,
     pub sample_period_ms: u64,
@@ -18,7 +19,7 @@ impl Default for PidConfig {
             kp: 0.35,
             ki: 0.04,
             kd: 0.08,
-            deadband_deg: 0.2,
+            deadband_curvature_per_m: 0.02,
             integral_limit: 30.0,
             output_limit: 8.0,
             sample_period_ms: 50,
@@ -30,9 +31,9 @@ impl Default for PidConfig {
 #[serde(rename_all = "camelCase")]
 pub struct CycleLifeConfig {
     pub enabled: bool,
-    pub lower_angle_deg: f64,
-    pub upper_angle_deg: f64,
-    pub tolerance_deg: f64,
+    pub lower_curvature_per_m: f64,
+    pub upper_curvature_per_m: f64,
+    pub tolerance_curvature_per_m: f64,
     pub dwell_ms: u64,
     pub max_cycles: u32,
 }
@@ -41,9 +42,9 @@ impl Default for CycleLifeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            lower_angle_deg: 12.0,
-            upper_angle_deg: 48.0,
-            tolerance_deg: 1.0,
+            lower_curvature_per_m: 1.0471975511965976,
+            upper_curvature_per_m: 4.1887902047863905,
+            tolerance_curvature_per_m: 0.08726646259971647,
             dwell_ms: 250,
             max_cycles: 0,
         }
@@ -77,12 +78,23 @@ impl SafetyInput {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlFeedback {
-    pub angle_deg: f64,
-    pub target_angle_deg: f64,
+    pub dynamics_input: dynamics::DynamicsInput,
+    pub dynamics_output: Option<dynamics::DynamicsOutput>,
+    pub target_curvature_per_m: f64,
     pub pressure: f64,
+}
+
+impl ControlFeedback {
+    fn feedback_curvature_per_m(&self) -> f64 {
+        self.dynamics_input
+            .sections
+            .first()
+            .map(|section| section.curvature_per_m)
+            .unwrap_or(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -92,7 +104,7 @@ pub struct ControlDecision {
     pub allowed: bool,
     pub reason: Option<String>,
     pub phase: CycleLifePhase,
-    pub target_angle_deg: f64,
+    pub target_curvature_per_m: f64,
     pub pid_output: f64,
     pub motor_delta_mm: f64,
     pub cycles_completed: u32,
@@ -107,7 +119,7 @@ pub struct ControlStatus {
     pub active: bool,
     pub allowed: bool,
     pub reason: Option<String>,
-    pub target_angle_deg: f64,
+    pub target_curvature_per_m: f64,
     pub pid_output: f64,
     pub motor_delta_mm: f64,
     pub cycles_completed: u32,
@@ -122,7 +134,7 @@ impl Default for ControlStatus {
             active: false,
             allowed: false,
             reason: Some("cycle life inactive".to_string()),
-            target_angle_deg: 0.0,
+            target_curvature_per_m: 0.0,
             pid_output: 0.0,
             motor_delta_mm: 0.0,
             cycles_completed: 0,
@@ -161,7 +173,7 @@ impl PidController {
     }
 
     pub fn step(&mut self, error: f64, dt_ms: u64) -> f64 {
-        if !error.is_finite() || error.abs() <= self.config.deadband_deg {
+        if !error.is_finite() || error.abs() <= self.config.deadband_curvature_per_m {
             self.reset();
             return 0.0;
         }
@@ -188,7 +200,7 @@ pub struct ControlRuntime {
     active: bool,
     allowed: bool,
     reason: Option<String>,
-    target_angle_deg: f64,
+    target_curvature_per_m: f64,
     pid_output: f64,
     motor_delta_mm: f64,
     cycles_completed: u32,
@@ -210,7 +222,7 @@ impl ControlRuntime {
             active: false,
             allowed: false,
             reason: Some("cycle life inactive".to_string()),
-            target_angle_deg: 0.0,
+            target_curvature_per_m: 0.0,
             pid_output: 0.0,
             motor_delta_mm: 0.0,
             cycles_completed: 0,
@@ -226,7 +238,7 @@ impl ControlRuntime {
             active: self.active,
             allowed: self.allowed,
             reason: self.reason.clone(),
-            target_angle_deg: self.target_angle_deg,
+            target_curvature_per_m: self.target_curvature_per_m,
             pid_output: self.pid_output,
             motor_delta_mm: self.motor_delta_mm,
             cycles_completed: self.cycles_completed,
@@ -255,7 +267,7 @@ impl ControlRuntime {
         self.active = true;
         self.allowed = false;
         self.reason = Some("waiting for safe feedback".to_string());
-        self.target_angle_deg = self.cycle.upper_angle_deg;
+        self.target_curvature_per_m = self.cycle.upper_curvature_per_m;
         self.pid_output = 0.0;
         self.motor_delta_mm = 0.0;
         self.cycles_completed = 0;
@@ -297,7 +309,8 @@ impl ControlRuntime {
 
         self.allowed = true;
         self.reason = None;
-        self.advance_phase(feedback.angle_deg, dt_ms);
+        let feedback_curvature_per_m = feedback.feedback_curvature_per_m();
+        self.advance_phase(feedback_curvature_per_m, dt_ms);
 
         if matches!(self.phase, CycleLifePhase::Complete) {
             self.active = false;
@@ -309,20 +322,20 @@ impl ControlRuntime {
             return self.decision();
         }
 
-        let error = self.target_angle_deg - feedback.angle_deg;
+        let error = self.target_curvature_per_m - feedback_curvature_per_m;
         self.pid_output = self.pid.step(error, dt_ms);
         self.motor_delta_mm = self.pid_output;
         self.decision()
     }
 
-    fn advance_phase(&mut self, angle_deg: f64, dt_ms: u64) {
+    fn advance_phase(&mut self, curvature_per_m: f64, dt_ms: u64) {
         match self.phase {
             CycleLifePhase::MovingUpper => {
-                self.target_angle_deg = self.cycle.upper_angle_deg;
+                self.target_curvature_per_m = self.cycle.upper_curvature_per_m;
                 if close_enough(
-                    angle_deg,
-                    self.cycle.upper_angle_deg,
-                    self.cycle.tolerance_deg,
+                    curvature_per_m,
+                    self.cycle.upper_curvature_per_m,
+                    self.cycle.tolerance_curvature_per_m,
                 ) {
                     self.phase = CycleLifePhase::HoldingUpper;
                     self.dwell_elapsed_ms = 0;
@@ -330,7 +343,7 @@ impl ControlRuntime {
                 }
             }
             CycleLifePhase::HoldingUpper => {
-                self.target_angle_deg = self.cycle.upper_angle_deg;
+                self.target_curvature_per_m = self.cycle.upper_curvature_per_m;
                 self.dwell_elapsed_ms = self.dwell_elapsed_ms.saturating_add(dt_ms);
                 if self.dwell_elapsed_ms >= self.cycle.dwell_ms {
                     self.phase = CycleLifePhase::MovingLower;
@@ -339,11 +352,11 @@ impl ControlRuntime {
                 }
             }
             CycleLifePhase::MovingLower => {
-                self.target_angle_deg = self.cycle.lower_angle_deg;
+                self.target_curvature_per_m = self.cycle.lower_curvature_per_m;
                 if close_enough(
-                    angle_deg,
-                    self.cycle.lower_angle_deg,
-                    self.cycle.tolerance_deg,
+                    curvature_per_m,
+                    self.cycle.lower_curvature_per_m,
+                    self.cycle.tolerance_curvature_per_m,
                 ) {
                     self.phase = CycleLifePhase::HoldingLower;
                     self.dwell_elapsed_ms = 0;
@@ -351,7 +364,7 @@ impl ControlRuntime {
                 }
             }
             CycleLifePhase::HoldingLower => {
-                self.target_angle_deg = self.cycle.lower_angle_deg;
+                self.target_curvature_per_m = self.cycle.lower_curvature_per_m;
                 self.dwell_elapsed_ms = self.dwell_elapsed_ms.saturating_add(dt_ms);
                 if self.dwell_elapsed_ms >= self.cycle.dwell_ms {
                     self.cycles_completed = self.cycles_completed.saturating_add(1);
@@ -359,7 +372,7 @@ impl ControlRuntime {
                         self.phase = CycleLifePhase::Complete;
                     } else {
                         self.phase = CycleLifePhase::MovingUpper;
-                        self.target_angle_deg = self.cycle.upper_angle_deg;
+                        self.target_curvature_per_m = self.cycle.upper_curvature_per_m;
                     }
                     self.dwell_elapsed_ms = 0;
                     self.pid.reset();
@@ -375,7 +388,7 @@ impl ControlRuntime {
             allowed: self.allowed,
             reason: self.reason.clone(),
             phase: self.phase,
-            target_angle_deg: self.target_angle_deg,
+            target_curvature_per_m: self.target_curvature_per_m,
             pid_output: self.pid_output,
             motor_delta_mm: self.motor_delta_mm,
             cycles_completed: self.cycles_completed,
@@ -412,6 +425,25 @@ mod tests {
         }
     }
 
+    fn feedback(curvature_per_m: f64) -> ControlFeedback {
+        ControlFeedback {
+            dynamics_input: dynamics::DynamicsInput {
+                device_id: "control-test".to_string(),
+                timestamp_ms: 0,
+                dt_ms: 50,
+                motors: Vec::new(),
+                sensors: Vec::new(),
+                sections: vec![
+                    dynamics::SectionCurvatureState { curvature_per_m, direction_deg: 0.0 },
+                    dynamics::SectionCurvatureState { curvature_per_m: 0.0, direction_deg: 60.0 },
+                ],
+            },
+            dynamics_output: None,
+            target_curvature_per_m: curvature_per_m,
+            pressure: 0.0,
+        }
+    }
+
     #[test]
     fn pid_output_is_limited() {
         let mut pid = PidController::new(PidConfig {
@@ -427,12 +459,12 @@ mod tests {
     #[test]
     fn pid_deadband_resets_output() {
         let mut pid = PidController::new(PidConfig {
-            deadband_deg: 0.5,
+            deadband_curvature_per_m: 0.05,
             ..PidConfig::default()
         });
 
         assert!(pid.step(2.0, 50).abs() > 0.0);
-        assert_eq!(pid.step(0.2, 50), 0.0);
+        assert_eq!(pid.step(0.02, 50), 0.0);
     }
 
     #[test]
@@ -441,11 +473,7 @@ mod tests {
         runtime.start_cycle(Some(CycleLifeConfig::default()));
 
         let decision = runtime.step_cycle(
-            ControlFeedback {
-                angle_deg: 10.0,
-                target_angle_deg: 48.0,
-                pressure: 0.0,
-            },
+            feedback(10.0),
             SafetyInput {
                 emergency_latched: true,
                 ..safe()
@@ -463,32 +491,26 @@ mod tests {
         let mut runtime = ControlRuntime::default();
         runtime.start_cycle(Some(CycleLifeConfig {
             enabled: true,
-            lower_angle_deg: 10.0,
-            upper_angle_deg: 20.0,
-            tolerance_deg: 0.5,
+            lower_curvature_per_m: 1.0,
+            upper_curvature_per_m: 2.0,
+            tolerance_curvature_per_m: 0.05,
             dwell_ms: 100,
             max_cycles: 1,
         }));
 
-        let feedback = |angle_deg| ControlFeedback {
-            angle_deg,
-            target_angle_deg: angle_deg,
-            pressure: 0.0,
-        };
-
         assert_eq!(
-            runtime.step_cycle(feedback(19.8), safe(), 50).phase,
+            runtime.step_cycle(feedback(1.98), safe(), 50).phase,
             CycleLifePhase::HoldingUpper
         );
         assert_eq!(
-            runtime.step_cycle(feedback(20.0), safe(), 100).phase,
+            runtime.step_cycle(feedback(2.0), safe(), 100).phase,
             CycleLifePhase::MovingLower
         );
         assert_eq!(
-            runtime.step_cycle(feedback(10.1), safe(), 50).phase,
+            runtime.step_cycle(feedback(1.01), safe(), 50).phase,
             CycleLifePhase::HoldingLower
         );
-        let complete = runtime.step_cycle(feedback(10.0), safe(), 100);
+        let complete = runtime.step_cycle(feedback(1.0), safe(), 100);
 
         assert_eq!(complete.phase, CycleLifePhase::Complete);
         assert_eq!(complete.cycles_completed, 1);

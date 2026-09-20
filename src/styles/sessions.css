@@ -1,0 +1,156 @@
+/* 会话页：录制工作台（左栏）与历史表格（主区）。 */
+
+.sessions-recorder-status {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+.sessions-recorder-status .status-strip-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.sessions-recorder-status strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessions-recorder-actions {
+  display: grid;
+  gap: 8px;
+}
+
+.sessions-name-input label {
+  display: grid;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.sessions-name-input input {
+  width: 100%;
+  min-width: 0;
+}
+
+.sessions-recorder-btn-group {
+  display: grid;
+  gap: 8px;
+}
+
+.sessions-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: var(--surface-page);
+  color: var(--text-muted);
+}
+
+.sessions-search input {
+  min-width: 0;
+  width: 100%;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+}
+
+.sessions-empty {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: center;
+}
+
+.sessions-table-wrap {
+  min-width: 0;
+  overflow: auto;
+}
+
+.sessions-table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.sessions-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-page);
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.sessions-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  vertical-align: middle;
+}
+
+.sessions-table tbody tr:hover td {
+  background: var(--surface-page);
+}
+
+.session-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.session-rename-inline {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.session-rename-inline input {
+  min-width: 0;
+  width: 140px;
+  height: 28px;
+  min-height: 28px;
+}
+
+.session-confirm-delete {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--status-error);
+  font-size: 12px;
+}
+
+.sessions-footer {
+  padding-top: 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.ghost-btn-sm.danger {
+  border-color: var(--button-danger-bg);
+  color: var(--button-danger-bg);
+}
+
+.theme-dark .ghost-btn-sm.danger,
+.app-shell.theme-dark .ghost-btn-sm.danger {
+  color: var(--status-error);
+}

@@ -1,0 +1,501 @@
+/* 设备工作台：上下文栏、标签页、各标签内容、3D 卡片。 */
+
+/* ---- 左侧设备上下文栏 ---- */
+
+.device-context-panel {
+  display: grid;
+  align-content: start;
+  gap: 14px;
+  min-height: 100%;
+}
+
+.device-context-header {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.device-context-header > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.device-context-header span,
+.context-status-list span,
+.context-metric-list span,
+.context-port-row span,
+.workspace-panel > header span,
+.automatic-status-grid span,
+.motor-state-strip span,
+.motor-state-strip small,
+.monitor-summary-grid span,
+.monitor-summary-grid small,
+.playback-session-row span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.device-context-header strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-status-list,
+.context-metric-list {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--border-subtle);
+}
+
+.context-status-list > div,
+.context-metric-list > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 9px;
+  background: var(--surface-panel);
+}
+
+.context-status-list strong,
+.context-metric-list strong {
+  max-width: 130px;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-action-stack {
+  display: grid;
+  gap: 7px;
+}
+
+.context-action-stack .ghost-btn {
+  justify-content: flex-start;
+}
+
+.context-section {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.context-section h3 {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.context-device-list,
+.context-port-list {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.context-port-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--surface-page);
+}
+
+.context-port-row > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.context-port-row strong,
+.context-port-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 标签页 ---- */
+
+.workspace-page-tabs {
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border-default);
+}
+
+.workspace-page-tab {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  height: 40px;
+  padding: 0 13px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.workspace-page-tab:hover,
+.workspace-page-tab.is-active {
+  color: var(--text-primary);
+}
+
+.workspace-page-tab.is-active::after {
+  position: absolute;
+  right: 10px;
+  bottom: -1px;
+  left: 10px;
+  height: 2px;
+  background: var(--action-primary);
+  content: "";
+}
+
+.workspace-page-tab:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* 高度交给父级：外层 .layout-fill-region 是「1fr + 外边距」的栅格，
+ * 这里再写 height: 100% 会把外边距顶出去，多出一条纵向滚动。 */
+.workspace-active-pane {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ---- 标签内容容器 ---- */
+
+.workspace-pane-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: minmax(min-content, 1fr);
+  align-content: stretch;
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
+.workspace-panel {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: var(--surface-panel);
+  color: var(--text-primary);
+}
+
+.workspace-panel-wide {
+  grid-column: 1 / -1;
+}
+
+.workspace-panel > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.workspace-panel > header > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.workspace-panel > header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.workspace-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+  gap: 10px;
+  padding: 12px;
+}
+
+.workspace-form-grid-motor {
+  grid-template-columns: repeat(4, minmax(110px, 1fr)) auto auto;
+}
+
+.workspace-form-grid-pid,
+.workspace-form-grid-cycle {
+  grid-template-columns: repeat(3, minmax(100px, 1fr));
+}
+
+.workspace-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.workspace-field input,
+.workspace-field select {
+  width: 100%;
+  min-width: 0;
+  height: var(--control-height);
+  padding: 0 9px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+.workspace-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 12px 12px;
+}
+
+.motor-state-strip,
+.monitor-summary-grid,
+.automatic-status-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--border-subtle);
+}
+
+.motor-state-strip > div,
+.monitor-summary-grid > div,
+.automatic-status-grid > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  background: var(--surface-panel);
+}
+
+.motor-state-strip strong,
+.monitor-summary-grid strong,
+.automatic-status-grid strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automatic-status-grid {
+  border-top: 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.monitor-summary-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border: 1px solid var(--border-subtle);
+  height: 100%;
+  min-height: 0;
+}
+
+.monitor-motor-summary-cell {
+  grid-template-rows: auto minmax(0, 1fr);
+  align-content: center;
+}
+
+.monitor-motor-summary-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.monitor-motor-status-lamp {
+  display: block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--status-error);
+}
+
+.monitor-motor-status-lamp.is-running {
+  background: var(--status-ok);
+}
+
+.monitor-motor-summary-value {
+  display: block;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 实时数据表 ---- */
+
+.workspace-table {
+  min-width: 720px;
+  overflow: auto;
+}
+
+.workspace-table-row {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(90px, 1fr));
+  min-width: 720px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.workspace-table-row > span {
+  min-width: 0;
+  overflow: hidden;
+  padding: 8px 10px;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-table-row.is-head {
+  background: var(--surface-page);
+  font-weight: 700;
+}
+
+/* ---- 空态 ---- */
+
+.workspace-empty-state {
+  display: grid;
+  min-height: 180px;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.workspace-empty-state strong {
+  color: var(--text-primary);
+}
+
+.workspace-empty-state span {
+  max-width: 520px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ---- 回放列表 ---- */
+
+.playback-session-list {
+  display: grid;
+}
+
+.playback-session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.playback-session-row > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.playback-session-row strong,
+.playback-session-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 3D 模型卡片 / 摄像头卡片 ----
+ * 两张卡片都是"整块画布"型：卡片体不留内边距，内容自己撑满。 */
+
+/* 用复合选择器提高特异性：layouts.css 的 .feature-card-body 有 padding，
+ * 单写 .model-card-body 会因加载顺序输掉。 */
+.feature-card-body.model-card-body {
+  padding: 0;
+  overflow: hidden;
+}
+
+.model-scene-col {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--surface-panel);
+}
+
+.model-scene-col .robot-scene {
+  min-height: 100%;
+  border: 0;
+  border-radius: 0;
+}
+
+/* 摄像头容器必须自带 position: relative。
+ * 里面的 <video> 是 position:absolute; inset:0，缺少定位祖先时
+ * 会直接铺满整个视口 —— 这正是"摄像界面占据整个界面"的原因。 */
+.camera-feed-wrap {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface-page);
+}
+
+@media (max-width: 1439px) {
+  .workspace-form-grid-motor {
+    grid-template-columns: repeat(3, minmax(110px, 1fr));
+  }
+
+  .motor-state-strip,
+  .automatic-status-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 1119px) {
+  .workspace-pane-grid,
+  .workspace-form-grid,
+  .workspace-form-grid-motor,
+  .workspace-form-grid-pid,
+  .workspace-form-grid-cycle {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .workspace-panel-wide {
+    grid-column: 1;
+  }
+
+}

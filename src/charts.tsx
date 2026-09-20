@@ -1,11 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
-import { Database, Download, PauseCircle, Play, RefreshCw } from "lucide-react";
+import { ChartLayout } from "./layouts/ChartLayout";
+import { ChannelSidebar } from "./components/layout/ResponsiveRail";
+import { ChartToolbar } from "./components/ChartToolbar";
+import { curvatureDistributionFromSnapshot, summarizeBackbone, buildBackboneFromCurvatureDistribution } from "./dynamics/svcModel";
 import type { ChartSection, DeviceSnapshot, RuntimeSnapshot, SessionInfo } from "./softuiTypes";
+import "./styles/charts.css";
 
-type ChartKind = "position" | "velocity" | "acceleration" | "bend" | "sensorX" | "sensorY" | "sensorZ";
+type ChartKind = "position" | "velocity" | "acceleration" | "curvature" | "sensorX" | "sensorY" | "sensorZ";
 
 interface ChartPanelConfig {
   key: ChartKind;
@@ -23,7 +27,7 @@ const CHARTS: ChartPanelConfig[] = [
   { key: "position", title: "电机位移曲线", unit: "mm", match: (name, type) => type === "motor" && name.endsWith(" pos") },
   { key: "velocity", title: "电机速度曲线", unit: "mm/s", match: (name, type) => type === "motor" && name.endsWith(" vel") },
   { key: "acceleration", title: "电机加速度曲线", unit: "mm/s²", match: (name, type) => type === "motor" && name.endsWith(" acc") },
-  { key: "bend", title: "弯曲曲线", unit: "deg", match: (_name, type) => type === "bend" },
+  { key: "curvature", title: "曲率分布时间曲线", unit: "1/m", match: (_name, type) => type === "curvature" },
   { key: "sensorX", title: "传感器 X 轴曲线", unit: "N", match: (name, type) => type === "sensor" && name.endsWith(" X") },
   { key: "sensorY", title: "传感器 Y 轴曲线", unit: "N", match: (name, type) => type === "sensor" && name.endsWith(" Y") },
   { key: "sensorZ", title: "传感器 Z 轴曲线", unit: "N", match: (name, type) => type === "sensor" && name.endsWith(" Z") },
@@ -51,8 +55,20 @@ function chartsFromFrames(frames: DeviceSnapshot[]): ChartSection | null {
     channels.push({ name: `Motor ${motor.id} acc`, unit: "mm/s²", channelType: "motor", channelIndex: motor.id, points: ordered.map((frame) => frame.motors.find((item) => item.id === motor.id)?.accelerationMmPerSec2 ?? 0) });
   }
 
-  channels.push({ name: "Bend S1", unit: "deg", channelType: "bend", channelIndex: 1, points: ordered.map((frame) => frame.bend.section1.angleDeg) });
-  channels.push({ name: "Bend S2", unit: "deg", channelType: "bend", channelIndex: 2, points: ordered.map((frame) => frame.bend.section2.angleDeg) });
+  const distributions = ordered.map((frame) => curvatureDistributionFromSnapshot(frame, { basisSegmentCount: 12 }));
+  const summaries = distributions.map((distribution) => summarizeBackbone(buildBackboneFromCurvatureDistribution(distribution)));
+  const basisCount = distributions[0]?.basisSegmentCount ?? 0;
+  for (let index = 0; index < basisCount; index += 1) {
+    channels.push({
+      name: `κ ${String(index + 1).padStart(2, "0")}`,
+      unit: "1/m",
+      channelType: "curvature",
+      channelIndex: index + 1,
+      points: distributions.map((distribution) => distribution.segments[index]?.kappaAbsPerM ?? 0),
+    });
+  }
+  channels.push({ name: "κ max", unit: "1/m", channelType: "curvature", channelIndex: basisCount + 1, points: summaries.map((summary) => summary.maxKappaPerM) });
+  channels.push({ name: "κ mean", unit: "1/m", channelType: "curvature", channelIndex: basisCount + 2, points: summaries.map((summary) => summary.meanKappaPerM) });
 
   for (const sensor of first.sensors) {
     sensor.alias.forEach((axis, axisIndex) => {
@@ -117,15 +133,20 @@ function axisRanges(timestamps: number[], channels: ChartSection["channels"]) {
   return { x: { min: xMin, max: xMax > xMin ? xMax : xMin + 1 }, y: { min: yMin, max: yMax } };
 }
 
-function ChartPanel({ config, charts, paused, timeOrigin }: { config: ChartPanelConfig; charts: ChartSection; paused: boolean; timeOrigin: number }) {
+function ChartPanel({ config, charts, paused, timeOrigin, hidden, onToggleChannel }: {
+  config: ChartPanelConfig;
+  charts: ChartSection;
+  paused: boolean;
+  timeOrigin: number;
+  hidden: Record<string, boolean>;
+  onToggleChannel: (name: string) => void;
+}) {
   const hostRef = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
   const lastKeyRef = useRef("");
-  const [hidden, setHidden] = useState<Record<string, boolean>>({});
   const [readout, setReadout] = useState<CursorReadout | null>(null);
 
   const panelChannels = useMemo(() => charts.channels.filter((channel) => config.match(channel.name, channel.channelType)), [charts.channels, config]);
-  const channelNames = useMemo(() => channelSignature(panelChannels), [panelChannels]);
   const visibleChannels = useMemo(() => panelChannels.filter((channel) => !hidden[channel.name]), [hidden, panelChannels]);
   const timestamps = useMemo(() => fallbackTimestamps(charts), [charts]);
   const alignedData = useMemo<uPlot.AlignedData>(() => [timestamps, ...visibleChannels.map((channel) => channel.points)], [timestamps, visibleChannels]);
@@ -138,14 +159,6 @@ function ChartPanel({ config, charts, paused, timeOrigin }: { config: ChartPanel
     timestampsRef.current = timestamps;
     visibleChannelsRef.current = visibleChannels;
   }, [timestamps, visibleChannels]);
-
-  useEffect(() => {
-    setHidden((prev) => {
-      const next: Record<string, boolean> = {};
-      for (const channel of panelChannels) next[channel.name] = prev[channel.name] ?? false;
-      return next;
-    });
-  }, [channelNames, panelChannels]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -230,7 +243,7 @@ function ChartPanel({ config, charts, paused, timeOrigin }: { config: ChartPanel
         <div className="chart-split-legend">
           {panelChannels.map((channel, index) => (
             <label className={hidden[channel.name] ? "muted" : ""} key={channel.name}>
-              <input type="checkbox" checked={!hidden[channel.name]} onChange={() => setHidden((prev) => ({ ...prev, [channel.name]: !prev[channel.name] }))} />
+              <input type="checkbox" checked={!hidden[channel.name]} onChange={() => onToggleChannel(channel.name)} />
               <i style={{ background: COLORS[index % COLORS.length] }} />
               {channel.name}
             </label>
@@ -256,6 +269,11 @@ export default function ChartsPage({ snapshot: _snapshot }: { snapshot: RuntimeS
   const [exportPath, setExportPath] = useState("");
   const [chartError, setChartError] = useState("");
   const [timeOrigin, setTimeOrigin] = useState<number | null>(null);
+  const [hidden, setHidden] = useState<Record<string, boolean>>({});
+
+  const toggleChannel = useCallback((name: string) => {
+    setHidden((prev) => ({ ...prev, [name]: !prev[name] }));
+  }, []);
   const liveCharts = useMemo(() => chartsFromFrames(liveFrames), [liveFrames]);
   const historyCharts = useMemo(() => chartsFromFrames(historyFrames), [historyFrames]);
   const activeCharts: ChartSection = selectedSessionId === "live" ? liveCharts ?? emptyCharts() : historyCharts ?? emptyCharts();
@@ -326,34 +344,62 @@ export default function ChartsPage({ snapshot: _snapshot }: { snapshot: RuntimeS
     }
   };
 
-  return (
-    <div className="charts-split-page">
-      <div className="charts-toolbar split">
-        <div className="charts-toolbar-left">
-          <select className="charts-session-select" value={selectedSessionId} onChange={(event) => setSelectedSessionId(event.target.value)}>
-            <option value="live">实时数据</option>
-            {sessions.map((session) => <option key={session.id} value={session.id}>{session.name}</option>)}
-          </select>
-          <button type="button" className={`ghost-btn-sm ${paused ? "active" : ""}`} onClick={() => setPaused(!paused)}>
-            {paused ? <Play size={14} /> : <PauseCircle size={14} />}
-            <span>{paused ? "继续" : "暂停"}</span>
-          </button>
-          <button type="button" className="ghost-btn-sm" onClick={() => setPaused(false)}>
-            <RefreshCw size={14} />
-            <span>刷新</span>
-          </button>
-          <button type="button" className="ghost-btn-sm" onClick={() => void exportAllChannels()}>
-            <Download size={14} />
-            <span>导出 CSV</span>
-          </button>
-          {playbackMode ? <span className="playback-mode-badge"><Database size={14} /><span>回放模式</span></span> : null}
-        </div>
-        <div className="charts-toolbar-status">{formatStatus(chartError, exportPath, playbackMode, historyFrames.length)}</div>
-      </div>
+  const chartKeyFor = useCallback(
+    (channel: ChartSection["channels"][number]) =>
+      CHARTS.find((config) => config.match(channel.name, channel.channelType))?.key ?? null,
+    [],
+  );
+  const chartTitles = useMemo(
+    () => Object.fromEntries(CHARTS.map((config) => [config.key as string, config.title])),
+    [],
+  );
+  const visibleNames = useMemo(() => (
+    new Set(
+      activeCharts.channels
+        .filter((channel) => !hidden[channel.name])
+        .map((channel) => channel.name),
+    )
+  ), [activeCharts.channels, hidden]);
 
+  return (
+    <ChartLayout
+      channelsLabel="曲线通道"
+      channels={
+        <ChannelSidebar
+          channels={activeCharts.channels}
+          visibleNames={visibleNames}
+          chartKeyFor={chartKeyFor}
+          chartTitles={chartTitles}
+          onToggleChannel={toggleChannel}
+        />
+      }
+      toolbar={
+        <ChartToolbar
+          sessions={sessions}
+          selectedSessionId={selectedSessionId}
+          paused={paused}
+          playbackMode={playbackMode}
+          status={formatStatus(chartError, exportPath, playbackMode, historyFrames.length)}
+          onSessionChange={setSelectedSessionId}
+          onPauseChange={setPaused}
+          onRefresh={() => setPaused(false)}
+          onExportCsv={() => void exportAllChannels()}
+        />
+      }
+    >
       <div className="charts-split-grid">
-        {CHARTS.map((config) => <ChartPanel key={config.key} config={config} charts={activeCharts} paused={paused} timeOrigin={timeOrigin ?? activeCharts.timestamps?.[0] ?? 0} />)}
+        {CHARTS.map((config) => (
+          <ChartPanel
+            key={config.key}
+            config={config}
+            charts={activeCharts}
+            paused={paused}
+            timeOrigin={timeOrigin ?? activeCharts.timestamps?.[0] ?? 0}
+            hidden={hidden}
+            onToggleChannel={toggleChannel}
+          />
+        ))}
       </div>
-    </div>
+    </ChartLayout>
   );
 }

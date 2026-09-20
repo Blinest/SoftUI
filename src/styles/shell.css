@@ -1,0 +1,277 @@
+/* 应用壳层：侧边栏 / 全局状态栏 / 内容区 / 底部状态栏的三段栅格。 */
+
+.app-shell {
+  min-height: 100vh;
+  height: 100vh;
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-rows: 56px minmax(0, 1fr) 28px;
+  overflow: hidden;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  transition: grid-template-columns 180ms ease;
+}
+
+.app-shell.is-sidebar-collapsed {
+  grid-template-columns: 56px minmax(0, 1fr);
+}
+
+.app-sidebar { grid-row: 1 / -1; min-width: 0; }
+.global-status-bar { grid-column: 2; min-width: 0; }
+.app-content { grid-column: 2; min-width: 0; min-height: 0; overflow: hidden; }
+.app-footer { grid-column: 2; min-width: 0; }
+
+/* ---- 侧边栏 ---- */
+
+.app-sidebar {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-sidebar);
+  border-right: 1px solid var(--border-default);
+  color: var(--text-sidebar);
+  overflow: hidden;
+}
+
+.sidebar-brand {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  height: 56px;
+  min-width: 0;
+  padding: 0 12px 0 16px;
+  border-bottom: 1px solid var(--border-default);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.sidebar-brand > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-collapse-button {
+  display: inline-grid;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-card);
+  background: transparent;
+  color: var(--text-sidebar);
+}
+
+.sidebar-collapse-button:hover {
+  border-color: var(--border-default);
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+.sidebar-nav {
+  display: grid;
+  gap: 20px;
+  padding: 16px 12px;
+  overflow-y: auto;
+}
+
+.sidebar-nav-group {
+  display: grid;
+  gap: 4px;
+}
+
+.sidebar-nav-group h2 {
+  margin: 0 8px 4px;
+  color: var(--text-sidebar-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sidebar-nav-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-card);
+  color: var(--text-sidebar);
+  text-decoration: none;
+}
+
+.sidebar-nav-link > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-nav-link:hover,
+.sidebar-nav-link.is-active {
+  border-color: var(--border-default);
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+.app-sidebar.is-collapsed .sidebar-brand {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  padding-inline: 12px;
+}
+
+.app-sidebar.is-collapsed .sidebar-brand > span,
+.app-sidebar.is-collapsed .sidebar-nav-group h2,
+.app-sidebar.is-collapsed .sidebar-nav-link span {
+  display: none;
+}
+
+.app-sidebar.is-collapsed .sidebar-nav {
+  gap: 12px;
+  padding: 12px 8px;
+}
+
+.app-sidebar.is-collapsed .sidebar-nav-group {
+  gap: 6px;
+}
+
+.app-sidebar.is-collapsed .sidebar-nav-link {
+  justify-content: center;
+  padding: 0;
+}
+
+/* ---- 全局状态栏 ---- */
+
+.global-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-default);
+  background: var(--surface-panel);
+}
+
+.global-status-items,
+.app-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.global-status-items { overflow: hidden; }
+
+.global-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.global-status-device {
+  font-weight: 700;
+}
+
+.global-status-device,
+.global-status-connection {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-status-connection,
+.status-indicator,
+.app-footer {
+  color: var(--text-secondary);
+}
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: var(--surface-overlay);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.status-chip.is-ok {
+  border-color: rgba(15, 123, 79, 0.35);
+  color: var(--status-ok);
+}
+
+.status-chip.is-muted {
+  color: var(--text-secondary);
+}
+
+.status-chip.is-warning {
+  border-color: rgba(154, 97, 0, 0.35);
+  color: var(--status-warning);
+}
+
+.status-chip.is-danger,
+.status-chip.is-emergency {
+  border-color: rgba(210, 45, 58, 0.45);
+  color: var(--status-error);
+}
+
+.emergency-stop-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-height: 36px;
+  border-color: var(--button-danger-bg);
+  background: var(--button-danger-bg);
+  color: var(--button-danger-text);
+  font-weight: 700;
+}
+
+.global-account-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: min(220px, 28vw);
+  padding: 0 8px;
+  border-color: var(--button-default-border);
+  background: var(--button-default-bg);
+  color: var(--button-default-text);
+}
+
+.global-account-control span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 内容区 ---- */
+
+.app-content {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app-page-content {
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ---- 底部状态栏 ---- */
+
+.app-footer {
+  padding: 0 16px;
+  overflow: hidden;
+  border-top: 1px solid var(--border-default);
+  background: var(--surface-panel);
+  font-size: 12px;
+  white-space: nowrap;
+}

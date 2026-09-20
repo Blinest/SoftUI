@@ -79,6 +79,16 @@ impl SqliteStore {
                 PRIMARY KEY (session_id, sequence, device_id)
             );
 
+            CREATE TABLE IF NOT EXISTS dynamics_outputs (
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                received_at_ms INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                model_version TEXT NOT NULL DEFAULT 'curvature-v1',
+                PRIMARY KEY (session_id, sequence, device_id)
+            );
+
             CREATE TABLE IF NOT EXISTS control_commands (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp_ms INTEGER NOT NULL,
@@ -101,6 +111,8 @@ impl SqliteStore {
 
             CREATE INDEX IF NOT EXISTS idx_session_snapshots_time
                 ON session_snapshots(session_id, received_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_dynamics_outputs_time
+                ON dynamics_outputs(session_id, received_at_ms);
             CREATE INDEX IF NOT EXISTS idx_audit_scope_time
                 ON audit_logs(scope, timestamp_ms);
             "#,
@@ -148,6 +160,7 @@ impl SqliteStore {
         self.run_sql(&format!(
             r#"
             DELETE FROM session_snapshots WHERE session_id = {id};
+            DELETE FROM dynamics_outputs WHERE session_id = {id};
             DELETE FROM sessions WHERE id = {id};
             "#,
             id = sql_string(id),
@@ -188,6 +201,54 @@ impl SqliteStore {
             r#"
             SELECT snapshot_json
             FROM session_snapshots
+            WHERE session_id = {session_id}
+            ORDER BY received_at_ms ASC, sequence ASC
+            LIMIT {limit};
+            "#,
+            session_id = sql_string(session_id),
+            limit = limit,
+        ))?;
+        Ok(output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && *line != "wal")
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    pub fn insert_dynamics_output<T: Serialize>(
+        &self,
+        session_id: &str,
+        sequence: u64,
+        received_at_ms: u64,
+        device_id: &str,
+        output: &T,
+    ) -> Result<(), String> {
+        let output_json = serde_json::to_string(output).map_err(|error| error.to_string())?;
+        self.run_sql(&format!(
+            r#"
+            INSERT OR REPLACE INTO dynamics_outputs
+                (session_id, sequence, received_at_ms, device_id, output_json, model_version)
+            VALUES ({session_id}, {sequence}, {received_at_ms}, {device_id}, {output_json}, 'curvature-v1');
+            "#,
+            session_id = sql_string(session_id),
+            sequence = sequence,
+            received_at_ms = received_at_ms,
+            device_id = sql_string(device_id),
+            output_json = sql_string(&output_json),
+        ))
+        .map(|_| ())
+    }
+
+    pub fn read_dynamics_output_json(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let output = self.run_sql(&format!(
+            r#"
+            SELECT output_json
+            FROM dynamics_outputs
             WHERE session_id = {session_id}
             ORDER BY received_at_ms ASC, sequence ASC
             LIMIT {limit};
@@ -251,6 +312,7 @@ impl SqliteStore {
         let allowed = [
             "sessions",
             "session_snapshots",
+            "dynamics_outputs",
             "control_commands",
             "audit_logs",
         ];

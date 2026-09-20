@@ -1,0 +1,96 @@
+/* 语义化主题 token。
+ *
+ * 浅色是默认值：页面在任何脚本执行前就是浅色中性底，避免主题未定时黑闪。
+ * 作用域同时挂在 :root[data-theme] 与旧的 .theme-light / .theme-dark 包装类上，
+ * 这样迁移期两条路径都生效，等 App.css 里的旧规则熄灭后再收掉类名作用域。
+ */
+
+:root,
+:root[data-theme="light"],
+.shell,
+.login-shell,
+.theme-light {
+  --surface-page: #edf2f6;
+  --surface-sidebar: #e4eaf0;
+  --surface-panel: #ffffff;
+  --surface-overlay: #ffffff;
+  --text-primary: #213241;
+  --text-secondary: #5c6d7b;
+  --text-muted: #5f6e7a;
+  --text-inverse: #f1f6fa;
+  --text-sidebar: #213241;
+  --text-sidebar-muted: #4d5f6d;
+  --border-default: #c9d5df;
+  --border-subtle: #dce4ea;
+  --focus-ring: #2f78b8;
+  --action-primary: #236fa8;
+  --action-primary-text: #ffffff;
+  --action-danger: #c82f38;
+  --action-danger-text: #ffffff;
+  --action-disabled: #dce4eb;
+  --action-disabled-text: #566674;
+  --button-default-bg: #f7fafc;
+  --button-default-text: #213241;
+  --button-default-border: #b9c8d5;
+  --button-primary-bg: #236fa8;
+  --button-primary-text: #ffffff;
+  --button-danger-bg: #c82f38;
+  --button-danger-text: #ffffff;
+  --button-disabled-bg: #dce4eb;
+  --button-disabled-text: #4f6070;
+  --button-disabled-border: #b8c7d6;
+  --status-ok: #17623b;
+  --status-warning: #8a5a08;
+  --status-error: #a1262d;
+  --status-info: #185f91;
+  --status-debug: #60528d;
+  --radius-card: 6px;
+  --control-height: 36px;
+
+  /* 别名桥：App.css 里已有若干 var(--text) / var(--muted) 引用。 */
+  --text: var(--text-primary);
+  --muted: var(--text-muted);
+}
+
+:root[data-theme="dark"],
+.shell.theme-dark,
+.login-shell.theme-dark,
+.theme-dark {
+  --surface-page: #171f25;
+  --surface-sidebar: #1b242b;
+  --surface-panel: #202930;
+  --surface-overlay: #27323a;
+  --text-primary: #e5edf3;
+  --text-secondary: #a5b2bd;
+  --text-muted: #8796a2;
+  --text-inverse: #08141d;
+  --text-sidebar: #e5edf3;
+  --text-sidebar-muted: #a5b2bd;
+  --border-default: #45535e;
+  --border-subtle: #34414a;
+  --focus-ring: #58a8dc;
+  --action-primary: #4091c8;
+  --action-primary-text: #08141d;
+  --action-danger: #e1494e;
+  --action-danger-text: #ffffff;
+  --action-disabled: #252e35;
+  --action-disabled-text: #8796a2;
+  --button-default-bg: #25313a;
+  --button-default-text: #e5edf3;
+  --button-default-border: #51616d;
+  --button-primary-bg: #58a8dc;
+  --button-primary-text: #08141d;
+  --button-danger-bg: #e1494e;
+  --button-danger-text: #08141d;
+  --button-disabled-bg: #27323a;
+  --button-disabled-text: #9baab6;
+  --button-disabled-border: #43525d;
+  --status-ok: #7fd3a4;
+  --status-warning: #ffd082;
+  --status-error: #ff8a8f;
+  --status-info: #8bc8ef;
+  --status-debug: #c1b6ed;
+
+  --text: var(--text-primary);
+  --muted: var(--text-muted);
+}

@@ -2484,6 +2484,22 @@ fn compute_live_dynamics(state: State<'_, AppState>) -> Result<dynamics::Dynamic
 }
 
 #[tauri::command]
+fn compute_dynamics_snapshot(state: State<'_, AppState>) -> Result<dynamics::DynamicsOutput, String> {
+    let frame = state
+        .live_ring
+        .lock()
+        .map_err(|_| "live ring poisoned".to_string())?
+        .latest()
+        .ok_or_else(|| "no device snapshot available for dynamics computation".to_string())?;
+
+    state
+        .dynamics_runtime
+        .lock()
+        .map_err(|_| "dynamics runtime poisoned".to_string())?
+        .step_frame(&frame, 50)
+}
+
+#[tauri::command]
 fn update_dynamics_config(
     state: State<'_, AppState>,
     config: dynamics::DynamicsConfig,
@@ -3265,6 +3281,11 @@ pub fn run() {
                                     .lock()
                                     .map(|p| p.status().active)
                                     .unwrap_or(false);
+                                let dynamics_result = bg_dynamics
+                                    .lock()
+                                    .map_err(|_| ())
+                                    .and_then(|mut dynamics| dynamics.step_frame(&frame, 50).map_err(|_| ()))
+                                    .ok();
                                 if let Ok(mut control) = bg_control.lock() {
                                     let safety = control::SafetyInput {
                                         connected: matches!(
@@ -3276,9 +3297,15 @@ pub fn run() {
                                         emergency_latched: result.runtime.emergency_latched,
                                         playback_mode: is_playback,
                                     };
+                                    let dynamics_input = dynamics::dynamics_input_from_frame(&frame, 50);
                                     let feedback = control::ControlFeedback {
-                                        angle_deg: frame.bend.section1.angle_deg,
-                                        target_angle_deg: frame.bend.section1.target_angle_deg,
+                                        target_curvature_per_m: dynamics_input
+                                            .sections
+                                            .first()
+                                            .map(|section| section.curvature_per_m)
+                                            .unwrap_or(0.0),
+                                        dynamics_input,
+                                        dynamics_output: dynamics_result.clone(),
                                         pressure: frame
                                             .sensors
                                             .first()
@@ -3287,10 +3314,6 @@ pub fn run() {
                                     };
                                     control.step_cycle(feedback, safety, 50);
                                 }
-                                // Step dynamics model for every live frame.
-                                let _ = bg_dynamics.lock().map(|mut dynamics| {
-                                    let _ = dynamics.step_frame(&frame, 50);
-                                });
                                 if !is_playback {
                                     if let Ok(mut rec) = bg_recorder.lock() {
                                         let rec_status = rec.status();
@@ -3303,6 +3326,15 @@ pub fn run() {
                                                 &frame.device_id,
                                                 &frame,
                                             );
+                                            if let Some(output) = &dynamics_result {
+                                                let _ = bg_sqlite.insert_dynamics_output(
+                                                    &rec_status.session_id,
+                                                    frame.sequence,
+                                                    frame.received_at_ms,
+                                                    &frame.device_id,
+                                                    output,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -3343,6 +3375,7 @@ pub fn run() {
             logout,
             calibrate_sensor,
             configure_cycle_life,
+            compute_dynamics_snapshot,
             compute_live_dynamics,
             control_runtime_status,
             dynamics_status,

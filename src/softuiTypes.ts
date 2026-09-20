@@ -2,6 +2,54 @@ export type ChartChannelType = "motor" | "bend" | "sensor";
 
 export type ThemeMode = "dark" | "light";
 
+/* ---- 卡片布局系统 ---- */
+
+/**
+ * 卡片尺寸：`列数 x 行数`，每一维都是 1~4 格。
+ *
+ * 用模板字面量类型而不是枚举，是为了让「拖到 3x2」这种自由尺寸也能直接表达 ——
+ * 上限由 `MAX_CARD_SPAN` 和容器列数共同约束，见 state/layoutStore.ts。
+ */
+export type CardSize = `${1 | 2 | 3 | 4}x${1 | 2 | 3 | 4}`;
+
+/** 可持久化布局的页面。 */
+export type LayoutPage = "dashboard" | "workspace-monitor";
+
+export interface CardPlacement {
+  id: string;
+  size: CardSize;
+  visible: boolean;
+}
+
+/** 布局数据结构版本。卡片集合有增删时递增，见 state/layoutStore.ts。 */
+export type LayoutSchemaVersion = 2;
+
+export interface PageLayout {
+  schemaVersion: LayoutSchemaVersion;
+  cards: CardPlacement[];
+}
+
+/** 总览页卡片。id 与参考实现保持一致，便于将来接拖拽/缩放。 */
+export type DashboardCardId =
+  | "connection"
+  | "sampling"
+  | "recording"
+  | "alerts"
+  | "deviceHealth"
+  | "recentSessions"
+  | "recentEvents";
+
+/** 设备工作台「监控」标签的卡片。 */
+export type MonitorCardId =
+  | "deviceState"
+  | "commandQueue"
+  | "motorSummary"
+  | "sensorSummary"
+  | "model3d"
+  | "camera"
+  | "armCharts"
+  | "recentAlerts";
+
 export type PageKey =
   | "Dashboard"
   | "Workspace"
@@ -59,6 +107,62 @@ export interface BendState {
   targetAngleDeg: number;
   direction: "up" | "right" | "down" | "left";
   quality: FrameQuality;
+}
+
+export interface SectionCurvatureState {
+  curvaturePerM: number;
+  directionDeg: number;
+}
+
+export interface MotorDynamicsState {
+  id: number;
+  positionMm: number;
+  velocityMmPerSec: number;
+  accelerationMmPerSec2: number;
+}
+
+export interface SensorDynamicsState {
+  id: number;
+  forceN: [number, number, number];
+}
+
+export interface DynamicsInput {
+  deviceId: string;
+  timestampMs: number;
+  dtMs: number;
+  motors: MotorDynamicsState[];
+  sensors: SensorDynamicsState[];
+  sections: SectionCurvatureState[];
+}
+
+export interface CurvatureProfile {
+  sMm: number[];
+  kxPerM: number[];
+  kyPerM: number[];
+  kappaAbsPerM: number[];
+}
+
+export interface DynamicsTipPose {
+  positionM: [number, number, number];
+}
+
+export interface DynamicsDiagnostics {
+  frameValid: boolean;
+  maxCurvaturePerM: number;
+  allForcesFinite: boolean;
+  forceMaxN: number;
+  inputMode?: "curvature" | "legacyAngleDerived";
+  legacyAngleDerived?: boolean;
+}
+
+export interface DynamicsOutput {
+  deviceId: string;
+  timestampMs: number;
+  sections: SectionCurvatureState[];
+  tendonForcesN: [number, number, number, number, number, number];
+  curvature: CurvatureProfile;
+  tipPose: DynamicsTipPose;
+  diagnostics: DynamicsDiagnostics;
 }
 
 export interface DeviceSnapshot {
@@ -266,7 +370,7 @@ export interface PidConfig {
   kp: number;
   ki: number;
   kd: number;
-  deadbandDeg: number;
+  deadbandCurvaturePerM: number;
   integralLimit: number;
   outputLimit: number;
   samplePeriodMs: number;
@@ -274,9 +378,9 @@ export interface PidConfig {
 
 export interface CycleLifeConfig {
   enabled: boolean;
-  lowerAngleDeg: number;
-  upperAngleDeg: number;
-  toleranceDeg: number;
+  lowerCurvaturePerM: number;
+  upperCurvaturePerM: number;
+  toleranceCurvaturePerM: number;
   dwellMs: number;
   maxCycles: number;
 }
@@ -288,7 +392,7 @@ export interface ControlRuntimeStatus {
   active: boolean;
   allowed: boolean;
   reason?: string | null;
-  targetAngleDeg: number;
+  targetCurvaturePerM: number;
   pidOutput: number;
   motorDeltaMm: number;
   cyclesCompleted: number;
