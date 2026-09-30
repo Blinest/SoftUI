@@ -212,6 +212,23 @@
   grid-column: 1 / -1;
 }
 
+/* ---- 手动控制：左列整高三维编辑器，右列纵向排控制面板 ---- */
+
+/* 右列的宽度由这个比例决定，**和视口宽度不成简单关系**（窗口越宽，左列的
+ * 3D 视图按 1.25 份抢走的绝对宽度越多），所以右栏里各表单的列数不能用视口
+ * 媒体查询去猜。见文件后半段的容器查询。 */
+.manual-control-pane {
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr);
+}
+
+.manual-side-stack {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+}
+
 .workspace-panel > header {
   display: flex;
   align-items: center;
@@ -241,13 +258,21 @@
   padding: 12px;
 }
 
+/* 电机表单：字段列宽**不设下限**。
+ *
+ * 原来写的是 `minmax(110px, 1fr)`，那是一个**下限**：右栏窄于 610px 时
+ * 栅格不会收缩，而是溢出面板，被 .workspace-panel 的 overflow:hidden
+ * 直接裁掉（表现为最右边的输入框和按钮看不见）。列数交给下面的容器查询
+ * 按实际可用宽度决定，这里只负责"能缩多窄就缩多窄"。 */
 .workspace-form-grid-motor {
-  grid-template-columns: repeat(4, minmax(110px, 1fr)) auto auto;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
+/* 同样不设下限：`minmax(100px, 1fr)` 在窄栏里会让三列栅格溢出面板被裁掉。
+ * 列数由 1119px 以下的媒体查询压到单列。 */
 .workspace-form-grid-pid,
 .workspace-form-grid-cycle {
-  grid-template-columns: repeat(3, minmax(100px, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .workspace-field {
@@ -357,8 +382,13 @@
 
 /* ---- 实时数据表 ---- */
 
+/* 横向滚动的**容器**不能自己带 min-width。
+ *
+ * 原来 .workspace-table 上写了 min-width: 720px，那是「容器至少要 720px 宽」，
+ * 于是它比面板还宽、直接溢出被裁掉 —— `overflow: auto` 管的是**内部内容**，
+ * 管不了自己的宽度。真正的宽内容在行上（.workspace-table-row 仍是 720px），
+ * 容器去掉 min-width 后就能正常出横向滚动条。 */
 .workspace-table {
-  min-width: 720px;
   overflow: auto;
 }
 
@@ -474,11 +504,280 @@
   background: var(--surface-page);
 }
 
-@media (max-width: 1439px) {
-  .workspace-form-grid-motor {
-    grid-template-columns: repeat(3, minmax(110px, 1fr));
+/* ---- 末端位姿控制 ---- */
+
+/* 6 个分量排 3 列 × 2 行：位置一行、姿态一行，与「先把点挪到位、再谈姿态」
+ * 的思考顺序一致，也避免两行混在一起看不出 xyz 与 rpy 的分组。 */
+.tip-pose-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 10px;
+  padding: 0 12px 10px;
+}
+
+.tip-pose-result {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  margin: 0 12px 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.tip-pose-result > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.tip-pose-result span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.tip-pose-result strong {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.tip-pose-result strong.is-warn {
+  color: var(--status-warning);
+}
+
+.tip-pose-note {
+  padding-bottom: 10px;
+}
+
+/* ---- 拖动式曲率控制 ---- */
+
+/* 三维曲率编辑器：画布 + 底部状态条。面板自己带 40vh 下限，
+ * 免得在窄屏单列布局里被压成一条看不见的缝。 */
+/* 三维面板的纵向分配：标题 / 3D 视图 / 等效值 / 按钮 / 说明。
+ *
+ * 视图那一行用 `minmax(40vh, 1fr)`：面板被栅格行拉高时它跟着长（不会在下方
+ * 留一片空白），窗口矮时也不会被压到看不见。其余几行都是内容高度，永远
+ * 完整显示 —— 之前它们被裁掉正是因为视图行没有上限。 */
+.manual-volume-panel {
+  display: grid;
+  grid-template-rows: auto minmax(40vh, 1fr) auto auto auto;
+}
+
+/* 三维视图区 + 底部状态条。
+ *
+ * **不能写 `height: 100%`**：面板高度是内容撑出来的（.workspace-pane-grid 的
+ * 行是 minmax(min-content, 1fr)，最小值取内容的 min-content），host 写 100%
+ * 就是「我要和父级一样高」，而父级的高度又取决于 host —— 循环之下 host 直接
+ * 吃掉整个面板高度，后面的等效曲率读数、按钮行、说明文字全部被面板的
+ * overflow:hidden 裁掉。高度改由上面 .manual-volume-panel 的行定义给。 */
+.curvature-drag-host {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* canvas 必须是绝对定位。
+ *
+ * 父级用的是 `grid-auto-rows: minmax(min-content, 1fr)`：行的下限是内容的
+ * min-content，而 WebGL canvas 的固有尺寸就是它的 width/height 属性 ——
+ * renderer.setSize(host.clientHeight) 把 canvas 撑大 → 行变高 → clientHeight
+ * 变大 → 再撑大，几帧之内画布就长到一万多像素。绝对定位后 canvas 不再参与
+ * 固有尺寸计算，这条正反馈就断了。
+ * 尺寸仍然由 ResizeObserver 按 host 的实测值写死，所以不会留白。 */
+.curvature-drag-host .robot-scene {
+  position: relative;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.curvature-drag-host .robot-scene canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: block;
+}
+
+/* 只有开启拖动编辑时才把光标提示成可抓取 —— 关闭时这是纯 OrbitControls。 */
+.robot-scene.is-curvature-editable {
+  cursor: grab;
+  touch-action: none;
+}
+
+.robot-scene.is-curvature-editable.is-dragging {
+  cursor: grabbing;
+}
+
+.curvature-drag-hint {
+  display: flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 4px 12px;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.curvature-drag-hint .is-warn {
+  color: var(--status-warning);
+}
+
+.curvature-drag-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.curvature-drag-actions {
+  padding: 0 4px;
+}
+
+/* 按钮组自带 .workspace-action-row 的左右内边距，这里只补底部间距，
+ * 免得嵌套之后左右被撑到两倍。 */
+.curvature-drag-actions .workspace-action-row {
+  padding: 0 8px 12px;
+}
+
+.curvature-equivalent {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px 12px;
+  padding: 0 12px 10px;
+}
+
+.curvature-equivalent > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.curvature-equivalent span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.curvature-equivalent strong {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.curvature-drag-note {
+  margin: 0;
+  padding: 0 12px 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* 拖动中的实时读数：和等效值并排，方便边拖边看。 */
+.curvature-live-grid {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 10px;
+  padding: 0 12px 10px;
+  font-size: 12px;
+}
+
+.curvature-live-grid span {
+  color: var(--text-secondary);
+}
+
+.curvature-live-grid strong {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 传感器三轴读数（X / Y / Z）。
+ *
+ * 原来是完全没样式的：容器默认 display:block，三个 cell 竖着堆成三行，
+ * 且每个 cell 内部也是行内流，读数、单位、raw 值挤成"X3.00 Nraw 3.00"一坨，
+ * 数值和标签都读不出来。这里按 motor-state-strip 同一套语言做成三列栅格。 */
+.sensor-axis-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--border-subtle);
+}
+
+.sensor-axis-grid > div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  background: var(--surface-panel);
+}
+
+.sensor-axis-grid span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+/* 读数可能很长（例如高增益通道的 1234.57 N），窄列下必须截断 ——
+ * 不截断会把栅格撑宽，进而把整块面板顶出容器。 */
+.sensor-axis-grid strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sensor-axis-grid small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 容器查询：按**侧栏实际宽度**切换列数。
+ *
+ * 视口宽 1600px 时窗口明明很宽，但左列 3D 视图拿走 1.25 份，右栏只剩
+ * 455px —— 用 `@media (max-width: 1439px)` 完全命中不了，电机表单照样
+ * 横向溢出。容器查询量的是元素自己的宽度，不受这个比例影响。 */
+@supports (container-type: inline-size) {
+  .manual-side-stack {
+    container-type: inline-size;
+    container-name: manual-side;
   }
 
+  @container manual-side (max-width: 560px) {
+    .workspace-form-grid-motor {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  /* 窄到放不下两个输入框时进一步压到单列。 */
+  @container manual-side (max-width: 360px) {
+    .workspace-form-grid-motor,
+    .workspace-form-grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .tip-pose-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+}
+
+/* 不支持容器查询时的兜底：按视口宽度选一个能用列数。
+ * 数值保守一些 —— 宁可列少也不能溢出（溢出会被裁掉，用户根本看不到）。 */
+@supports not (container-type: inline-size) {
+  @media (max-width: 1759px) {
+    .workspace-form-grid-motor {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+}
+
+@media (max-width: 1439px) {
   .motor-state-strip,
   .automatic-status-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -492,6 +791,20 @@
   .workspace-form-grid-pid,
   .workspace-form-grid-cycle {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 单列时整页变窄，三轴的读数单元更要压紧。 */
+  .sensor-axis-grid > div {
+    padding: 7px 8px;
+  }
+
+  .sensor-axis-grid strong {
+    font-size: 13px;
+  }
+
+  /* 单列时右列那摞面板不再需要约束，交给通用行高即可。 */
+  .manual-side-stack {
+    grid-template-rows: auto auto auto;
   }
 
   .workspace-panel-wide {

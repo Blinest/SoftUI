@@ -22,12 +22,20 @@ import { monitorCardRegistry } from "./monitorCards";
 import { clamp, isoFull, toneForLevel } from "../utils";
 import { useCardLayout } from "../state/layoutStore";
 import {
-  angleDegToCurvaturePerM,
   buildBackboneFromCurvatureDistribution,
   curvatureDistributionFromSnapshot,
   DEFAULT_DYNAMICS_CONFIG,
   summarizeBackbone,
+  type CurvatureDistribution,
 } from "../dynamics/svcModel";
+import { sectionEquivalents } from "../dynamics/curvatureDrag";
+import {
+  curvatureOf,
+  distributionFromTipSections,
+  solveTipPose,
+  type SectionCurvature,
+} from "../robot/pose3d";
+import { CurvatureDragPreview } from "../robot/CurvatureDragPreview";
 import type {
   DeviceConnectionRecord,
   DeviceRuntimeStatusView,
@@ -48,6 +56,18 @@ export type MotorCommandDraft = {
   accelerationMmPerSec2: number;
 };
 
+/**
+ * 下发给后端的载荷。
+ *
+ * 手动控制有两路输入，最终都折算成「两段曲率 + 方向」才发出去：
+ *   - 三维拖动：12 段分布 → `sectionEquivalents` → 这里的曲率/方向；
+ *   - 末端位姿：6 个位姿分量 → `solveTipPose` → 两段曲率 → 同样落到这里。
+ *
+ * **不让后端做反解**：反解要用到臂长、曲率上限、姿态权重这些参数，它们都在
+ * 前端（和 3D 视图共用同一份），后端 `send_bend_command` 仍然吃角度。把反解
+ * 放前端，预览与下发走的就是同一个函数，不会出现「预览是这个形状、发下去是
+ * 另一个」。
+ */
 export type WorkspaceCommandPayload = {
   sensorId?: number;
   calibrationValue?: number;
@@ -118,14 +138,7 @@ export function WorkspacePage({
     accelerationMmPerSec2: 3,
   });
   const [sensorDraft, setSensorDraft] = useState({ sensorId: 1, calibrationValue: 0 });
-  const [curvatureDraft, setCurvatureDraft] = useState({
-    direction1: 0,
-    section1CurvaturePerM: angleDegToCurvaturePerM(snapshot.calibration.targetAngles[0], DEFAULT_DYNAMICS_CONFIG.segmentLengthM[0]),
-    direction2: 0,
-    section2CurvaturePerM: angleDegToCurvaturePerM(Math.min(snapshot.calibration.targetAngles[1], 70), DEFAULT_DYNAMICS_CONFIG.segmentLengthM[1]),
-  });
-  const [pidDraft, setPidDraft] = useState({ kp: 0.5, ki: 0.01, kd: 0.01 });
-  const [activeControlEnabled, setActiveControlEnabled] = useState(false);
+  const [pidDraft, setPidDraft] = useState({ kp: 0.5, ki: 0.01, kd: 0.01 });  const [activeControlEnabled, setActiveControlEnabled] = useState(false);
   const [cycleLifeEnabled, setCycleLifeEnabled] = useState(false);
   const [cycleCount, setCycleCount] = useState(0);
   const [cycleLowThreshold, setCycleLowThreshold] = useState(4);
@@ -147,12 +160,94 @@ export function WorkspacePage({
   const backbone = useMemo(() => buildBackboneFromCurvatureDistribution(curvatureDistribution), [curvatureDistribution]);
   const curvatureSummary = useMemo(() => summarizeBackbone(backbone), [backbone]);
 
-  const directionOptions = [
-    { label: "上", value: 0 },
-    { label: "右", value: 1 },
-    { label: "下", value: 2 },
-    { label: "左", value: 3 },
-  ];
+  /**
+   * 当前实际的「两段等效曲率」，作为末端反解的迭代初值。
+   *
+   * 取分布里两半的积分平均（和下发时的折算同一套口径），比直接读某一端的
+   * 采样更稳 —— 传感融合出来的分布在段与段的交界处会有过渡带。
+   */
+  const actualTipSections = useMemo<[SectionCurvature, SectionCurvature]>(() => {
+    const eq = sectionEquivalents(curvatureDistribution);
+    return [
+      { kxPerM: -eq.curvaturePerM[0] * Math.sin((eq.directionDeg[0] * Math.PI) / 180), kyPerM: eq.curvaturePerM[0] * Math.cos((eq.directionDeg[0] * Math.PI) / 180) },
+      { kxPerM: -eq.curvaturePerM[1] * Math.sin((eq.directionDeg[1] * Math.PI) / 180), kyPerM: eq.curvaturePerM[1] * Math.cos((eq.directionDeg[1] * Math.PI) / 180) },
+    ];
+  }, [curvatureDistribution]);
+
+  /** 方向度（0 上 / 90 右 / 180 下 / 270 左）→ 中文标签，用于等效曲率展示。 */
+  const directionLabel = (deg: number): string => {
+    const labels = ["上", "右", "下", "左"];
+    return labels[((Math.round(deg / 90) % 4) + 4) % 4] ?? "上";
+  };
+
+  /**
+   * 三维拖动编辑的状态。
+   *
+   * `dragEnabled` 默认关闭：手动控制页是操作员高频使用的地方，进来就抢走
+   * 左键会让「转视角」这件最常做的事变难。打开后左键才变成拖臂。
+   *
+   * `dragTarget` 只在拖动过程中非空。反解的基准始终是**当前实际分布**
+   * （见 curvatureDrag 的说明），所以这里存的是一份**绝对**目标分布，
+   * 不随新帧累积。清空它即可让 3D 视图回到真实形状。
+   */
+  const [dragEnabled, setDragEnabled] = useState(false);
+  const [dragTarget, setDragTarget] = useState<CurvatureDistribution | null>(null);
+
+  /**
+   * 末端位姿输入（右侧的控制卡片）。
+   *
+   * 解出来的曲率单独存一份，**不写回输入框**：反解只决定位置、姿态是尽力逼近
+   * 的（4 个自由度对 6 个约束），如果把解出来的精确位姿回填，用户就会发现
+   * 自己输的 rpy 被悄悄改了。输入框保留用户填的值，实际能达到的位姿另外显示。
+   */
+  const [tipDraft, setTipDraft] = useState({ x: 0, y: 0, z: 320, roll: 0, pitch: 0, yaw: 0 });
+  const [tipSections, setTipSections] = useState<[SectionCurvature, SectionCurvature] | null>(null);
+
+  const segmentLengthM = DEFAULT_DYNAMICS_CONFIG.segmentLengthM;
+  /** 曲率上限沿用原来粗控通道的限幅：段 1 是 8、段 2 是 6.5 1/m。 */
+  const maxCurvaturePerM = useMemo<readonly [number, number]>(() => [8, 6.5], []);
+
+  const tipSolution = useMemo(() => solveTipPose({
+    target: {
+      positionM: [tipDraft.x / 1000, tipDraft.y / 1000, tipDraft.z / 1000],
+      rpyRad: [
+        (tipDraft.roll * Math.PI) / 180,
+        (tipDraft.pitch * Math.PI) / 180,
+        (tipDraft.yaw * Math.PI) / 180,
+      ],
+    },
+    // 初值取「当前实际曲率」：反解非凸，从现实状态出发既能保证输入框不动时
+    // 解是稳定的，也避免每次微调都跳到另一个完全不同的解上。
+    base: tipSections ?? actualTipSections,
+    segmentLengthM,
+    maxCurvaturePerM,
+  }), [tipDraft, tipSections, actualTipSections, segmentLengthM, maxCurvaturePerM]);
+
+  /**
+   * 当前目标对应的 12 段分布（拖动或末端反解都算）。
+   *
+   * 这是整页唯一的「目标形状」来源：3D 预览、等效曲率、峰值曲率、下发 payload
+   * 全部从它派生，避免出现「预览是一个形状、发下去是另一个」。
+   */
+  const targetDistribution = useMemo<CurvatureDistribution | null>(() => {
+    if (dragTarget) return dragTarget;
+    if (tipSections) return distributionFromTipSections(tipSections, segmentLengthM);
+    return null;
+  }, [dragTarget, tipSections, segmentLengthM]);
+
+  const equivalents = useMemo(
+    () => sectionEquivalents(targetDistribution ?? curvatureDistribution),
+    [targetDistribution, curvatureDistribution],
+  );
+
+  /** 沿整条分布取最大曲率（两段等效值会把峰值平均掉，限位检查必须看原始分布）。 */
+  const peakCurvature = useMemo(
+    () => (targetDistribution ?? curvatureDistribution).segments.reduce(
+      (max, segment) => Math.max(max, segment.kappaAbsPerM),
+      0,
+    ),
+    [targetDistribution, curvatureDistribution],
+  );
 
   const setActiveTab = useCallback((next: WorkspaceTab) => {
     setSearchParams(next === "monitor" ? {} : { tab: next }, { replace: true });
@@ -160,6 +255,49 @@ export function WorkspacePage({
 
   const notifyCommand = useCallback((message: string, tone: "ok" | "warn" | "error" = "ok") => {
     setCommandStatus({ tone, message });
+  }, []);
+
+  /**
+   * 按末端位姿求解并把结果固定下来。
+   *
+   * 输入框里的位姿是**实时**求解的（每敲一个字符就解一次），但那个结果不进
+   * 3D 预览 —— 预览要有「确认」这个动作才不会在打字过程中乱跳。按下按钮才把
+   * 当前解冻结成目标曲率，预览与下发随之更新。
+   */
+  const applyTipPose = useCallback(() => {
+    const solved = tipSolution;
+    // 末端位姿接管目标：清掉可能还挂着的拖动结果，保证「当前目标」只有一个来源。
+    setDragTarget(null);
+    setTipSections(solved.sections);
+    if (!solved.reachable) {
+      notifyCommand(
+        `末端点超出工作空间：位置差 ${(solved.positionErrorM * 1000).toFixed(1)} mm，已取最近的可行解`,
+        "warn",
+      );
+      return;
+    }
+    notifyCommand(
+      `已按末端位姿求解（位置残差 ${(solved.positionErrorM * 1000).toFixed(2)} mm，`
+      + `姿态残差 ${((solved.orientationErrorRad * 180) / Math.PI).toFixed(1)}°）—— 臂只有 4 个自由度，姿态无法完全指定`,
+      "ok",
+    );
+  }, [tipSolution, notifyCommand]);
+
+  const clearTargets = useCallback(() => {
+    setDragTarget(null);
+    setTipSections(null);
+  }, []);
+
+  /**
+   * 三维拖动接管目标。
+   *
+   * 拖动时清掉末端反解的结果 —— 否则「当前目标」会有两个来源打架：
+   * `targetDistribution` 优先取拖动值，但末端面板还在显示上一次的解，用户会
+   * 以为两者是一致的。让最后一次操作说了算。
+   */
+  const handleDragTarget = useCallback((next: CurvatureDistribution | null) => {
+    setDragTarget(next);
+    if (next) setTipSections(null);
   }, []);
 
   const runSystemControl = useCallback(async (action: SystemControlAction) => {
@@ -192,6 +330,29 @@ export function WorkspacePage({
       setCommandStatus({ tone: "error", message: err instanceof Error ? err.message : "命令失败" });
     }
   }, [onWorkspaceCommand]);
+
+  /**
+   * 下发当前的**目标**曲率（拖动或末端位姿反解产生的）。
+   *
+   * 走的是和原来「发送粗控」完全同一条路径：先折回两段等效曲率，再由 App
+   * 转成角度发给 `send_bend_command`。所以拖动 / 末端位姿 / 手输三者发出的
+   * 东西是同一量纲，不会出现几条通道各发各的。
+   */
+  const sendTarget = useCallback(() => {
+    if (!targetDistribution) return;
+    const source = dragTarget ? "三维拖动" : "末端位姿";
+    // 解不可达时把残差一起报出来 —— 操作员按下去的是一条真的会驱动电机的命令，
+    // 必须知道他拿到的不是他要的那个点。
+    const warn = tipSections && !tipSolution.reachable
+      ? `（注意：位置差 ${(tipSolution.positionErrorM * 1000).toFixed(1)} mm，已取最近可行解）`
+      : "";
+    void runWorkspaceCommand("bend", {
+      direction1: equivalents.directionCode[0],
+      section1CurvaturePerM: equivalents.curvaturePerM[0],
+      direction2: equivalents.directionCode[1],
+      section2CurvaturePerM: equivalents.curvaturePerM[1],
+    }, `已按${source}曲率下发（峰值 ${peakCurvature.toFixed(2)} 1/m）${warn}`);
+  }, [targetDistribution, dragTarget, tipSections, tipSolution, equivalents, peakCurvature, runWorkspaceCommand]);
 
   // 主动控制：开启后每 200ms 发一次 tick，直到失能或手动停止。
   useEffect(() => {
@@ -376,7 +537,115 @@ export function WorkspacePage({
         {/* ---------- 手动控制 ---------- */}
         {activeTab === "manual" ? (
           <div className="workspace-pane-grid manual-control-pane">
-            <section className="workspace-panel workspace-panel-wide">
+            <section className="workspace-panel manual-volume-panel">
+              <header>
+                <div><span>DeviceTab</span><h2>三维曲率拖动控制</h2></div>
+                <label className="curvature-drag-toggle">
+                  <input type="checkbox" checked={dragEnabled}
+                    onChange={(event) => {
+                      const next = event.target.checked;
+                      setDragEnabled(next);
+                      // 关掉编辑时一并清掉目标，视图立刻回到真实形状。
+                      if (!next) setDragTarget(null);
+                    }} />
+                  <span>拖动编辑</span>
+                </label>
+              </header>
+              <CurvatureDragPreview
+                actual={backbone}
+                // 预览显示的是**目标**分布：拖动与末端位姿反解是两个入口，
+                // 但都落到 targetDistribution 上，3D 视图与下发永远一致。
+                target={targetDistribution}
+                enabled={dragEnabled}
+                onTargetChange={handleDragTarget}
+              />
+              <div className="curvature-equivalent">
+                <div>
+                  <span>通道 A 等效曲率</span>
+                  <strong>{equivalents.curvaturePerM[0].toFixed(2)} 1/m · {directionLabel(equivalents.directionDeg[0])}</strong>
+                </div>
+                <div>
+                  <span>通道 B 等效曲率</span>
+                  <strong>{equivalents.curvaturePerM[1].toFixed(2)} 1/m · {directionLabel(equivalents.directionDeg[1])}</strong>
+                </div>
+                <div>
+                  <span>沿臂峰值曲率</span>
+                  <strong className={peakCurvature > maxCurvaturePerM[0] ? "is-warn" : undefined}>{peakCurvature.toFixed(2)} 1/m</strong>
+                </div>
+              </div>
+              <div className="curvature-drag-actions">
+                <div className="workspace-action-row">
+                  <button type="button" className="ghost-btn" disabled={!targetDistribution}
+                    onClick={clearTargets}>
+                    <span>清空目标</span>
+                  </button>
+                  <button type="button" className="primary-btn" disabled={!targetDistribution}
+                    onClick={sendTarget}>
+                    <ArrowRightLeft size={15} /><span>按此曲率下发</span>
+                  </button>
+                </div>
+              </div>
+              <p className="curvature-drag-note">
+                点击「按此曲率下发」下发命令
+              </p>
+            </section>
+
+            <div className="manual-side-stack">
+            <section className="workspace-panel">
+              <header>
+                <div><span>DeviceTab</span><h2>末端位姿控制</h2></div>
+              </header>
+              <div className="tip-pose-grid">
+                {([
+                  ["x", "X mm"], ["y", "Y mm"], ["z", "Z mm"],
+                  ["roll", "Roll °"], ["pitch", "Pitch °"], ["yaw", "Yaw °"],
+                ] as const).map(([key, label]) => (
+                  <label className="workspace-field" key={key}>
+                    <span>{label}</span>
+                    <input type="number" step={key === "z" ? 1 : 0.5} value={tipDraft[key]}
+                      onChange={(event) => setTipDraft((draft) => ({ ...draft, [key]: Number(event.target.value) }))} />
+                  </label>
+                ))}
+              </div>
+
+              {/* 实时求解结果：用户每改一个数字这里就更新，但只有按下按钮才进 3D 预览。 */}
+              <div className="tip-pose-result">
+                <div>
+                  <span>可达性</span>
+                  <strong className={tipSolution.reachable ? undefined : "is-warn"}>
+                    {tipSolution.reachable ? "位置可达" : `不可达（差 ${(tipSolution.positionErrorM * 1000).toFixed(1)} mm）`}
+                  </strong>
+                </div>
+                <div>
+                  <span>位置残差</span>
+                  <strong>{(tipSolution.positionErrorM * 1000).toFixed(2)} mm</strong>
+                </div>
+                <div>
+                  <span>姿态残差</span>
+                  <strong className={tipSolution.orientationErrorRad > 0.1 ? "is-warn" : undefined}>
+                    {((tipSolution.orientationErrorRad * 180) / Math.PI).toFixed(1)}°
+                  </strong>
+                </div>
+                <div>
+                  <span>解出曲率</span>
+                  <strong>
+                    {curvatureOf(tipSolution.sections[0]).curvaturePerM.toFixed(2)} /{" "}
+                    {curvatureOf(tipSolution.sections[1]).curvaturePerM.toFixed(2)} 1/m
+                  </strong>
+                </div>
+              </div>
+
+              <div className="workspace-action-row">
+                <button type="button" className="primary-btn" onClick={applyTipPose}>
+                  <span>按位姿求解</span>
+                </button>
+                <button type="button" className="ghost-btn" onClick={clearTargets} disabled={!tipSections}>
+                  <span>清除</span>
+                </button>
+              </div>
+            </section>
+
+            <section className="workspace-panel">
               <header><div><span>DeviceTab</span><h2>电机控制</h2></div></header>
               <div className="workspace-form-grid workspace-form-grid-motor">
                 <label className="workspace-field">
@@ -451,42 +720,7 @@ export function WorkspacePage({
                 </div>
               ) : null}
             </section>
-
-            <section className="workspace-panel">
-              <header><div><span>DeviceTab</span><h2>协议粗控通道</h2></div></header>
-              <div className="bend-control-layout">
-                {[1, 2].map((section) => (
-                  <div className="bend-section-card" key={section}>
-                    <div className="command-form-title">粗控通道 {section === 1 ? "A" : "B"}</div>
-                    <label className="inline-input">
-                      <span>目标曲率</span>
-                      <input type="number" min={0} max={section === 1 ? 8 : 6.5} step={0.01}
-                        value={section === 1 ? curvatureDraft.section1CurvaturePerM : curvatureDraft.section2CurvaturePerM}
-                        onChange={(event) => setCurvatureDraft((draft) => section === 1
-                          ? { ...draft, section1CurvaturePerM: clamp(Number(event.target.value), 0, 8) }
-                          : { ...draft, section2CurvaturePerM: clamp(Number(event.target.value), 0, 6.5) })} />
-                      <span>1/m</span>
-                    </label>
-                    <div className="bend-direction-grid">
-                      {directionOptions.map((direction) => (
-                        <button key={`${section}-${direction.value}`} type="button"
-                          className={`ghost-btn ${(section === 1 ? curvatureDraft.direction1 : curvatureDraft.direction2) === direction.value ? "active" : ""}`}
-                          onClick={() => setCurvatureDraft((draft) => section === 1
-                            ? { ...draft, direction1: direction.value }
-                            : { ...draft, direction2: direction.value })}>
-                          {direction.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-              <div className="workspace-action-row">
-                <button type="button" className="primary-btn" onClick={() => runWorkspaceCommand("bend", curvatureDraft, "已发送协议粗控命令")}>
-                  <span>发送粗控</span>
-                </button>
-              </div>
-            </section>
+            </div>
           </div>
         ) : null}
 

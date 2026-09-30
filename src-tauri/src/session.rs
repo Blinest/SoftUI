@@ -7,6 +7,56 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+/// 标定用的沿臂曲率采样点数 (固定 20 点, 沿全臂等弧长分布)。
+/// 导出 CSV 里每个点占 2 列: kappa_x_i, kappa_y_i。
+pub const CALIB_KAPPA_POINTS: usize = 20;
+
+/// 一帧的**标定附加量** —— 现有 CSV 列 (电机原始值 + bend 角) 之外的派生量,
+/// 供 `tools/calib_fit.py` 做 ΔL 仿射标定:
+///
+///   * `tau_n`       实测 6 路张力, 由传感器 filtered 值经映射系数换算 (N)
+///   * `dl_mm`       实测 6 根丝位移, 由电机位置经映射系数换算 (mm), 负 = 收丝
+///   * `kappa_x/y`   沿臂 20 个等弧长点的曲率分量 (1/m)
+///
+/// 录制时由调用方 (lib.rs) 从 DynamicsInput / DynamicsOutput 组装; 拿不到就留空,
+/// 对应列写成空串。这样**旧录制流程不受影响**, 新列只是附加。
+#[derive(Debug, Clone, Default)]
+pub struct CalibRow {
+    pub tau_n: [Option<f64>; 6],
+    pub dl_mm: [Option<f64>; 6],
+    /// 长度应为 `CALIB_KAPPA_POINTS`, 每项 (kx, ky); None 表示该点缺
+    pub kappa: Vec<Option<(f64, f64)>>,
+}
+
+impl CalibRow {
+    fn write_tail(&self, writer: &mut BufWriter<File>) {
+        const EMPTY: &str = "";
+        // tau_0..5
+        for v in &self.tau_n {
+            match v {
+                Some(x) if x.is_finite() => write!(writer, ",{:.4}", x).ok(),
+                _ => write!(writer, ",{}", EMPTY).ok(),
+            };
+        }
+        // dl_0..5
+        for v in &self.dl_mm {
+            match v {
+                Some(x) if x.is_finite() => write!(writer, ",{:.4}", x).ok(),
+                _ => write!(writer, ",{}", EMPTY).ok(),
+            };
+        }
+        // kappa_x/y_0..19 —— 每点占 2 列, 缺值时**两列都要写空**, 否则列数错位
+        for i in 0..CALIB_KAPPA_POINTS {
+            match self.kappa.get(i).copied().flatten() {
+                Some((kx, ky)) if kx.is_finite() && ky.is_finite() => {
+                    write!(writer, ",{:.6},{:.6}", kx, ky).ok()
+                }
+                _ => write!(writer, ",,").ok(),
+            };
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMetadata {
@@ -100,7 +150,10 @@ impl SessionRecorder {
         writer
             .write_all(&[0xEF, 0xBB, 0xBF])
             .map_err(|e| e.to_string())?;
-        let header = "timestamp_ms,sequence,device_id".to_string()
+        // ⚠ 注意 "timestamp_ms,sequence,device_id" 后面要有分隔逗号 ——
+        // 原来直接 `+ join(",")` 没补逗号, 表头会变成 "...device_idmotor_1_pos_mm",
+        // 少一列导致 Excel 整行列错位 (数据行是对的, 所以一直没被发现)。
+        let header = "timestamp_ms,sequence,device_id,".to_string()
             + &(1..=6)
                 .flat_map(|i| {
                     [
@@ -113,6 +166,11 @@ impl SessionRecorder {
                     "bend_s1_angle_deg".to_string(),
                     "bend_s2_angle_deg".to_string(),
                 ])
+                .chain((0..6).map(|i| format!("tau_{}", i)))            // 实测张力 (N)
+                .chain((0..6).map(|i| format!("dl_{}", i)))             // 实测丝位移 (mm)
+                .chain((0..CALIB_KAPPA_POINTS).flat_map(|i| {
+                    [format!("kappa_x_{}", i), format!("kappa_y_{}", i)]
+                }))                                                     // 沿臂曲率 (1/m)
                 .collect::<Vec<_>>()
                 .join(",");
         writeln!(writer, "{}", header).map_err(|e| e.to_string())?;
@@ -232,7 +290,14 @@ impl SessionRecorder {
         Ok(())
     }
 
+    /// 只记原始帧 (旧行为)。标定量留空 —— 仅测试用; 生产路径走 `write_frame_calib`。
+    #[cfg(test)]
     pub(crate) fn write_frame(&mut self, frame: &DeviceSnapshot) {
+        self.write_frame_calib(frame, &CalibRow::default());
+    }
+
+    /// 记一帧 + 标定附加量。`calib` 缺的部分在 CSV 里写成空字段。
+    pub(crate) fn write_frame_calib(&mut self, frame: &DeviceSnapshot, calib: &CalibRow) {
         if !self.active || self.paused {
             return;
         }
@@ -264,12 +329,18 @@ impl SessionRecorder {
             }
         }
 
-        writeln!(
+        // ⚠ 这里必须用 write! 而不是 writeln! —— 标定列要接在同一行,
+        // 换行留到 write_tail 之后 (曾踩过: 先 writeln! 会把标定列顶到下一行, 行数翻倍)
+        write!(
             writer,
             ",{},{}",
             frame.bend.section1.angle_deg, frame.bend.section2.angle_deg
         )
         .ok();
+
+        // 标定附加列 (张力/丝位移/20 点曲率) —— 无数据时写空占位保持列数对齐
+        calib.write_tail(writer);
+        writeln!(writer).ok();
 
         self.frame_count = self.frame_count.saturating_add(1);
         // Flush periodically for crash safety
@@ -656,6 +727,51 @@ mod tests {
         assert_eq!(lines.len(), 6); // header + 5 data rows
         assert!(lines[1].contains("dev:0")); // first data row
         assert!(lines[1].contains("2.000")); // motor 1 pos for seq 1
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ★ 标定列的关键不变量: **表头列数 == 数据行字段数**。
+    /// 缺值时必须写空占位而不是省略, 否则整行错位 (曾踩过: kappa 缺值少写一列)。
+    #[test]
+    fn calib_columns_align() {
+        let dir = std::env::temp_dir().join("softui-test-calib");
+        let _ = fs::remove_dir_all(&dir);
+        let mut rec = SessionRecorder::new(dir.clone());
+        rec.start("calib-test".to_string()).expect("start");
+
+        // 一行全有, 一行全空 —— 两种都要列数对齐
+        let mut full = CalibRow::default();
+        for i in 0..6 {
+            full.tau_n[i] = Some(i as f64 * 1.5);
+            full.dl_mm[i] = Some(-(i as f64) - 0.25);
+        }
+        for k in 0..CALIB_KAPPA_POINTS {
+            full.kappa.push(Some((k as f64 * 0.1, -(k as f64) * 0.2)));
+        }
+        rec.write_frame_calib(&dummy_frame("dev:0", 1), &full);
+        rec.write_frame_calib(&dummy_frame("dev:0", 2), &CalibRow::default());
+
+        let info = rec.stop().expect("stop");
+        let csv = fs::read_to_string(&info.file_path).expect("read csv");
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3); // header + 2 rows
+
+        let n_head = lines[0].split(',').count();
+        // 预期: 3 + 18(电机) + 2(bend) + 6(tau) + 6(dl) + 2*CALIB_KAPPA_POINTS(kappa) = 75
+        assert_eq!(n_head, 3 + 18 + 2 + 6 + 6 + CALIB_KAPPA_POINTS * 2);
+        assert!(lines[0].ends_with("kappa_y_19"));
+        for (i, line) in lines[1..].iter().enumerate() {
+            let n = line.split(',').count();
+            assert_eq!(n, n_head, "第 {} 行字段数 {}(表头 {})", i + 1, n, n_head);
+        }
+        // 有值的那行应含 tau 与 dl 的数值, 空行对应位置是空字段
+        let full_cols: Vec<&str> = lines[1].split(',').collect();
+        assert_eq!(full_cols[23], "0.0000"); // tau_0
+        assert_eq!(full_cols[29], "-0.2500"); // dl_0
+        let empty_cols: Vec<&str> = lines[2].split(',').collect();
+        assert_eq!(empty_cols[23], ""); // 空行的 tau_0
+        assert_eq!(empty_cols[29], ""); // 空行的 dl_0
+
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -48,7 +48,15 @@ export interface CurvatureDerivationDiagnostics {
 export interface CurvatureDistribution {
   totalLengthMm: number;
   basisSegmentCount: number;
-  source: CurvatureDerivationSource | "legacyTwoChannelFit" | "deviceCurvature" | "simulated";
+  /** `manualDrag`：三维视图拖动反解得到（见 dynamics/curvatureDrag.ts）。
+   *  `tipTarget`：末端位姿反解得到（见 robot/pose3d.ts）。 */
+  source:
+    | CurvatureDerivationSource
+    | "legacyTwoChannelFit"
+    | "deviceCurvature"
+    | "simulated"
+    | "manualDrag"
+    | "tipTarget";
   segments: CurvatureBasisSegment[];
   diagnostics?: CurvatureDerivationDiagnostics;
 }

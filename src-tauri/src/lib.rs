@@ -396,6 +396,110 @@ impl RuntimeStore {
     }
 }
 
+/// 组装一帧的**标定附加量** (写入录制 CSV 的尾部列)。
+///
+/// 三个来源:
+///   * `tau_n`    ← `DynamicsOutput.tendon_forces_n`, 单位已是 N (见 dynamics.rs)
+///   * `dl_mm`    ← 电机位置 = 丝位移 (电机行程即丝位移), 符号约定: 负 = 收丝
+///   * `kappa`    ← `DynamicsOutput.curvature`, 从解算网格线性重采样到
+///                  `CALIB_KAPPA_POINTS` 个**等弧长**点, 存体坐标 (kx, ky)
+///
+/// 解算结果缺失时返回全空行 —— 只记原始帧, 不让录制失败。
+fn make_calib_row(
+    frame: &DeviceSnapshot,
+    out: Option<&dynamics::DynamicsOutput>,
+) -> session::CalibRow {
+    let mut row = session::CalibRow::default();
+
+    // ── 实测张力: 优先用解算输出 (已做映射/滤波), 否则退回传感器 filtered 原值 ──
+    if let Some(o) = out {
+        for i in 0..6 {
+            let v = o.tendon_forces_n[i];
+            if v.is_finite() {
+                row.tau_n[i] = Some(v);
+            }
+        }
+    } else {
+        for i in 0..6 {
+            if let Some(s) = frame.sensors.get(i) {
+                let v = s.filtered[0];
+                if v.is_finite() {
+                    row.tau_n[i] = Some(v);
+                }
+            }
+        }
+    }
+
+    // ── 实测丝位移: 电机行程即丝位移 (motor id i ↔ cable i-1) ──
+    for c in 0..6u32 {
+        if let Some(m) = frame.motors.iter().find(|m| m.id == c + 1) {
+            if m.position_mm.is_finite() {
+                row.dl_mm[c as usize] = Some(m.position_mm);
+            }
+        }
+    }
+
+    // ── 沿臂曲率: 从解算网格线性重采样到 20 个等弧长点 ──
+    if let Some(o) = out {
+        let prof = &o.curvature;
+        let n = prof.s_mm.len();
+        if n >= 2 && prof.kx_per_m.len() == n && prof.ky_per_m.len() == n {
+            let s0 = prof.s_mm[0];
+            let s1 = prof.s_mm[n - 1];
+            row.kappa.reserve(session::CALIB_KAPPA_POINTS);
+            for k in 0..session::CALIB_KAPPA_POINTS {
+                // 端点均匀铺满: k=0 -> s0, k=N-1 -> s1
+                let t = if session::CALIB_KAPPA_POINTS > 1 {
+                    k as f64 / (session::CALIB_KAPPA_POINTS - 1) as f64
+                } else {
+                    0.0
+                };
+                let s = s0 + t * (s1 - s0);
+                row.kappa.push(sample_curve(prof, s));
+            }
+        }
+    }
+    row
+}
+
+/// 在弧长 s 处线性插值曲率 (kx, ky); 越界取端点。返回 None 表示该点无数值。
+fn sample_curve(prof: &dynamics::CurvatureProfile, s: f64) -> Option<(f64, f64)> {
+    let n = prof.s_mm.len();
+    if n < 2 || !s.is_finite() {
+        return None;
+    }
+    if s <= prof.s_mm[0] {
+        return Some((prof.kx_per_m[0], prof.ky_per_m[0]));
+    }
+    if s >= prof.s_mm[n - 1] {
+        return Some((prof.kx_per_m[n - 1], prof.ky_per_m[n - 1]));
+    }
+    // 解算网格是单调递增的, 二分找区间
+    let mut lo = 0usize;
+    let mut hi = n - 1;
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if prof.s_mm[mid] <= s {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let span = prof.s_mm[hi] - prof.s_mm[lo];
+    let w = if span.abs() < 1e-12 {
+        0.0
+    } else {
+        (s - prof.s_mm[lo]) / span
+    };
+    let kx = prof.kx_per_m[lo] + w * (prof.kx_per_m[hi] - prof.kx_per_m[lo]);
+    let ky = prof.ky_per_m[lo] + w * (prof.ky_per_m[hi] - prof.ky_per_m[lo]);
+    if kx.is_finite() && ky.is_finite() {
+        Some((kx, ky))
+    } else {
+        None
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3317,7 +3421,10 @@ pub fn run() {
                                 if !is_playback {
                                     if let Ok(mut rec) = bg_recorder.lock() {
                                         let rec_status = rec.status();
-                                        rec.write_frame(&frame);
+                                        rec.write_frame_calib(
+                                            &frame,
+                                            &make_calib_row(&frame, dynamics_result.as_ref()),
+                                        );
                                         if rec_status.active && !rec_status.paused {
                                             let _ = bg_sqlite.insert_snapshot(
                                                 &rec_status.session_id,
