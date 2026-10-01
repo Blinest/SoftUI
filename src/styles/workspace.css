@@ -217,6 +217,16 @@
 /* 右列的宽度由这个比例决定，**和视口宽度不成简单关系**（窗口越宽，左列的
  * 3D 视图按 1.25 份抢走的绝对宽度越多），所以右栏里各表单的列数不能用视口
  * 媒体查询去猜。见文件后半段的容器查询。 */
+/* 手动控制页：顶部「模型包」卡片 + 下方两列主区。 */
+.workspace-manual-pane {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+}
+
 .manual-control-pane {
   grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr);
 }
@@ -557,6 +567,20 @@
  * 视图那一行用 `minmax(40vh, 1fr)`：面板被栅格行拉高时它跟着长（不会在下方
  * 留一片空白），窗口矮时也不会被压到看不见。其余几行都是内容高度，永远
  * 完整显示 —— 之前它们被裁掉正是因为视图行没有上限。 */
+/* 三维拖动卡片迁进 CardGrid 后，行的定义必须落在**卡片体**上。
+ *
+ * `.manual-volume-panel` 原本是给**面板**用的 5 行模板（auto / 40vh / auto / auto / auto），
+ * 第一行是面板自己的 header。卡片化之后 header 由 CardGrid 渲染，体里只剩 4 个块：
+ *   3D 视图 host / 等效曲率读数 / 按钮行 / 说明文字
+ * 如果沿用 5 行模板，3D host 会落到第一行 `auto` —— 它是 minmax(0,1fr) 的 grid 且
+ * overflow:hidden，没有内在高度，直接塌成 0，画布就看不见了（就是这次的 bug）。
+ */
+.feature-card-body.manual-volume-panel {
+  display: grid;
+  grid-template-rows: minmax(40vh, 1fr) auto auto auto;
+  align-content: stretch;
+}
+
 .manual-volume-panel {
   display: grid;
   grid-template-rows: auto minmax(40vh, 1fr) auto auto auto;

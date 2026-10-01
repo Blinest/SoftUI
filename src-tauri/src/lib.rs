@@ -2,13 +2,17 @@ pub mod auth;
 pub mod control;
 pub mod device;
 pub mod dynamics;
+pub mod kappatable;
 pub mod live;
 pub mod migration;
+pub mod model;
 pub mod playback;
+pub mod posetable;
 pub mod profiles;
 pub mod protocol;
 pub mod session;
 pub mod storage;
+pub mod tablecore;
 pub mod transport;
 
 use serde::{Deserialize, Serialize};
@@ -1307,15 +1311,22 @@ impl AppState {
             snapshot.auth_session = auth.clone();
         }
 
-        // If playback is active, inject its frame and skip live ring
+        // 回放激活：用**回放帧**灌满快照，并跳过实时环。
         if let Ok(pb) = self.playback.lock() {
             if pb.status().active {
-                if let Some(frame) = pb.current_frame() {
+                // ⚠ 必须走 `overlay_live_frames`：设备工作区读数与曲线都由它填充。
+                //   原来只手写 `live.latest` 然后直接 return —— 曲线/读数拿不到回放帧，
+                //   表现就是「开始回放后，工作区和曲线还是实时数据（其实是空的）」。
+                let window: Vec<DeviceSnapshot> =
+                    pb.frame_window(240).into_iter().cloned().collect();
+                let frame = window.last().cloned().or_else(|| pb.current_frame().cloned());
+                if let Some(frame) = frame {
                     snapshot.playback_mode = true;
                     if let Ok(mut control) = self.control_runtime.lock() {
                         control.stop("playback mode blocks active control");
                         snapshot.control_runtime = control.status();
                     }
+                    overlay_live_frames(&mut snapshot, &window);
                     snapshot.live.selected_device_id = frame.device_id.clone();
                     snapshot.live.latest = Some(frame.clone());
                     snapshot.dashboard.device_count = 1;
@@ -1605,6 +1616,248 @@ struct HomeCommandRequest {
     start_address: Option<u8>,
 }
 
+/// 多电机同步位移指令（0x04）请求体。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MultiMotorCommandRequest {
+    device_id: Option<String>,
+    /// 起始电机地址（1 基），默认 1
+    start_address: Option<u8>,
+    /// 各电机目标位移（mm，带符号）；下标 0 对应 `start_address`
+    positions_mm: Vec<f64>,
+}
+
+/// 运行时导入的模型包：`(文件名, 表)`。为空时用内置默认。
+static IMPORTED_MODEL: std::sync::OnceLock<
+    std::sync::Mutex<Option<(String, std::sync::Arc<model::ModelTables>)>>,
+> = std::sync::OnceLock::new();
+static DEFAULT_MODEL: std::sync::OnceLock<std::sync::Arc<model::ModelTables>> = std::sync::OnceLock::new();
+
+fn imported_slot() -> &'static std::sync::Mutex<Option<(String, std::sync::Arc<model::ModelTables>)>> {
+    IMPORTED_MODEL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 已导入模型的 Arc 快照（没有导入则为 `None`）。
+fn imported_tables() -> Option<std::sync::Arc<model::ModelTables>> {
+    imported_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(_, tables)| std::sync::Arc::clone(tables)))
+}
+
+/// 持久化文件：与可执行文件同目录的 `model.tdcrmodel`。
+fn persisted_model_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("model.tdcrmodel"))
+}
+
+/// 从磁盘载入上次导入的模型包（没有或损坏则安静跳过）。
+fn try_load_persisted_model() {
+    let Some(path) = persisted_model_path() else { return };
+    let Ok(bytes) = std::fs::read(&path) else { return };
+    if let Ok(tables) = model::ModelTables::from_bundle(&bytes) {
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("model.{}", model::EXTENSION));
+        if let Ok(mut guard) = imported_slot().lock() {
+            *guard = Some((name, std::sync::Arc::new(tables)));
+        }
+    }
+}
+
+/// 当前生效的模型表：导入的优先，否则内置默认。
+fn current_model() -> std::sync::Arc<model::ModelTables> {
+    if let Some(tables) = imported_tables() {
+        return tables;
+    }
+    // 首次取用时尝试载入上次导入的模型包（每个进程只试一次）。
+    static TRIED_PERSISTED: std::sync::Once = std::sync::Once::new();
+    TRIED_PERSISTED.call_once(try_load_persisted_model);
+    if let Some(tables) = imported_tables() {
+        return tables;
+    }
+    std::sync::Arc::clone(
+        DEFAULT_MODEL.get_or_init(|| std::sync::Arc::new(model::ModelTables::builtin())),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStatus {
+    /// `builtin` 或 `imported`
+    source: String,
+    name: Option<String>,
+    summary: String,
+    bundle_bytes: usize,
+    persisted_path: Option<String>,
+}
+
+fn model_status_of() -> ModelStatus {
+    let imported = imported_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(name, tables)| (name.clone(), tables.summary())));
+    let (source, name, summary) = match imported {
+        Some((name, summary)) => ("imported".to_string(), Some(name), summary),
+        None => ("builtin".to_string(), None, current_model().summary()),
+    };
+    ModelStatus {
+        source,
+        name,
+        summary,
+        bundle_bytes: model::DEFAULT_BUNDLE.len(),
+        persisted_path: persisted_model_path().map(|path| path.to_string_lossy().to_string()),
+    }
+}
+
+/// 查询当前模型（只读）。
+#[tauri::command]
+fn model_status() -> ModelStatus {
+    model_status_of()
+}
+
+/// 导入模型包（`.tdcrmodel`）。校验通过后写入可执行文件同目录并立即生效。
+#[tauri::command]
+fn import_model(bytes: Vec<u8>, name: Option<String>) -> Result<ModelStatus, String> {
+    let tables = model::ModelTables::from_bundle(&bytes)
+        .map_err(|error| format!("模型包无效：{error:?}"))?;
+    let label = name.unwrap_or_else(|| format!("model.{}", model::EXTENSION));
+
+    if let Some(path) = persisted_model_path() {
+        std::fs::write(&path, &bytes).map_err(|error| format!("写入模型文件失败：{error}"))?;
+    }
+    if let Ok(mut guard) = imported_slot().lock() {
+        *guard = Some((label, std::sync::Arc::new(tables)));
+    }
+    Ok(model_status_of())
+}
+
+/// 恢复内置默认模型（并删除已持久化的模型文件）。
+#[tauri::command]
+fn reset_model() -> Result<ModelStatus, String> {
+    if let Ok(mut guard) = imported_slot().lock() {
+        *guard = None;
+    }
+    if let Some(path) = persisted_model_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(model_status_of())
+}
+
+/// 只读的形状查询请求（3D 预览用，不下发）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TipPoseShapeRequest {
+    position_mm: [f64; 3],
+    roll: f64,
+    pitch: f64,
+    yaw: f64,
+    table_gauge_n: Option<u8>,
+}
+
+/// 表中最接近的真实形状（12 段 κx/κy）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TipPoseShapeResponse {
+    nearest_distance: f64,
+    covered: bool,
+    degraded: bool,
+    segment_count: usize,
+    segment_length_mm: f64,
+    total_length_mm: f64,
+    kx_per_m: Vec<f64>,
+    ky_per_m: Vec<f64>,
+    kappa_abs_per_m: Vec<f64>,
+    phi_rad: Vec<f64>,
+    displacement_mm: Vec<f64>,
+}
+
+/// 末端位姿 → 表中最接近的**真实形状**（只读，供 3D 预览渲染）。
+///
+/// 取的是**最近表点的 0 阶形状**，不做插值：预览必须显示表里真实存在的解，
+/// 否则会出现「预览一个形状、发下去另一个」。
+#[tauri::command]
+fn lookup_tip_pose_shape(request: TipPoseShapeRequest) -> Result<TipPoseShapeResponse, String> {
+    let kind = match request.table_gauge_n.unwrap_or(60) {
+        40 => posetable::PoseTableKind::Limit40n,
+        _ => posetable::PoseTableKind::Limit60n,
+    };
+    let query = posetable::encode_rpy_mm(
+        request.position_mm,
+        request.roll,
+        request.pitch,
+        request.yaw,
+    );
+    let model_tables = current_model();
+    let shape = model_tables
+        .pose(kind)
+        .lookup_shape(&query)
+        .map_err(|error| format!("{error:?}"))?;
+
+    let nodes = posetable::N_SHAPE_NODES;
+    let mut kx_per_m = Vec::with_capacity(nodes);
+    let mut ky_per_m = Vec::with_capacity(nodes);
+    let mut kappa_abs_per_m = Vec::with_capacity(nodes);
+    let mut phi_rad = Vec::with_capacity(nodes);
+    for node in 0..nodes {
+        let kx = shape.kappa[node * 2] as f64;
+        let ky = shape.kappa[node * 2 + 1] as f64;
+        kx_per_m.push(kx);
+        ky_per_m.push(ky);
+        kappa_abs_per_m.push((kx * kx + ky * ky).sqrt());
+        phi_rad.push(ky.atan2(kx));
+    }
+
+    Ok(TipPoseShapeResponse {
+        nearest_distance: shape.nearest_distance,
+        covered: shape.covered,
+        degraded: shape.degraded,
+        segment_count: nodes,
+        segment_length_mm: posetable::L_TOTAL_MM / nodes as f64,
+        total_length_mm: posetable::L_TOTAL_MM,
+        kx_per_m,
+        ky_per_m,
+        kappa_abs_per_m,
+        phi_rad,
+        displacement_mm: shape.displacement_mm.to_vec(),
+    })
+}
+/// 末端位姿 → 0x04 多电机同步指令 的请求体（全阶 Cosserat 位姿查表）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TipPoseCommandRequest {
+    device_id: Option<String>,
+    /// 起始电机地址（1 基），默认 1
+    start_address: Option<u8>,
+    /// 末端位置（mm）
+    position_mm: [f64; 3],
+    /// 末端姿态 roll / pitch / yaw（rad，ZYX 内旋）
+    roll: f64,
+    pitch: f64,
+    yaw: f64,
+    /// 查表档位 40 / 60，默认 60
+    table_gauge_n: Option<u8>,
+}
+
+/// 曲率 → 6 肌腱位移 → 0x04 多电机同步指令 的请求体。
+///
+/// `segment_curvature_per_m` / `segment_direction_rad` 直接取自拖拽预览的
+/// `BackboneOutput.segmentCurvaturePerM` / `segmentDirectionRad`。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurvatureCommandRequest {
+    device_id: Option<String>,
+    /// 起始电机地址（1 基），默认 1
+    start_address: Option<u8>,
+    /// 两段曲率大小 κ（1/m）
+    segment_curvature_per_m: [f64; 2],
+    /// 两段弯曲方向 φ（rad）
+    segment_direction_rad: [f64; 2],
+    /// 全阶 Cosserat 查表档位：40 或 60（张力上限 N），默认 60
+    table_gauge_n: Option<u8>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SensorCalibrationRequest {
@@ -1778,6 +2031,11 @@ fn record_control_command<T: Serialize>(
     frame_hex: &str,
     payload: &T,
 ) {
+    // 录制中：指令同步写进会话 sidecar，回放时才能复盘「控制指令变化」。
+    if let Ok(mut recorder) = state.recorder.lock() {
+        recorder.record_command(now_ms(), command.to_string(), frame_hex.to_string());
+    }
+
     let username = current_username(state);
     let _ = state.sqlite.insert_control_command(
         now_ms(),
@@ -2166,6 +2424,13 @@ fn disconnect_device(
 
 #[tauri::command]
 fn fetch_live_window(state: State<'_, AppState>, count: u32) -> Vec<DeviceSnapshot> {
+    // ⚠ 回放激活时曲线必须来自**回放帧**。这两个命令原来直接读实时环，
+    //   于是「点了播放，工作区/曲线还在跑模拟数据」—— 它们绕过了回放引擎。
+    if let Ok(pb) = state.playback.lock() {
+        if pb.status().active {
+            return pb.frame_window(count as usize).into_iter().cloned().collect();
+        }
+    }
     state
         .live_ring
         .lock()
@@ -2192,6 +2457,23 @@ fn fetch_live_stats(state: State<'_, AppState>) -> live::FrameStats {
 /// 只序列化一个帧与统计，远小于整份 RuntimeSnapshot。
 #[tauri::command]
 fn fetch_live_latest(state: State<'_, AppState>) -> LiveLatest {
+    // 回放激活：工作区读数取回放游标那一帧（同上，必须绕开实时环）。
+    let ring_stats = state
+        .live_ring
+        .lock()
+        .map(|ring| ring.stats())
+        .unwrap_or_else(|_| empty_live_stats());
+    if let Ok(pb) = state.playback.lock() {
+        if pb.status().active {
+            if let Some(frame) = pb.current_frame().cloned() {
+                return LiveLatest {
+                    selected_device_id: frame.device_id.clone(),
+                    latest: Some(frame),
+                    stats: ring_stats,
+                };
+            }
+        }
+    }
     let mut latest: Option<DeviceSnapshot> = None;
     let mut stats = live::FrameStats {
         stored_frames: 0,
@@ -2406,6 +2688,119 @@ fn send_home_command(
         state,
         device_id,
         "home command sent",
+        frame,
+        CommandSafety::Enabled,
+    )
+}
+
+/// 多电机同步位移：一次下发一组目标位移，速度由下位机按位移比例分配。
+#[tauri::command]
+fn send_multi_motor_command(
+    state: State<'_, AppState>,
+    request: MultiMotorCommandRequest,
+) -> Result<RuntimeSnapshot, String> {
+    let frame = protocol::encode_multi_motor_command(
+        request.start_address.unwrap_or(1),
+        &request.positions_mm,
+    )
+    .map_err(|error| format!("{error:?}"))?;
+    let device_id = selected_device_id(request.device_id);
+    audit_control_frame(
+        state,
+        device_id,
+        "multi-motor command sent",
+        frame,
+        CommandSafety::Enabled,
+    )
+}
+
+/// 曲率 → 电机位移：**纯走全阶 Cosserat 查表**（超范围报错，无内置解析回退），
+/// 再走 0x04 多电机同步指令下发。
+#[tauri::command]
+fn send_curvature_command(
+    state: State<'_, AppState>,
+    request: CurvatureCommandRequest,
+) -> Result<RuntimeSnapshot, String> {
+    // 1) 全阶 Cosserat 查表：曲率 → 6 丝位移
+    let kind = match request.table_gauge_n.unwrap_or(60) {
+        40 => kappatable::KappaTableKind::Limit40n,
+        _ => kappatable::KappaTableKind::Limit60n,
+    };
+    let model_tables = current_model();
+    let table = model_tables.kappa(kind);
+    let query = kappatable::features_from_segments(
+        request.segment_curvature_per_m,
+        request.segment_direction_rad,
+    );
+    let lookup = table.lookup(query).map_err(|error| format!("{error:?}"))?;
+
+    // 2) 纯查表：超出覆盖范围直接报错，不再退回解析 PCC 模型
+    if !lookup.covered {
+        return Err(format!(
+            "曲率超出全阶 Cosserat 表覆盖范围（最近邻 {:.2} > {:.1}）",
+            lookup.nearest_distance,
+            kappatable::COVERAGE_RADIUS_PER_M,
+        ));
+    }
+    let positions_mm = lookup.displacement_mm;
+
+    let frame = protocol::encode_multi_motor_command(
+        request.start_address.unwrap_or(1),
+        &positions_mm,
+    )
+    .map_err(|error| format!("{error:?}"))?;
+
+    let device_id = selected_device_id(request.device_id);
+    audit_control_frame(
+        state,
+        device_id,
+        "curvature command sent",
+        frame,
+        CommandSafety::Enabled,
+    )
+}
+
+/// 末端位姿 → 电机位移：走**全阶 Cosserat 位姿查表**（`ik_table.PoseTable` 口径），
+/// 再经 0x04 多电机同步指令下发。取代原先「位姿 → 两段曲率 → 0x05 角度」的内置 PCC 链路。
+#[tauri::command]
+fn send_tip_pose_command(
+    state: State<'_, AppState>,
+    request: TipPoseCommandRequest,
+) -> Result<RuntimeSnapshot, String> {
+    let kind = match request.table_gauge_n.unwrap_or(60) {
+        40 => posetable::PoseTableKind::Limit40n,
+        _ => posetable::PoseTableKind::Limit60n,
+    };
+    let query = posetable::encode_rpy_mm(
+        request.position_mm,
+        request.roll,
+        request.pitch,
+        request.yaw,
+    );
+    let model_tables = current_model();
+    let lookup = model_tables
+        .pose(kind)
+        .lookup(&query)
+        .map_err(|error| format!("{error:?}"))?;
+    if !lookup.covered {
+        return Err(format!(
+            "位姿超出全阶 Cosserat 表覆盖范围（最近邻 {:.1} > {:.0}）",
+            lookup.nearest_distance,
+            posetable::COVERAGE_RADIUS,
+        ));
+    }
+
+    let frame = protocol::encode_multi_motor_command(
+        request.start_address.unwrap_or(1),
+        &lookup.displacement_mm,
+    )
+    .map_err(|error| format!("{error:?}"))?;
+
+    let device_id = selected_device_id(request.device_id);
+    audit_control_frame(
+        state,
+        device_id,
+        "tip pose command sent",
         frame,
         CommandSafety::Enabled,
     )
@@ -2726,6 +3121,16 @@ fn playback_load(
     session_id: String,
 ) -> Result<playback::PlaybackStatus, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
+    // ⚠ 回放会接管实时帧（`playback_mode`），录制就收不到新数据了。
+    //   这是个静默陷阱（实测踩到：录着录着点了回放，数据再也不增长），直接拦下来。
+    if let Ok(rec) = state.recorder.lock() {
+        if rec.is_active() {
+            return Err(
+                "正在录制中：请先停止录制再加载回放（回放会接管实时数据，录制将收不到新帧）"
+                    .to_string(),
+            );
+        }
+    }
     let csv_path = {
         let rec = state
             .recorder
@@ -2777,6 +3182,21 @@ fn playback_stop(state: State<'_, AppState>) -> Result<playback::PlaybackStatus,
     Ok(status)
 }
 
+/// 单帧步进：`delta` = ±1（或 ±N）。步进会自动暂停播放。
+#[tauri::command]
+fn playback_step_frame(
+    state: State<'_, AppState>,
+    delta: i64,
+) -> Result<playback::PlaybackStatus, String> {
+    guard_permission(&state, auth::Permission::ManageSessions)?;
+    let mut pb = state
+        .playback
+        .lock()
+        .map_err(|_| "playback poisoned".to_string())?;
+    pb.step_frame(delta);
+    Ok(pb.status())
+}
+
 #[tauri::command]
 fn playback_seek(state: State<'_, AppState>, ms: u64) -> Result<playback::PlaybackStatus, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
@@ -2802,12 +3222,47 @@ fn playback_set_speed(
     Ok(pb.status())
 }
 
+/// 游标之前 `window_ms` 毫秒内的设备帧（「最近 N 分钟」的原始数据）。
+#[tauri::command]
+fn playback_recent_window(
+    state: State<'_, AppState>,
+    window_ms: u64,
+) -> Result<Vec<DeviceSnapshot>, String> {
+    let pb = state
+        .playback
+        .lock()
+        .map_err(|_| "playback poisoned".to_string())?;
+    Ok(pb.frames_in_window(window_ms).into_iter().cloned().collect())
+}
+
+/// 当前回放会话记录的控制指令（配合 `playback_status` 的游标切窗口）。
+#[tauri::command]
+fn playback_commands(
+    state: State<'_, AppState>,
+) -> Result<Vec<session::SessionCommandRow>, String> {
+    let pb = state
+        .playback
+        .lock()
+        .map_err(|_| "playback poisoned".to_string())?;
+    Ok(pb.commands().to_vec())
+}
+
 #[tauri::command]
 fn playback_status(state: State<'_, AppState>) -> playback::PlaybackStatus {
+    // ⚠ 播放的**推进**挂在这里。
+    //
+    // 原来推进只挂在 `AppState::tick()`（= `tick_snapshot`）上，而前端除了登录/
+    // 迁移后根本不轮询它 —— 于是游标不动，表现就是「点播放界面不刷新，只有单帧
+    // 步进时才动」。本命令在播放期间被前端每 100ms 轮询，是最可靠的推进点。
+    //
+    // `tick` 用绝对时间算游标（`started_at_real + speed`），重复调用不会叠加。
     state
         .playback
         .lock()
-        .map(|p| p.status())
+        .map(|mut p| {
+            p.tick(now_ms());
+            p.status()
+        })
         .unwrap_or_else(|_| playback::PlaybackStatus {
             active: false,
             session_id: String::new(),
@@ -3479,6 +3934,10 @@ pub fn run() {
             list_sessions,
             list_users,
             login,
+            import_model,
+            lookup_tip_pose_shape,
+            model_status,
+            reset_model,
             logout,
             calibrate_sensor,
             configure_cycle_life,
@@ -3491,7 +3950,10 @@ pub fn run() {
             playback_load,
             playback_pause,
             playback_play,
+            playback_commands,
+            playback_recent_window,
             playback_seek,
+            playback_step_frame,
             playback_set_speed,
             playback_status,
             playback_stop,
@@ -3503,8 +3965,11 @@ pub fn run() {
             resume_recording,
             send_active_control_tick,
             send_bend_command,
+            send_curvature_command,
             send_home_command,
             send_motor_command,
+            send_multi_motor_command,
+            send_tip_pose_command,
             save_connection_profile,
             preview_legacy_migration,
             run_legacy_migration,

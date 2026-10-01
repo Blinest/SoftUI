@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -19,30 +19,25 @@ import { CardGrid } from "../components/cards/CardGrid";
 import { DeviceContextPanel } from "../components/DeviceContextPanel";
 import { WorkbenchLayout } from "../layouts/WorkbenchLayout";
 import { monitorCardRegistry } from "./monitorCards";
+import { automaticCardDraggable, automaticCardRegistry } from "./automaticCards";
+import { manualCardDraggable, manualCardRegistry } from "./manualCards";
 import { clamp, isoFull, toneForLevel } from "../utils";
 import { useCardLayout } from "../state/layoutStore";
 import {
   buildBackboneFromCurvatureDistribution,
   curvatureDistributionFromSnapshot,
-  DEFAULT_DYNAMICS_CONFIG,
   summarizeBackbone,
   type CurvatureDistribution,
 } from "../dynamics/svcModel";
 import { sectionEquivalents } from "../dynamics/curvatureDrag";
-import {
-  curvatureOf,
-  distributionFromTipSections,
-  solveTipPose,
-  type SectionCurvature,
-} from "../robot/pose3d";
 import { CurvatureDragPreview } from "../robot/CurvatureDragPreview";
-import type {
-  DeviceConnectionRecord,
-  DeviceRuntimeStatusView,
-  MonitorCardId,
-  RuntimeSnapshot,
-  SerialPortDescriptor,
-} from "../softuiTypes";
+import { WorkspaceCard } from "../components/WorkspaceCard";
+import { lookupTipPoseShape, sendCurvatureCommand, sendTipPoseCommand, type TipPoseShapeLookup } from "../robot/curvatureBridge";
+import { fetchModelStatus, importModelFromFile, resetModel, type ModelStatus } from "../robot/modelBridge";
+
+/** 度 → 弧度（曲率方向换算用）。 */
+const DEG2RAD = Math.PI / 180;
+import type { AutomaticCardId, DeviceConnectionRecord, DeviceRuntimeStatusView, ManualCardId, MonitorCardId, RuntimeSnapshot, SerialPortDescriptor } from "../softuiTypes";
 import "../styles/workspace.css";
 
 export type WorkspaceTab = "monitor" | "live-data" | "manual" | "automatic" | "playback";
@@ -61,7 +56,7 @@ export type MotorCommandDraft = {
  *
  * 手动控制有两路输入，最终都折算成「两段曲率 + 方向」才发出去：
  *   - 三维拖动：12 段分布 → `sectionEquivalents` → 这里的曲率/方向；
- *   - 末端位姿：6 个位姿分量 → `solveTipPose` → 两段曲率 → 同样落到这里。
+ *   - 末端位姿：6 个位姿分量 → **全阶 Cosserat 位姿查表** → κ(s) → 同样落到这里。
  *
  * **不让后端做反解**：反解要用到臂长、曲率上限、姿态权重这些参数，它们都在
  * 前端（和 3D 视图共用同一份），后端 `send_bend_command` 仍然吃角度。把反解
@@ -160,20 +155,6 @@ export function WorkspacePage({
   const backbone = useMemo(() => buildBackboneFromCurvatureDistribution(curvatureDistribution), [curvatureDistribution]);
   const curvatureSummary = useMemo(() => summarizeBackbone(backbone), [backbone]);
 
-  /**
-   * 当前实际的「两段等效曲率」，作为末端反解的迭代初值。
-   *
-   * 取分布里两半的积分平均（和下发时的折算同一套口径），比直接读某一端的
-   * 采样更稳 —— 传感融合出来的分布在段与段的交界处会有过渡带。
-   */
-  const actualTipSections = useMemo<[SectionCurvature, SectionCurvature]>(() => {
-    const eq = sectionEquivalents(curvatureDistribution);
-    return [
-      { kxPerM: -eq.curvaturePerM[0] * Math.sin((eq.directionDeg[0] * Math.PI) / 180), kyPerM: eq.curvaturePerM[0] * Math.cos((eq.directionDeg[0] * Math.PI) / 180) },
-      { kxPerM: -eq.curvaturePerM[1] * Math.sin((eq.directionDeg[1] * Math.PI) / 180), kyPerM: eq.curvaturePerM[1] * Math.cos((eq.directionDeg[1] * Math.PI) / 180) },
-    ];
-  }, [curvatureDistribution]);
-
   /** 方向度（0 上 / 90 右 / 180 下 / 270 左）→ 中文标签，用于等效曲率展示。 */
   const directionLabel = (deg: number): string => {
     const labels = ["上", "右", "下", "左"];
@@ -201,27 +182,92 @@ export function WorkspacePage({
    * 自己输的 rpy 被悄悄改了。输入框保留用户填的值，实际能达到的位姿另外显示。
    */
   const [tipDraft, setTipDraft] = useState({ x: 0, y: 0, z: 320, roll: 0, pitch: 0, yaw: 0 });
-  const [tipSections, setTipSections] = useState<[SectionCurvature, SectionCurvature] | null>(null);
 
-  const segmentLengthM = DEFAULT_DYNAMICS_CONFIG.segmentLengthM;
-  /** 曲率上限沿用原来粗控通道的限幅：段 1 是 8、段 2 是 6.5 1/m。 */
-  const maxCurvaturePerM = useMemo<readonly [number, number]>(() => [8, 6.5], []);
+  /** 当前模型包（内置 or 导入）。 */
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
+  const modelFileRef = useRef<HTMLInputElement | null>(null);
 
-  const tipSolution = useMemo(() => solveTipPose({
-    target: {
-      positionM: [tipDraft.x / 1000, tipDraft.y / 1000, tipDraft.z / 1000],
-      rpyRad: [
-        (tipDraft.roll * Math.PI) / 180,
-        (tipDraft.pitch * Math.PI) / 180,
-        (tipDraft.yaw * Math.PI) / 180,
-      ],
-    },
-    // 初值取「当前实际曲率」：反解非凸，从现实状态出发既能保证输入框不动时
-    // 解是稳定的，也避免每次微调都跳到另一个完全不同的解上。
-    base: tipSections ?? actualTipSections,
-    segmentLengthM,
-    maxCurvaturePerM,
-  }), [tipDraft, tipSections, actualTipSections, segmentLengthM, maxCurvaturePerM]);
+  useEffect(() => {
+    void (async () => {
+      try {
+        setModelStatus(await fetchModelStatus());
+      } catch { /* 忽略：拿不到就只显示未加载 */ }
+    })();
+  }, []);
+
+  const handleImportModel = useCallback(async (file: File) => {
+    try {
+      setModelStatus(await importModelFromFile(file));
+      setCommandStatus({ tone: "ok", message: `模型已导入：${file.name}` });
+    } catch (err) {
+      setCommandStatus({ tone: "error", message: err instanceof Error ? err.message : "模型导入失败" });
+    }
+  }, []);
+
+  const handleResetModel = useCallback(async () => {
+    try {
+      setModelStatus(await resetModel());
+      setCommandStatus({ tone: "ok", message: "已恢复内置模型" });
+    } catch (err) {
+      setCommandStatus({ tone: "error", message: err instanceof Error ? err.message : "恢复失败" });
+    }
+  }, []);
+
+  /** 末端位姿 → .py 表的真实形状（3D 预览用，只读）。 */
+  const [tableShape, setTableShape] = useState<TipPoseShapeLookup | null>(null);
+
+  /**
+   * 位姿一变就去查表取形状（150ms 防抖，避免每次按键都打一次 IPC）。
+   *
+   * 预览**只认表里真实存在的解**：查不到（超覆盖）就退回显示实际形状，
+   * 而不是拿前端拟合出来的形状糊弄。
+   */
+  useEffect(() => {
+    const rollRad = (tipDraft.roll * Math.PI) / 180;
+    const pitchRad = (tipDraft.pitch * Math.PI) / 180;
+    const yawRad = (tipDraft.yaw * Math.PI) / 180;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const shape = await lookupTipPoseShape(
+            [tipDraft.x, tipDraft.y, tipDraft.z],
+            [rollRad, pitchRad, yawRad],
+          );
+          if (!cancelled) setTableShape(shape);
+        } catch {
+          if (!cancelled) setTableShape(null);
+        }
+      })();
+    }, 150);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [tipDraft]);
+
+  /** 由查表结果拼出 12 段曲率分布（喂给既有的 3D 骨架积分器）。 */
+  const tableDistribution = useMemo<CurvatureDistribution | null>(() => {
+    if (!tableShape || !tableShape.covered) return null;
+    const segLen = tableShape.segmentLengthMm;
+    return {
+      totalLengthMm: tableShape.totalLengthMm,
+      basisSegmentCount: tableShape.segmentCount,
+      source: "deviceCurvature",
+      segments: tableShape.kxPerM.map((kx, index) => ({
+        index,
+        sStartMm: index * segLen,
+        sEndMm: (index + 1) * segLen,
+        sMidMm: (index + 0.5) * segLen,
+        lengthMm: segLen,
+        kxPerM: kx,
+        kyPerM: tableShape.kyPerM[index] ?? 0,
+        kappaAbsPerM: tableShape.kappaAbsPerM[index] ?? 0,
+        phiRad: tableShape.phiRad[index] ?? 0,
+      })),
+    };
+  }, [tableShape]);
+
 
   /**
    * 当前目标对应的 12 段分布（拖动或末端反解都算）。
@@ -231,9 +277,10 @@ export function WorkspacePage({
    */
   const targetDistribution = useMemo<CurvatureDistribution | null>(() => {
     if (dragTarget) return dragTarget;
-    if (tipSections) return distributionFromTipSections(tipSections, segmentLengthM);
+    // 末端位姿分支：形状**只**来自 .py 表；表外不再兜底（前端已无内置 PCC 反解）
+    if (tableDistribution) return tableDistribution;
     return null;
-  }, [dragTarget, tipSections, segmentLengthM]);
+  }, [dragTarget, tableDistribution]);
 
   const equivalents = useMemo(
     () => sectionEquivalents(targetDistribution ?? curvatureDistribution),
@@ -257,35 +304,8 @@ export function WorkspacePage({
     setCommandStatus({ tone, message });
   }, []);
 
-  /**
-   * 按末端位姿求解并把结果固定下来。
-   *
-   * 输入框里的位姿是**实时**求解的（每敲一个字符就解一次），但那个结果不进
-   * 3D 预览 —— 预览要有「确认」这个动作才不会在打字过程中乱跳。按下按钮才把
-   * 当前解冻结成目标曲率，预览与下发随之更新。
-   */
-  const applyTipPose = useCallback(() => {
-    const solved = tipSolution;
-    // 末端位姿接管目标：清掉可能还挂着的拖动结果，保证「当前目标」只有一个来源。
-    setDragTarget(null);
-    setTipSections(solved.sections);
-    if (!solved.reachable) {
-      notifyCommand(
-        `末端点超出工作空间：位置差 ${(solved.positionErrorM * 1000).toFixed(1)} mm，已取最近的可行解`,
-        "warn",
-      );
-      return;
-    }
-    notifyCommand(
-      `已按末端位姿求解（位置残差 ${(solved.positionErrorM * 1000).toFixed(2)} mm，`
-      + `姿态残差 ${((solved.orientationErrorRad * 180) / Math.PI).toFixed(1)}°）—— 臂只有 4 个自由度，姿态无法完全指定`,
-      "ok",
-    );
-  }, [tipSolution, notifyCommand]);
-
   const clearTargets = useCallback(() => {
     setDragTarget(null);
-    setTipSections(null);
   }, []);
 
   /**
@@ -297,7 +317,6 @@ export function WorkspacePage({
    */
   const handleDragTarget = useCallback((next: CurvatureDistribution | null) => {
     setDragTarget(next);
-    if (next) setTipSections(null);
   }, []);
 
   const runSystemControl = useCallback(async (action: SystemControlAction) => {
@@ -343,16 +362,57 @@ export function WorkspacePage({
     const source = dragTarget ? "三维拖动" : "末端位姿";
     // 解不可达时把残差一起报出来 —— 操作员按下去的是一条真的会驱动电机的命令，
     // 必须知道他拿到的不是他要的那个点。
-    const warn = tipSections && !tipSolution.reachable
-      ? `（注意：位置差 ${(tipSolution.positionErrorM * 1000).toFixed(1)} mm，已取最近可行解）`
-      : "";
-    void runWorkspaceCommand("bend", {
-      direction1: equivalents.directionCode[0],
-      section1CurvaturePerM: equivalents.curvaturePerM[0],
-      direction2: equivalents.directionCode[1],
-      section2CurvaturePerM: equivalents.curvaturePerM[1],
-    }, `已按${source}曲率下发（峰值 ${peakCurvature.toFixed(2)} 1/m）${warn}`);
-  }, [targetDistribution, dragTarget, tipSections, tipSolution, equivalents, peakCurvature, runWorkspaceCommand]);
+    const warn = "";
+    // 走全阶 Cosserat 查表（0x04 多电机同步指令），不再折成角度发 0x05。
+    void (async () => {
+      try {
+        await sendCurvatureCommand(
+          [equivalents.curvaturePerM[0], equivalents.curvaturePerM[1]],
+          [equivalents.directionDeg[0] * DEG2RAD, equivalents.directionDeg[1] * DEG2RAD],
+        );
+        setCommandStatus({
+          tone: "ok",
+          message: `已按${source}曲率下发（全阶 Cosserat 查表，峰值 ${peakCurvature.toFixed(2)} 1/m）${warn}`,
+        });
+      } catch (err) {
+        setCommandStatus({
+          tone: "error",
+          message: err instanceof Error ? err.message : "命令失败",
+        });
+      }
+    })();
+  }, [targetDistribution, dragTarget, equivalents, peakCurvature]);
+
+  /**
+   * 末端位姿**直接走全阶 Cosserat 位姿查表**下发（0x04）。
+   *
+   * 与「按此曲率下发」的区别：这里把位姿本身交给后端查表，
+   * 不再先在前端做 PCC 反解折成两段曲率。
+   */
+  const sendTipPoseToTable = useCallback(() => {
+    if (tableShape && !tableShape.covered) {
+      setCommandStatus({ tone: "warn", message: "超出可达空间范围：该位姿不在全阶 Cosserat 表的覆盖内" });
+      return;
+    }
+    const warn = "";
+    void (async () => {
+      try {
+        await sendTipPoseCommand(
+          [tipDraft.x, tipDraft.y, tipDraft.z],
+          [tipDraft.roll * DEG2RAD, tipDraft.pitch * DEG2RAD, tipDraft.yaw * DEG2RAD],
+        );
+        setCommandStatus({
+          tone: "ok",
+          message: `已按位姿下发（全阶 Cosserat 位姿查表，x=${tipDraft.x} y=${tipDraft.y} z=${tipDraft.z}）${warn}`,
+        });
+      } catch (err) {
+        setCommandStatus({
+          tone: "error",
+          message: err instanceof Error ? err.message : "命令失败",
+        });
+      }
+    })();
+  }, [tipDraft, tableShape]);
 
   // 主动控制：开启后每 200ms 发一次 tick，直到失能或手动停止。
   useEffect(() => {
@@ -386,6 +446,51 @@ export function WorkspacePage({
 
   // 监控卡片布局：拖动 / 缩放后由 useCardLayout 原地写盘，不走页面级状态。
   const { layout, commit: commitLayout } = useCardLayout(snapshot.authSession.username, "workspace-monitor");
+  // 自动控制卡片布局：拖动 / 缩放后由 useCardLayout 原地写盘，不走页面级状态。
+  const automaticLayout = useCardLayout(snapshot.authSession.username, "workspace-automatic");
+
+  // 手动控制卡片布局。
+  const manualLayout = useCardLayout(snapshot.authSession.username, "workspace-manual");
+
+  const manualHeaderForCard = useCallback(
+    (cardId: string) => {
+      const meta = manualCardRegistry[cardId as ManualCardId];
+      const Icon = meta.icon;
+      // 3D 拖动卡片的标题栏右侧是「拖动编辑」开关。
+      const action =
+        cardId === "curvatureDrag" ? (
+          <label className="curvature-drag-toggle">
+            <input
+              type="checkbox"
+              checked={dragEnabled}
+              onChange={(event) => {
+                const next = event.target.checked;
+                setDragEnabled(next);
+                // 关掉编辑时一并清掉目标，视图立刻回到真实形状。
+                if (!next) setDragTarget(null);
+              }}
+            />
+            <span>拖动编辑</span>
+          </label>
+        ) : undefined;
+      return { title: meta.title, icon: <Icon aria-hidden="true" size={17} />, action };
+    },
+    [dragEnabled],
+  );
+
+  const automaticHeaderForCard = useCallback(
+    (cardId: string) => {
+      const meta = automaticCardRegistry[cardId as AutomaticCardId];
+      const Icon = meta.icon;
+      // 系统操作卡片的标题栏右侧挂命令状态徽标。
+      const action =
+        cardId === "systemControl" && commandStatus ? (
+          <Badge tone={commandStatus.tone}>{commandStatus.message}</Badge>
+        ) : undefined;
+      return { title: meta.title, icon: <Icon aria-hidden="true" size={17} />, action };
+    },
+    [commandStatus],
+  );
 
   const context = (
     <DeviceContextPanel
@@ -467,11 +572,11 @@ export function WorkspacePage({
         {/* ---------- 实时数据 ---------- */}
         {activeTab === "live-data" ? (
           <div className="workspace-pane-grid live-data-pane">
-            <section className="workspace-panel workspace-panel-wide">
-              <header>
-                <div><span>DeviceTab</span><h2>电机实时数据</h2></div>
-                <Badge tone={isSystemEnabled ? "ok" : "warn"}>{isSystemEnabled ? "已使能" : "未使能"}</Badge>
-              </header>
+            <WorkspaceCard
+              title="电机实时数据"
+              wide
+              actions={<Badge tone={isSystemEnabled ? "ok" : "warn"}>{isSystemEnabled ? "已使能" : "未使能"}</Badge>}
+            >
               <div className="workspace-table" role="table" aria-label="电机实时数据">
                 <div className="workspace-table-row is-head" role="row">
                   <span role="columnheader">电机</span>
@@ -499,10 +604,9 @@ export function WorkspacePage({
                   <span>请先在左侧连接设备或启动模拟器，数据会随采样自动刷新。</span>
                 </div>
               ) : null}
-            </section>
+            </WorkspaceCard>
 
-            <section className="workspace-panel workspace-panel-wide">
-              <header><div><span>DeviceTab</span><h2>压力传感器实时数据</h2></div></header>
+            <WorkspaceCard title="压力传感器实时数据" wide>
               <div className="workspace-table" role="table" aria-label="压力传感器实时数据">
                 <div className="workspace-table-row is-head" role="row">
                   <span role="columnheader">传感器</span>
@@ -530,27 +634,58 @@ export function WorkspacePage({
                   <span>请先在左侧连接设备或启动模拟器。</span>
                 </div>
               ) : null}
-            </section>
+            </WorkspaceCard>
           </div>
         ) : null}
 
         {/* ---------- 手动控制 ---------- */}
         {activeTab === "manual" ? (
-          <div className="workspace-pane-grid manual-control-pane">
-            <section className="workspace-panel manual-volume-panel">
-              <header>
-                <div><span>DeviceTab</span><h2>三维曲率拖动控制</h2></div>
-                <label className="curvature-drag-toggle">
-                  <input type="checkbox" checked={dragEnabled}
-                    onChange={(event) => {
-                      const next = event.target.checked;
-                      setDragEnabled(next);
-                      // 关掉编辑时一并清掉目标，视图立刻回到真实形状。
-                      if (!next) setDragTarget(null);
-                    }} />
-                  <span>拖动编辑</span>
-                </label>
-              </header>
+          <CardGrid
+            layout={manualLayout.layout}
+            ariaLabel="手动控制卡片"
+            layoutKey="workspace-manual"
+            onLayoutChange={manualLayout.commit}
+            draggableForCard={manualCardDraggable}
+            bodyClassForCard={(cardId) => (cardId === "curvatureDrag" ? "manual-volume-panel" : undefined)}
+            headerForCard={manualHeaderForCard}
+            childrenForCard={(cardId) => {
+              switch (cardId as ManualCardId) {
+                case "modelPackage":
+                  return (
+                    <>
+              <div className="workspace-action-row">
+                <input
+                  ref={modelFileRef}
+                  type="file"
+                  accept=".tdcrmodel"
+                  style={{ display: "none" }}
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void handleImportModel(file);
+                    event.target.value = "";
+                  }}
+                />
+                <button type="button" className="ghost-btn" onClick={() => modelFileRef.current?.click()}>
+                  <span>导入模型包</span>
+                </button>
+                <button type="button" className="ghost-btn" onClick={() => void handleResetModel()}
+                  disabled={modelStatus?.source !== "imported"}>
+                  <span>恢复内置模型</span>
+                </button>
+              </div>
+              <p className="curvature-drag-note">
+                当前模型：
+                {modelStatus
+                  ? (modelStatus.source === "imported"
+                      ? `${modelStatus.name ?? "已导入"} · ${modelStatus.summary}`
+                      : `内置默认 · ${modelStatus.summary}`)
+                  : "加载中…"}
+              </p>
+                    </>
+                  );
+                case "curvatureDrag":
+                  return (
+                    <>
               <CurvatureDragPreview
                 actual={backbone}
                 // 预览显示的是**目标**分布：拖动与末端位姿反解是两个入口，
@@ -570,7 +705,7 @@ export function WorkspacePage({
                 </div>
                 <div>
                   <span>沿臂峰值曲率</span>
-                  <strong className={peakCurvature > maxCurvaturePerM[0] ? "is-warn" : undefined}>{peakCurvature.toFixed(2)} 1/m</strong>
+                  <strong className={peakCurvature > 8 ? "is-warn" : undefined}>{peakCurvature.toFixed(2)} 1/m</strong>
                 </div>
               </div>
               <div className="curvature-drag-actions">
@@ -585,16 +720,15 @@ export function WorkspacePage({
                   </button>
                 </div>
               </div>
+
               <p className="curvature-drag-note">
                 点击「按此曲率下发」下发命令
               </p>
-            </section>
-
-            <div className="manual-side-stack">
-            <section className="workspace-panel">
-              <header>
-                <div><span>DeviceTab</span><h2>末端位姿控制</h2></div>
-              </header>
+                    </>
+                  );
+                case "tipPose":
+                  return (
+                    <>
               <div className="tip-pose-grid">
                 {([
                   ["x", "X mm"], ["y", "Y mm"], ["z", "Z mm"],
@@ -611,42 +745,49 @@ export function WorkspacePage({
               {/* 实时求解结果：用户每改一个数字这里就更新，但只有按下按钮才进 3D 预览。 */}
               <div className="tip-pose-result">
                 <div>
-                  <span>可达性</span>
-                  <strong className={tipSolution.reachable ? undefined : "is-warn"}>
-                    {tipSolution.reachable ? "位置可达" : `不可达（差 ${(tipSolution.positionErrorM * 1000).toFixed(1)} mm）`}
+                  <span>全阶查表</span>
+                  <strong className={tableShape?.covered ? undefined : "is-warn"}>
+                    {tableShape
+                      ? (tableShape.covered
+                          ? `命中表点（${tableShape.nearestDistance.toFixed(0)}）`
+                          : "超出可达空间范围")
+                      : "查询中…"}
                   </strong>
                 </div>
                 <div>
-                  <span>位置残差</span>
-                  <strong>{(tipSolution.positionErrorM * 1000).toFixed(2)} mm</strong>
-                </div>
-                <div>
-                  <span>姿态残差</span>
-                  <strong className={tipSolution.orientationErrorRad > 0.1 ? "is-warn" : undefined}>
-                    {((tipSolution.orientationErrorRad * 180) / Math.PI).toFixed(1)}°
+                  <span>最近表点距离</span>
+                  <strong className={tableShape?.covered ? undefined : "is-warn"}>
+                    {tableShape ? tableShape.nearestDistance.toFixed(0) : "--"}
                   </strong>
                 </div>
                 <div>
-                  <span>解出曲率</span>
+                  <span>查表峰值曲率</span>
                   <strong>
-                    {curvatureOf(tipSolution.sections[0]).curvaturePerM.toFixed(2)} /{" "}
-                    {curvatureOf(tipSolution.sections[1]).curvaturePerM.toFixed(2)} 1/m
+                    {tableShape && tableShape.kappaAbsPerM.length > 0
+                      ? `${Math.max(...tableShape.kappaAbsPerM).toFixed(2)} 1/m`
+                      : "--"}
                   </strong>
                 </div>
+                {tableShape && !tableShape.covered ? (
+                  <p className="curvature-drag-note is-warn">
+                    超出可达空间范围：该位姿不在全阶 Cosserat 表的覆盖内，3D 视图不显示目标骨架
+                  </p>
+                ) : null}
               </div>
 
               <div className="workspace-action-row">
-                <button type="button" className="primary-btn" onClick={applyTipPose}>
-                  <span>按位姿求解</span>
+                <button type="button" className="primary-btn" onClick={sendTipPoseToTable}>
+                  <ArrowRightLeft size={15} /><span>按位姿下发</span>
                 </button>
-                <button type="button" className="ghost-btn" onClick={clearTargets} disabled={!tipSections}>
+                <button type="button" className="ghost-btn" onClick={clearTargets} disabled={!targetDistribution}>
                   <span>清除</span>
                 </button>
               </div>
-            </section>
-
-            <section className="workspace-panel">
-              <header><div><span>DeviceTab</span><h2>电机控制</h2></div></header>
+                    </>
+                  );
+                case "motorControl":
+                  return (
+                    <>
               <div className="workspace-form-grid workspace-form-grid-motor">
                 <label className="workspace-field">
                   <span>电机 ID</span>
@@ -686,10 +827,11 @@ export function WorkspacePage({
                 ))}
                 {motors.length === 0 ? <div><span>电机</span><strong>无数据</strong><small>未连接</small></div> : null}
               </div>
-            </section>
-
-            <section className="workspace-panel">
-              <header><div><span>DeviceTab</span><h2>压力数据监控 / 校准</h2></div></header>
+                    </>
+                  );
+                case "sensorMonitor":
+                  return (
+                    <>
               <div className="workspace-form-grid">
                 <label className="workspace-field">
                   <span>压力传感器 ID</span>
@@ -719,19 +861,29 @@ export function WorkspacePage({
                   ))}
                 </div>
               ) : null}
-            </section>
-            </div>
-          </div>
+                    </>
+                  );
+                default:
+                  return null;
+              }
+            }}
+          />
         ) : null}
 
         {/* ---------- 自动控制 ---------- */}
         {activeTab === "automatic" ? (
-          <div className="workspace-pane-grid automatic-control-pane">
-            <section className="workspace-panel workspace-panel-wide">
-              <header>
-                <div><span>DeviceTab</span><h2>系统操作权限</h2></div>
-                {commandStatus ? <Badge tone={commandStatus.tone}>{commandStatus.message}</Badge> : null}
-              </header>
+          <CardGrid
+            layout={automaticLayout.layout}
+            ariaLabel="自动控制卡片"
+            layoutKey="workspace-automatic"
+            onLayoutChange={automaticLayout.commit}
+            draggableForCard={automaticCardDraggable}
+            headerForCard={automaticHeaderForCard}
+            childrenForCard={(cardId) => {
+              switch (cardId as AutomaticCardId) {
+                case "systemControl":
+                  return (
+                    <>
               <div className="automatic-status-grid">
                 <div><span>连接状态</span><strong>{snapshot.connection.state}</strong></div>
                 <div><span>使能状态</span><strong>{isSystemEnabled ? "已使能" : "已失能"}</strong></div>
@@ -751,10 +903,11 @@ export function WorkspacePage({
                   <AlertTriangle size={15} /><span>紧急停止</span>
                 </button>
               </div>
-            </section>
-
-            <section className="workspace-panel">
-              <header><div><span>DeviceTab</span><h2>PID 参数</h2></div></header>
+                    </>
+                  );
+                case "pidControl":
+                  return (
+                    <>
               <div className="workspace-form-grid workspace-form-grid-pid">
                 {(["kp", "ki", "kd"] as const).map((key) => (
                   <label className="workspace-field" key={key}>
@@ -776,10 +929,11 @@ export function WorkspacePage({
                   <span>{activeControlEnabled ? "停止主动控制" : "主动控制"}</span>
                 </button>
               </div>
-            </section>
-
-            <section className="workspace-panel">
-              <header><div><span>frontend loop</span><h2>循环寿命检测</h2></div></header>
+                    </>
+                  );
+                case "cycleLife":
+                  return (
+                    <>
               <div className="workspace-form-grid workspace-form-grid-cycle">
                 <label className="workspace-field"><span>低阈值</span>
                   <input type="number" step={0.1} value={cycleLowThreshold}
@@ -815,18 +969,24 @@ export function WorkspacePage({
                   <span>重置计数</span>
                 </button>
               </div>
-            </section>
-          </div>
+                    </>
+                  );
+                default:
+                  return null;
+              }
+            }}
+          />
         ) : null}
 
         {/* ---------- 回放 ---------- */}
         {activeTab === "playback" ? (
           <div className="workspace-pane-grid playback-pane">
-            <section className="workspace-panel workspace-panel-wide">
-              <header>
-                <div><span>workspace</span><h2>会话与回放</h2></div>
-                <Badge tone={snapshot.playbackMode ? "info" : "neutral"}>{snapshot.playbackMode ? "回放中" : "实时"}</Badge>
-              </header>
+            <WorkspaceCard
+              title="会话与回放"
+              kicker="workspace"
+              wide
+              actions={<Badge tone={snapshot.playbackMode ? "info" : "neutral"}>{snapshot.playbackMode ? "回放中" : "实时"}</Badge>}
+            >
               <div className="timeline">
                 <div className="timeline-bar"><div className="timeline-fill" style={{ width: `${progress}%` }} /></div>
                 <div className="timeline-meta">
@@ -836,10 +996,9 @@ export function WorkspacePage({
                 </div>
               </div>
               <div className="mini-info">当前会话：<strong>{activeSession?.name ?? "--"}</strong></div>
-            </section>
+            </WorkspaceCard>
 
-            <section className="workspace-panel workspace-panel-wide">
-              <header><div><span>workspace</span><h2>会话列表</h2></div></header>
+            <WorkspaceCard title="会话列表" kicker="workspace" wide>
               <div className="playback-session-list">
                 {snapshot.playback.sessions.map((session) => (
                   <div className="playback-session-row" key={session.id}>
@@ -857,10 +1016,9 @@ export function WorkspacePage({
                   </div>
                 ) : null}
               </div>
-            </section>
+            </WorkspaceCard>
 
-            <section className="workspace-panel workspace-panel-wide">
-              <header><div><span>workspace</span><h2>最近日志</h2></div></header>
+            <WorkspaceCard title="最近日志" kicker="workspace" wide>
               <div className="log-list compact">
                 {snapshot.logs.slice(0, 4).map((entry) => (
                   <div className="log-row" key={entry.id}>
@@ -876,7 +1034,7 @@ export function WorkspacePage({
                   </div>
                 ) : null}
               </div>
-            </section>
+            </WorkspaceCard>
           </div>
         ) : null}
       </div>

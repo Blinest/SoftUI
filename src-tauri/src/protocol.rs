@@ -171,14 +171,35 @@ pub fn encode_sensor_calibration(
     encode_frame(FrameHead::Sensor, 0x03, &data)
 }
 
-pub fn encode_home_command(motor_count: u8, start_address: u8) -> Result<Vec<u8>, ProtocolError> {
-    let mut data = Vec::with_capacity(2 + motor_count as usize * 2);
-    data.push(motor_count);
+/// 多电机同步位移指令（功能码 0x04）。
+///
+/// 帧结构：`AA 04 LEN count start_addr d0_H d0_L ... dn_H dn_L checksum`
+///   - `LEN`        = `2 + count * 2`
+///   - `count`      = 电机数量
+///   - `start_addr` = 起始电机地址（1 基，与单电机指令语义一致；下位机对 0 按 1 处理）
+///   - 每个位移     = `int16` 大端，单位 0.01mm，**带符号**（正 = 正方向，负 = 反方向）
+///
+/// 本指令**不下发速度**：下位机 `motor_sync_control()` 会按「各电机位移 / 本批次最大位移」
+/// 的比例分配速度，使多轴位移同时到达。
+pub fn encode_multi_motor_command(
+    start_address: u8,
+    positions_mm: &[f64],
+) -> Result<Vec<u8>, ProtocolError> {
+    let count = u8::try_from(positions_mm.len()).map_err(|_| ProtocolError::InvalidLength)?;
+
+    let mut data = Vec::with_capacity(2 + positions_mm.len() * 2);
+    data.push(count);
     data.push(start_address);
-    for _ in 0..motor_count {
-        data.extend_from_slice(&0u16.to_be_bytes());
+    for position in positions_mm {
+        data.extend_from_slice(&scaled_i16(*position, "position")?.to_be_bytes());
     }
     encode_frame(FrameHead::Motor, 0x04, &data)
+}
+
+/// 一键归中：全部位移为 0 的 0x04 特例，等价于 `encode_multi_motor_command` + 全零数组。
+pub fn encode_home_command(motor_count: u8, start_address: u8) -> Result<Vec<u8>, ProtocolError> {
+    let positions = vec![0.0; motor_count as usize];
+    encode_multi_motor_command(start_address, &positions)
 }
 
 pub fn encode_bend_command(
@@ -419,6 +440,43 @@ mod tests {
         assert_eq!(
             frame,
             vec![0xAA, 0x03, 0x08, 0x01, 0x01, 0x02, 0xBC, 0x03, 0xE8, 0x03, 0xE8, 0x4B]
+        );
+    }
+
+    #[test]
+    fn encodes_multi_motor_command_with_signed_positions() {
+        // 3 台电机，起始地址 1，位移 +1.00 / 0.00 / -2.50 mm
+        let frame = encode_multi_motor_command(1, &[1.0, 0.0, -2.5]).expect("multi motor");
+        assert_eq!(
+            frame,
+            vec![
+                0xAA, 0x04, 0x08, 0x03, 0x01, // 帧头/功能码/LEN=8/count=3/起始地址=1
+                0x00, 0x64, // +1.00mm ->  100
+                0x00, 0x00, //  0.00mm ->    0
+                0xFF, 0x06, // -2.50mm -> -250
+                0x23,       // 校验和
+            ]
+        );
+    }
+
+    #[test]
+    fn home_command_equals_multi_motor_with_zero_positions() {
+        assert_eq!(
+            encode_home_command(2, 1).expect("home"),
+            encode_multi_motor_command(1, &[0.0, 0.0]).expect("multi"),
+        );
+    }
+
+    #[test]
+    fn multi_motor_command_rejects_out_of_range_position() {
+        // int16 只能表示 ±327.67mm
+        assert_eq!(
+            encode_multi_motor_command(1, &[400.0]),
+            Err(ProtocolError::ValueOutOfRange("position")),
+        );
+        assert_eq!(
+            encode_multi_motor_command(1, &[f64::NAN]),
+            Err(ProtocolError::ValueOutOfRange("position")),
         );
     }
 

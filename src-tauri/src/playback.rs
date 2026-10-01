@@ -1,5 +1,6 @@
 use crate::session;
 use crate::DeviceSnapshot;
+use crate::session::{read_session_commands, SessionCommandRow};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,6 +22,7 @@ pub struct PlaybackEngine {
     active: bool,
     session_id: String,
     frames: Vec<DeviceSnapshot>,
+    commands: Vec<SessionCommandRow>,
     cursor_idx: usize,
     cursor_ms: u64,
     start_ms: u64,
@@ -37,6 +39,7 @@ impl PlaybackEngine {
             active: false,
             session_id: String::new(),
             frames: Vec::new(),
+            commands: Vec::new(),
             cursor_idx: 0,
             cursor_ms: 0,
             start_ms: 0,
@@ -61,6 +64,7 @@ impl PlaybackEngine {
         self.active = true;
         self.session_id = session_id;
         self.frames = frames;
+        self.commands = read_session_commands(&csv_path.to_path_buf());
         self.cursor_idx = 0;
         self.cursor_ms = start_ms;
         self.start_ms = start_ms;
@@ -112,6 +116,33 @@ impl PlaybackEngine {
         }
     }
 
+    /// 单帧步进：游标移动 `delta` 帧（负 = 上一帧）。
+    ///
+    /// 步进会**自动暂停** —— 逐帧看数据时时钟还在跑会把游标冲掉。
+    /// 到位后同步 `cursor_ms` 与 `started_at_cursor_ms`，之后按播放也能从这里续。
+    /// 返回步进后游标是否还在会话范围内。
+    pub fn step_frame(&mut self, delta: i64) -> bool {
+        if !self.active || self.frames.is_empty() {
+            return false;
+        }
+        self.playing = false;
+        let last = self.frames.len() - 1;
+        let next = (self.cursor_idx as i64 + delta).clamp(0, last as i64) as usize;
+        self.cursor_idx = next;
+        self.cursor_ms = self.frames[next].received_at_ms;
+        self.started_at_cursor_ms = self.cursor_ms;
+        true
+    }
+
+    /// 单帧步进是否真的移动了（到首/末帧时再按即为 false，UI 可给"到头了"提示）。
+    pub fn can_step(&self, delta: i64) -> bool {
+        if !self.active || self.frames.is_empty() {
+            return false;
+        }
+        let next = self.cursor_idx as i64 + delta;
+        next >= 0 && next < self.frames.len() as i64
+    }
+
     pub fn set_speed(&mut self, speed: f64) {
         // Clamp between 0.25 and 4.0
         if self.playing {
@@ -145,8 +176,32 @@ impl PlaybackEngine {
         self.frames.get(self.cursor_idx)
     }
 
+    /// 该会话记录的控制指令（按时间升序）。
+    ///
+    /// 指令来自录制时同步写进会话 sidecar 的 `commands` 数组 —— 与帧共用
+    /// `received_at_ms` 时钟，UI 可直接按游标位置切出「最近 N 分钟」的窗口。
+    pub(crate) fn commands(&self) -> &[SessionCommandRow] {
+        &self.commands
+    }
+
     pub(crate) fn current_frame(&self) -> Option<&DeviceSnapshot> {
         self.frames.get(self.cursor_idx)
+    }
+
+    /// 取游标**之前** `window_ms` 毫秒内的帧（含游标帧），按时间升序。
+    ///
+    /// 与 `frame_window` 的区别：那个按**帧数**取（适合波形滚动），这个按**时间**取
+    /// （「最近 10 分钟」这种口径）。帧按 `received_at_ms` 升序，用 `partition_point`
+    /// 二分定位起点 —— 6000 帧的窗口不会每次线性扫。
+    pub(crate) fn frames_in_window(&self, window_ms: u64) -> Vec<&DeviceSnapshot> {
+        if self.frames.is_empty() || self.cursor_idx >= self.frames.len() {
+            return Vec::new();
+        }
+        let from = self.cursor_ms.saturating_sub(window_ms);
+        let start = self
+            .frames
+            .partition_point(|frame| frame.received_at_ms < from);
+        self.frames[start..=self.cursor_idx].iter().collect()
     }
 
     /// Return a window of `count` frames centered on the current cursor.
@@ -194,6 +249,7 @@ impl PlaybackEngine {
         self.active = false;
         self.session_id.clear();
         self.frames.clear();
+        self.commands.clear();
         self.cursor_idx = 0;
         self.cursor_ms = 0;
         self.start_ms = 0;

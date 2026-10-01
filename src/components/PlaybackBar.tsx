@@ -1,175 +1,96 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { PlaybackStatus } from "../softuiTypes";
-import {
-  Play,
-  PauseCircle,
-  Square,
-  SkipBack,
-  SkipForward,
-  AlertTriangle,
-} from "lucide-react";
+import { useEffect } from "react";
+import { ChevronLeft, ChevronRight, Pause, Play, X } from "lucide-react";
 
+import type { PlaybackStatus } from "../softuiTypes";
+
+/**
+ * 极简回放条：**只有「上一帧 / 下一帧 / 关闭」**。
+ *
+ * 之前那版带了警告条、操作提示、时间轴、倍速、会话信息，再加上一个「最近 10 分钟」
+ * 窗口卡片 —— 回放本身只需要逐帧核对，这些全是干扰。要分析曲线/指令，用会话导出
+ * 或其它页面，不占用回放条。
+ *
+ * 键盘 ← → 仍然可用（不可见，不占地方）；关闭 = `playback_stop`，会卸载引擎并
+ * 解除 `playback_mode` 对下发命令的封锁。
+ */
 interface PlaybackBarProps {
   status: PlaybackStatus;
+  /** 播放 / 暂停（自动实时推进 / 停住）。 */
   onPlayPause: () => void;
-  onStop: () => void;
-  onSeek: (ms: number) => void;
-  onStepForward: () => void;
   onStepBackward: () => void;
-  onSetSpeed: (speed: number) => void;
+  onStepForward: () => void;
+  onClose: () => void;
 }
 
-const SPEEDS = [0.25, 0.5, 1, 2, 4];
-
-function formatTime(ms: number): string {
-  const totalSec = ms / 1000;
-  const min = Math.floor(totalSec / 60);
-  const sec = totalSec % 60;
-  return `${String(min).padStart(2, "0")}:${sec.toFixed(1).padStart(4, "0")}`;
-}
-
-export default function PlaybackBar({
-  status,
-  onPlayPause,
-  onStop,
-  onSeek,
-  onSetSpeed,
-}: PlaybackBarProps) {
-  const timelineRef = useRef<HTMLDivElement>(null);
-  const [dragging, setDragging] = useState(false);
-
-  const handleTimelineClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!timelineRef.current || status.durationMs === 0) return;
-      const rect = timelineRef.current.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
-      const ms = pct * status.durationMs;
-      onSeek(Math.round(ms));
-    },
-    [status.durationMs, onSeek],
-  );
-
-  // Drag-to-seek
-  const handleMouseDown = useCallback(() => setDragging(true), []);
+export default function PlaybackBar({ status, onPlayPause, onStepBackward, onStepForward, onClose }: PlaybackBarProps) {
+  // 键盘 ← → 步进。输入框聚焦时不抢键。
   useEffect(() => {
-    if (!dragging) return;
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!timelineRef.current || status.durationMs === 0) return;
-      const rect = timelineRef.current.getBoundingClientRect();
-      const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      const ms = pct * status.durationMs;
-      onSeek(Math.round(ms));
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        onStepBackward();
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        onStepForward();
+      } else if (event.key === " ") {
+        event.preventDefault();
+        onPlayPause();
+      }
     };
-    const handleMouseUp = () => setDragging(false);
-    window.addEventListener("mousemove", handleMouseMove);
-    window.addEventListener("mouseup", handleMouseUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMouseMove);
-      window.removeEventListener("mouseup", handleMouseUp);
-    };
-  }, [dragging, status.durationMs, onSeek]);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onStepBackward, onStepForward, onPlayPause]);
+
+  const atFirst = status.currentFrameIdx <= 0;
+  const atLast = status.currentFrameIdx >= status.totalFrames - 1;
 
   return (
-    <div className={`playback-bar ${status.active ? "active" : ""}`}>
-      {/* Warning banner */}
-      <div className="playback-banner">
-        <AlertTriangle size={14} />
-        <span>
-          回放模式 — 显示的是历史数据，不会向真实设备发送控制命令
-        </span>
-      </div>
+    <div className="playback-bar is-minimal">
+      <span className="playback-minimal-session" title={status.sessionId}>
+        {status.sessionId ? status.sessionId.slice(0, 20) : "回放"}
+      </span>
 
-      {/* Transport controls */}
-      <div className="playback-controls">
-        <div className="playback-btn-group">
-          <button
-            type="button"
-            className="playback-btn"
-            onClick={() => onSeek(0)}
-            title="跳转到开头"
-          >
-            <SkipBack size={16} />
-          </button>
-          <button
-            type="button"
-            className={`playback-btn primary ${status.playing ? "is-playing" : ""}`}
-            onClick={onPlayPause}
-            title={status.playing ? "暂停" : "播放"}
-          >
-            {status.playing ? <PauseCircle size={18} /> : <Play size={18} />}
-          </button>
-          <button
-            type="button"
-            className="playback-btn"
-            onClick={onStop}
-            title="停止"
-          >
-            <Square size={16} />
-          </button>
-          <button
-            type="button"
-            className="playback-btn"
-            onClick={() => {
-              const step = status.durationMs / status.totalFrames;
-              onSeek(Math.min(status.cursorMs + Math.round(step * 10), status.durationMs));
-            }}
-            title="快进"
-          >
-            <SkipForward size={16} />
-          </button>
-        </div>
+      <button
+        type="button"
+        className="playback-btn primary"
+        onClick={onPlayPause}
+        title={status.playing ? "暂停（空格）" : "播放（空格）"}
+      >
+        {status.playing ? <Pause size={18} /> : <Play size={18} />}
+        <span>{status.playing ? "暂停" : "播放"}</span>
+      </button>
 
-        {/* Timeline */}
-        <div className="playback-timeline-wrap">
-          <div
-            className="playback-timeline"
-            ref={timelineRef}
-            onClick={handleTimelineClick}
-            onMouseDown={handleMouseDown}
-          >
-            <div
-              className="playback-timeline-fill"
-              style={{ width: `${Math.min(status.cursorPct * 100, 100)}%` }}
-            />
-            <div
-              className="playback-timeline-thumb"
-              style={{
-                left: `${Math.min(status.cursorPct * 100, 100)}%`,
-              }}
-            />
-          </div>
-          <div className="playback-time-display">
-            <span>{formatTime(status.cursorMs)}</span>
-            <span>/</span>
-            <span className="playback-time-total">{formatTime(status.durationMs)}</span>
-          </div>
-        </div>
+      <button
+        type="button"
+        className="playback-btn"
+        onClick={onStepBackward}
+        disabled={atFirst}
+        title="上一帧（←）"
+      >
+        <ChevronLeft size={16} />
+        <span>上一帧</span>
+      </button>
 
-        {/* Speed selector */}
-        <div className="playback-speed-group">
-          <span className="playback-speed-label">速度:</span>
-          {SPEEDS.map((s) => (
-            <button
-              key={s}
-              type="button"
-              className={`playback-speed-btn ${Math.abs(status.speed - s) < 0.01 ? "active" : ""}`}
-              onClick={() => onSetSpeed(s)}
-            >
-              {s}x
-            </button>
-          ))}
-        </div>
+      <span className="playback-minimal-frames">
+        {status.currentFrameIdx + 1} / {status.totalFrames}
+      </span>
 
-        {/* Session info */}
-        <div className="playback-session-info">
-          <span className="playback-session-id">
-            会话: {status.sessionId.slice(0, 24)}
-          </span>
-          <span className="playback-frame-info">
-            帧 {status.currentFrameIdx + 1}/{status.totalFrames}
-          </span>
-        </div>
-      </div>
+      <button
+        type="button"
+        className="playback-btn"
+        onClick={onStepForward}
+        disabled={atLast}
+        title="下一帧（→）"
+      >
+        <span>下一帧</span>
+        <ChevronRight size={16} />
+      </button>
+
+      <button type="button" className="playback-btn" onClick={onClose} title="退出回放">
+        <X size={16} />
+      </button>
     </div>
   );
 }

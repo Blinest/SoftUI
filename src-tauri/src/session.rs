@@ -73,8 +73,24 @@ pub struct SessionMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct SessionSidecar {
     pub name: String,
+    /// 录制期间下发的控制指令（稀疏事件，不属于任何一帧）。
+    /// `#[serde(default)]` 让旧会话文件仍可读。
+    #[serde(default)]
+    pub commands: Vec<SessionCommandRow>,
     #[serde(flatten)]
     pub meta: SessionMetadata,
+}
+
+/// 一条控制指令记录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCommandRow {
+    /// 与设备帧 `received_at_ms` **同一时钟**，可直接与帧对齐。
+    pub at_ms: u64,
+    /// 人可读动作名（例如「一键归中」）。
+    pub label: String,
+    /// 实际下发的报文（十六进制），复盘时用来核对。
+    pub frame_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +131,7 @@ pub struct SessionRecorder {
     last_seq: u64,
     frame_count: u64,
     file_path: Option<PathBuf>,
+    commands: Vec<SessionCommandRow>,
     start_ms: u64,
 }
 
@@ -131,6 +148,7 @@ impl SessionRecorder {
             last_seq: 0,
             frame_count: 0,
             file_path: None,
+            commands: Vec::new(),
             start_ms: 0,
         }
     }
@@ -179,6 +197,7 @@ impl SessionRecorder {
         // Write initial metadata sidecar
         let sidecar = SessionSidecar {
             name: name.clone(),
+            commands: Vec::new(),
             meta: SessionMetadata {
                 operator: String::new(),
                 notes: String::new(),
@@ -202,6 +221,7 @@ impl SessionRecorder {
         self.last_seq = 0;
         self.frame_count = 0;
         self.file_path = Some(file_path.clone());
+        self.commands.clear();
         self.start_ms = now;
 
         Ok(SessionInfo {
@@ -270,6 +290,7 @@ impl SessionRecorder {
         self.last_seq = 0;
         self.frame_count = 0;
         self.file_path = None;
+        self.commands.clear();
 
         Ok(info)
     }
@@ -351,6 +372,26 @@ impl SessionRecorder {
         self.last_seq = frame.sequence;
     }
 
+    /// 记一条控制指令（录制中且未暂停时生效）。
+    ///
+    /// 指令是**低频稀疏事件**，与逐帧的 CSV 不同，因此写进 JSON sidecar 的
+    /// `commands` 数组：读改写一份小 JSON 的开销可忽略，换来崩溃也不丢指令。
+    pub fn record_command(&mut self, at_ms: u64, label: String, frame_hex: String) {
+        if !self.active || self.paused {
+            return;
+        }
+        let Some(ref path) = self.file_path else {
+            return;
+        };
+        self.commands.push(SessionCommandRow {
+            at_ms,
+            label,
+            frame_hex,
+        });
+        let path = path.clone();
+        flush_commands(&path, &self.commands).ok();
+    }
+
     /// Write full metadata to the JSON sidecar for the active session.
     pub fn write_metadata(&self, meta: &SessionMetadata) -> Result<(), String> {
         let Some(ref path) = self.file_path else {
@@ -358,6 +399,7 @@ impl SessionRecorder {
         };
         let sidecar = SessionSidecar {
             name: self.session_name.clone(),
+            commands: self.commands.clone(),
             meta: meta.clone(),
         };
         let json = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
@@ -542,6 +584,30 @@ impl SessionRecorder {
     }
 }
 
+/// 把 `commands` 写回 sidecar（保留原有 meta 字段）。
+fn flush_commands(csv_path: &std::path::Path, commands: &[SessionCommandRow]) -> Result<(), String> {
+    let json_path = csv_path.with_extension("json");
+    let Ok(raw) = fs::read_to_string(&json_path) else {
+        return Ok(());
+    };
+    let Ok(mut sidecar) = serde_json::from_str::<SessionSidecar>(&raw) else {
+        return Ok(());
+    };
+    sidecar.commands = commands.to_vec();
+    let json = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
+    fs::write(&json_path, json).map_err(|e| e.to_string())
+}
+
+/// 读取某会话记录的控制指令（按时间升序）。
+pub(crate) fn read_session_commands(csv_path: &PathBuf) -> Vec<SessionCommandRow> {
+    let json_path = csv_path.with_extension("json");
+    fs::read_to_string(&json_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<SessionSidecar>(&raw).ok())
+        .map(|sidecar| sidecar.commands)
+        .unwrap_or_default()
+}
+
 /// Read CSV file contents into Vec<DeviceSnapshot> for playback / history.
 pub(crate) fn read_session_csv(path: &PathBuf) -> Result<Vec<DeviceSnapshot>, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -551,11 +617,18 @@ pub(crate) fn read_session_csv(path: &PathBuf) -> Result<Vec<DeviceSnapshot>, St
     let _header = lines.next().ok_or("CSV 为空")?; // skip header
 
     let mut frames = Vec::new();
+    // 诊断计数：全被跳掉时要说清是「几行列数不够」，否则只能报一句空泛的「没有数据帧」。
+    let mut data_rows = 0usize;
+    let mut first_cols = 0usize;
     for line in lines {
         if line.trim().is_empty() {
             continue;
         }
         let cols: Vec<&str> = line.split(',').collect();
+        data_rows += 1;
+        if data_rows == 1 {
+            first_cols = cols.len();
+        }
         if cols.len() < 23 {
             continue; // malformed row — skip
         }
@@ -621,6 +694,12 @@ pub(crate) fn read_session_csv(path: &PathBuf) -> Result<Vec<DeviceSnapshot>, St
         });
     }
 
+    if frames.is_empty() {
+        return Err(format!(
+            "CSV 里没有可解析的数据帧：{} 行数据，首行列数 {}（解析要求 ≥ 23）",
+            data_rows, first_cols
+        ));
+    }
     Ok(frames)
 }
 

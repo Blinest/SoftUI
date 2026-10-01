@@ -2476,6 +2476,20 @@ button,
 
 /* ---- playback bar ---- */
 
+/* 操作提示条：说明单帧步进行为与键盘快捷键。 */
+.playback-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: rgba(76, 141, 255, 0.12);
+  color: #8a93a6;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .playback-bar {
   display: flex;
   flex-direction: column;
@@ -4230,9 +4244,10 @@ button {
   min-height: 0;
 }
 
-.playback-bar {
-  display: none !important;
-}
+/* ⚠ 本文件原来有一条 `.playback-bar { display: none !important; }` 规则，
+ * 把 App 顶部渲染的回放条永久隐藏（!important 压过一切）。
+ * 表现：点「加载回放」后提示条出现，但回放条怎么都不见。
+ * 回放条现在由 .playback-bar.is-minimal 承载，必须可见，故移除该规则。 */
 
 .connect-modal {
   overflow: hidden;
@@ -5172,4 +5187,86 @@ button {
 
 
 
+}.playback-hide-btn { margin-left: auto; }
+
+/* 回放操作失败提示。 */
+.playback-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 122, 122, 0.45);
+  border-radius: 8px;
+  background: rgba(255, 122, 122, 0.1);
+  color: #ff9a9a;
+  font-size: 12px;
+}
+
+/* 极简回放条：只有 上一帧 / 下一帧 / 关闭。 */
+.playback-bar.is-minimal {
+  /* ⚠ 基础 `.playback-bar` 是 `flex-direction: column`（原来是竖排：警告条/提示/控制区）。
+   * 极简版必须显式覆盖成横向，否则五个按钮竖着堆成一列。 */
+  flex-direction: row;
+  flex-wrap: wrap;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border-default, #333a48);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.playback-minimal-session {
+  font-size: 12px;
+  color: #8a93a6;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.playback-minimal-frames {
+  font-size: 13px;
+  color: #cfd6e4;
+  font-variant-numeric: tabular-nums;
+  min-width: 72px;
+  text-align: center;
+}
+
+.playback-error.is-info {
+  border-color: rgba(76, 141, 255, 0.45);
+  background: rgba(76, 141, 255, 0.1);
+  color: #9dc0ff;
+}
+
+/* 极简回放条：按钮放大到能轻松点中（原来是通用 .playback-btn，太小）。 */
+.playback-bar.is-minimal .playback-btn,
+.playback-bar.is-minimal .playback-btn.primary {
+  /* ⚠ 基础 `.playback-btn` 是**固定** width/height: 32px（primary 36px），只加 padding
+   * 会被固定尺寸压回去 → 文字溢出、方框比例不对。必须显式改成自适应。 */
+  width: auto;
+  height: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 8px 16px;
+  font-size: 14px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.playback-bar.is-minimal .playback-btn.primary {
+  border-color: rgba(76, 141, 255, 0.55);
+  color: #cfe0ff;
+}
+.playback-bar.is-minimal .playback-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.playback-bar.is-minimal .playback-minimal-frames {
+  font-size: 15px;
+  min-width: 96px;
+  font-weight: 600;
 }

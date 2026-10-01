@@ -284,6 +284,15 @@ function AppShell() {
   const [recorderStatus, setRecorderStatus] = useState<RecorderStatus>({ active: false, sessionId: "", sessionName: "", frameCount: 0, elapsedSecs: 0, paused: false });
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus | null>(null);
+  /**
+   * 回放操作的即时反馈。
+   *
+   * 之前失败只在 console 里 → 界面上「点了没反应」。这里点下去的**第一件事**就是
+   * 写一条「正在加载…」：如果连这条都不出现，说明点击根本没到 JS（按钮被遮挡/禁用），
+   * 而不是后端报错 —— 这两种情况的排查方向完全不同。
+   */
+  const [playbackNotice, setPlaybackNotice] = useState<{ tone: "info" | "error"; text: string } | null>(null);
+  /** 回放控件是否被收起（回放本身继续，只把界面藏起来）。 */
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
   const [migrationSource, setMigrationSource] = useState("");
@@ -676,22 +685,43 @@ function AppShell() {
     } catch (e) { console.error(e); }
   }, []);
 
+  /**
+   * 挂载时与后端**同步一次**回放状态。
+   *
+   * ⚠ 这是必须的：回放引擎活在 Rust 进程里，`playbackStatus` 只是 React 状态。
+   * 页面一刷新（HMR / F5），React 状态清零而引擎还在跑 —— 结果就是
+   *   ① 回放条不显示（playbackStatus 为 null）
+   *   ② `playback_mode` 仍为 true，实时帧被回放接管，**录制再也收不到新数据**
+   *   ③ 而唯一的退出入口（✕）恰好就在那条看不见的条上。
+   *
+   * 原来的轮询 effect 以 `playbackStatus?.active` 为前提 —— 初始为 null 就永不轮询，
+   * 永远发现不了这个"幽灵引擎"。
+   */
+  useEffect(() => {
+    void (async () => {
+      try {
+        const status = await invoke<PlaybackStatus>("playback_status");
+        if (status.active) setPlaybackStatus(status);
+      } catch {
+        /* 拿不到就当没有回放 */
+      }
+    })();
+  }, []);
+
   const loadPlayback = useCallback(async (id: string) => {
+    setPlaybackNotice({ tone: "info", text: `正在加载回放：${id}` });
     try {
       const status = await invoke<PlaybackStatus>("playback_load", { sessionId: id });
       setPlaybackStatus(status);
-    } catch (e) { console.error(e); }
+      setPlaybackNotice({
+        tone: "info",
+        text: `回放已加载：${status.totalFrames} 帧 · 会话 ${status.sessionId.slice(0, 20)}`,
+      });
+    } catch (e) {
+      console.error(e);
+      setPlaybackNotice({ tone: "error", text: `回放加载失败：${e instanceof Error ? e.message : String(e)}` });
+    }
   }, []);
-
-  const playbackPlayPause = useCallback(async () => {
-    if (!playbackStatus) return;
-    try {
-      const status = playbackStatus.playing
-        ? await invoke<PlaybackStatus>("playback_pause")
-        : await invoke<PlaybackStatus>("playback_play");
-      setPlaybackStatus(status);
-    } catch (e) { console.error(e); }
-  }, [playbackStatus]);
 
   const playbackStop = useCallback(async () => {
     try {
@@ -700,18 +730,27 @@ function AppShell() {
     } catch (e) { console.error(e); }
   }, []);
 
-  const playbackSeek = useCallback(async (ms: number) => {
+  /** 播放 / 暂停：播放时引擎按真实时间推进游标（后端 tick 已挂到 10Hz 快照）。 */
+  const playbackPlayPause = useCallback(async () => {
     try {
-      const status = await invoke<PlaybackStatus>("playback_seek", { ms });
+      const status = playbackStatus?.playing
+        ? await invoke<PlaybackStatus>("playback_pause")
+        : await invoke<PlaybackStatus>("playback_play");
       setPlaybackStatus(status);
-    } catch (e) { console.error(e); }
-  }, []);
+    } catch (e) {
+      console.error(e);
+      setPlaybackNotice({ tone: "error", text: `播放控制失败：${e instanceof Error ? e.message : String(e)}` });
+    }
+  }, [playbackStatus?.playing]);
 
-  const playbackSetSpeed = useCallback(async (speed: number) => {
+  const playbackStepFrame = useCallback(async (delta: number) => {
     try {
-      const status = await invoke<PlaybackStatus>("playback_set_speed", { speed });
+      const status = await invoke<PlaybackStatus>("playback_step_frame", { delta });
       setPlaybackStatus(status);
-    } catch (e) { console.error(e); }
+    } catch (e) {
+      console.error(e);
+      setPlaybackNotice({ tone: "error", text: `步进失败：${e instanceof Error ? e.message : String(e)}` });
+    }
   }, []);
 
   // Poll recorder status and sessions list every 2 seconds — 未认证时不启动
@@ -744,6 +783,28 @@ function AppShell() {
     }, 100);
     return () => clearInterval(interval);
   }, [playbackStatus?.active]);
+  /**
+   * 播放期间轮询整份快照。
+   *
+   * ⚠ 手动控制（三维拖动 / 末端位姿 / 电机读数）、监控等区块全部从 `snapshot` 派生，
+   *   而 `snapshot` 只在登录、迁移、以及命令回调里刷新 —— 不轮询的话，播放时这些
+   *   区块会一直停在打开页面那一刻的数据（只有工作区那条走 fetch_live_latest 的会动）。
+   *
+   * `tick_snapshot` 是轻量只读快照（不写盘、不写 SQLite、不构建曲线），5Hz 没问题；
+   * 且它会走 `AppState::snapshot()` 里的**回放帧注入**分支。
+   */
+  useEffect(() => {
+    if (!playbackStatus?.active) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      if (cancelled) return;
+      void fetchSnapshot("tick_snapshot");
+    }, 200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [playbackStatus?.active, fetchSnapshot]);
 
   const submitSystemControl = useCallback(async (action: SystemControlAction) => {
     try {
@@ -883,15 +944,21 @@ function AppShell() {
 
       <main className="app-content">
         <div className="app-page-content">
+          {playbackNotice ? (
+            <div className={`playback-error is-${playbackNotice.tone}`}>
+              <span>{playbackNotice.text}</span>
+              <button type="button" className="ghost-btn" onClick={() => setPlaybackNotice(null)}>
+                <span>知道了</span>
+              </button>
+            </div>
+          ) : null}
           {playbackStatus?.active ? (
             <PlaybackBar
               status={playbackStatus}
-              onPlayPause={playbackPlayPause}
-              onStop={playbackStop}
-              onSeek={playbackSeek}
-              onStepForward={() => {}}
-              onStepBackward={() => {}}
-              onSetSpeed={playbackSetSpeed}
+              onPlayPause={() => void playbackPlayPause()}
+              onStepBackward={() => void playbackStepFrame(-1)}
+              onStepForward={() => void playbackStepFrame(1)}
+              onClose={() => void playbackStop()}
             />
           ) : null}
 

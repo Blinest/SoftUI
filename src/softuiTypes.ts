@@ -13,7 +13,11 @@ export type ThemeMode = "dark" | "light";
 export type CardSize = `${1 | 2 | 3 | 4}x${1 | 2 | 3 | 4}`;
 
 /** 可持久化布局的页面。 */
-export type LayoutPage = "dashboard" | "workspace-monitor";
+export type LayoutPage =
+  | "dashboard"
+  | "workspace-monitor"
+  | "workspace-manual"
+  | "workspace-automatic";
 
 export interface CardPlacement {
   id: string;
@@ -49,6 +53,20 @@ export type MonitorCardId =
   | "camera"
   | "armCharts"
   | "recentAlerts";
+
+/** 设备工作台「手动控制」标签的卡片。 */
+export type ManualCardId =
+  | "modelPackage"
+  | "curvatureDrag"
+  | "tipPose"
+  | "motorControl"
+  | "sensorMonitor";
+
+/** 设备工作台「自动控制」标签的卡片。 */
+export type AutomaticCardId =
+  | "systemControl"
+  | "pidControl"
+  | "cycleLife";
 
 export type PageKey =
   | "Dashboard"

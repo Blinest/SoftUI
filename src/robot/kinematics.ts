@@ -36,12 +36,6 @@ export function applyDirectionMapping(command: ContinuumCommand): [SegmentBendRa
   return [mapSegmentBend(command.targetSegments[0], command), mapSegmentBend(command.targetSegments[1], command)];
 }
 
-export function cableLengthsFromBending(angleRad: number, directionRad: number, cableRadiusMm: number): number[] {
-  const a = angleRad * Math.cos(directionRad);
-  const b = angleRad * Math.sin(directionRad);
-  const cableAngles = [0, (2 * Math.PI) / 3, (4 * Math.PI) / 3];
-  return cableAngles.map((alpha) => -cableRadiusMm * (a * Math.cos(alpha) + b * Math.sin(alpha)));
-}
 
 export function makeBoneWeights(count: number, mode: ContinuumCommand["mode"], activeSegments: [boolean, boolean]): number[] {
   const weights = Array.from({ length: count }, (_, index) => {

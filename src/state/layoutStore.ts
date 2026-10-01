@@ -8,8 +8,10 @@ import { useEffect, useSyncExternalStore } from "react";
 import type {
   CardPlacement,
   CardSize,
+  AutomaticCardId,
   DashboardCardId,
   LayoutPage,
+  ManualCardId,
   MonitorCardId,
   PageLayout,
 } from "../softuiTypes";
@@ -41,6 +43,20 @@ const MONITOR_CARD_IDS: MonitorCardId[] = [
   "camera",
   "armCharts",
   "recentAlerts",
+];
+
+const MANUAL_CARD_IDS: ManualCardId[] = [
+  "modelPackage",
+  "curvatureDrag",
+  "tipPose",
+  "motorControl",
+  "sensorMonitor",
+];
+
+const AUTOMATIC_CARD_IDS: AutomaticCardId[] = [
+  "systemControl",
+  "pidControl",
+  "cycleLife",
 ];
 
 /** 卡片尺寸每一维的上限（列 / 行都是 1~4 格）。 */
@@ -153,6 +169,28 @@ export const defaultWorkspaceMonitorLayout: PageLayout = freezeLayout({
   ],
 });
 
+/** 设备工作台「手动控制」标签默认布局。 */
+export const defaultWorkspaceManualLayout: PageLayout = freezeLayout({
+  schemaVersion: LAYOUT_SCHEMA_VERSION,
+  cards: [
+    { id: "modelPackage", size: "4x1", visible: true },
+    { id: "curvatureDrag", size: "2x2", visible: true },
+    { id: "tipPose", size: "2x2", visible: true },
+    { id: "motorControl", size: "2x1", visible: true },
+    { id: "sensorMonitor", size: "2x1", visible: true },
+  ],
+});
+
+/** 设备工作台「自动控制」标签默认布局。 */
+export const defaultWorkspaceAutomaticLayout: PageLayout = freezeLayout({
+  schemaVersion: LAYOUT_SCHEMA_VERSION,
+  cards: [
+    { id: "systemControl", size: "4x1", visible: true },
+    { id: "pidControl", size: "2x1", visible: true },
+    { id: "cycleLife", size: "2x1", visible: true },
+  ],
+});
+
 function freezeLayout(layout: PageLayout): PageLayout {
   layout.cards.forEach((card) => Object.freeze(card));
   Object.freeze(layout.cards);
@@ -160,14 +198,30 @@ function freezeLayout(layout: PageLayout): PageLayout {
 }
 
 function allowedCardIds(page: LayoutPage): string[] {
-  return page === "dashboard" ? DASHBOARD_CARD_IDS : MONITOR_CARD_IDS;
+  switch (page) {
+    case "workspace-monitor":
+      return MONITOR_CARD_IDS;
+    case "workspace-manual":
+      return MANUAL_CARD_IDS;
+    case "workspace-automatic":
+      return AUTOMATIC_CARD_IDS;
+    default:
+      return DASHBOARD_CARD_IDS;
+  }
 }
 
 /**
  * 默认布局的副本。默认布局是深冻结的，直接返回会让调用方改不动卡片顺序。
  */
 export function defaultLayoutForPage(page: LayoutPage): PageLayout {
-  const source = page === "dashboard" ? defaultDashboardLayout : defaultWorkspaceMonitorLayout;
+  const source =
+    page === "workspace-monitor"
+      ? defaultWorkspaceMonitorLayout
+      : page === "workspace-manual"
+        ? defaultWorkspaceManualLayout
+        : page === "workspace-automatic"
+          ? defaultWorkspaceAutomaticLayout
+          : defaultDashboardLayout;
   return { schemaVersion: source.schemaVersion, cards: source.cards.map((card) => ({ ...card })) };
 }
 
@@ -196,12 +250,18 @@ export function validateLayout(value: unknown, page: LayoutPage = "dashboard"): 
     if (typeof card.visible !== "boolean") return defaultLayoutForPage(page);
     // 关键安全卡片不允许被隐藏。
     if (card.id === "connection" && !card.visible) return defaultLayoutForPage(page);
+    // 急停入口所在卡片同样不允许被隐藏。
+    if (card.id === "systemControl" && !card.visible) return defaultLayoutForPage(page);
     seen.add(card.id);
     cards.push({ id: card.id, size: card.size, visible: card.visible });
   }
   // 安全卡片必须存在；监控页则要求 3D 与摄像头卡片都在，避免旧布局缺卡片。
   if (page === "dashboard" && !seen.has("connection")) return defaultLayoutForPage(page);
   if (page === "workspace-monitor" && !(seen.has("model3d") && seen.has("camera"))) {
+    return defaultLayoutForPage(page);
+  }
+  // 自动控制页必须有系统操作卡片（含急停）。
+  if (page === "workspace-automatic" && !seen.has("systemControl")) {
     return defaultLayoutForPage(page);
   }
   return { schemaVersion: LAYOUT_SCHEMA_VERSION, cards };

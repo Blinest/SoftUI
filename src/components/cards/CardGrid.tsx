@@ -82,6 +82,8 @@ export interface CardGridProps {
   /** 卡片内容区的额外 class（例如 3D 场景需要无内边距）。 */
   bodyClassForCard?: (cardId: string) => string | undefined;
   /** 松手后提交新布局；不传时卡片只展示，不可拖动。 */
+  /** 单张卡片是否允许拖动/缩放；返回 `false` 的卡片被钉在默认位置。默认全开。 */
+  draggableForCard?: (cardId: string) => boolean;
   onLayoutChange?: (next: PageLayout) => void;
   /** 布局的持久化标识，变化时跳过占位动画，避免整屏卡片一起飞。 */
   layoutKey?: string;
@@ -101,6 +103,7 @@ export function CardGrid({
   childrenForCard,
   bodyClassForCard,
   onLayoutChange,
+  draggableForCard,
   layoutKey,
   ariaLabel = "卡片布局",
 }: CardGridProps) {
@@ -136,6 +139,10 @@ export function CardGrid({
   const visible = useMemo(() => layout.cards.filter((card) => card.visible), [layout.cards]);
   const placed = dragOrder ?? visible;
   const editable = Boolean(onLayoutChange);
+
+  /** 单卡可拖拽判定：整页可编辑 && 该卡未被 `draggableForCard` 钉住。 */
+  const draggableFor = (cardId: string) =>
+    editable && (draggableForCard ? draggableForCard(cardId) : true);
 
   const baseMetrics = useMemo(() => gridMetricsForWidth(box.width), [box.width]);
   const entries = useMemo(
@@ -441,14 +448,14 @@ export function CardGrid({
           >
             {header ? (
               <header
-                className={`feature-card-header${editable ? " is-draggable" : ""}`}
-                onPointerDown={editable ? (event) => beginDrag(event, card.id) : undefined}
-                onPointerMove={editable ? moveDrag : undefined}
-                onPointerUp={editable ? () => endDrag() : undefined}
-                onPointerCancel={editable ? () => endDrag(true) : undefined}
+                className={`feature-card-header${draggableFor(card.id) ? " is-draggable" : ""}`}
+                onPointerDown={draggableFor(card.id) ? (event) => beginDrag(event, card.id) : undefined}
+                onPointerMove={draggableFor(card.id) ? moveDrag : undefined}
+                onPointerUp={draggableFor(card.id) ? () => endDrag() : undefined}
+                onPointerCancel={draggableFor(card.id) ? () => endDrag(true) : undefined}
               >
                 <div>
-                  {editable ? <GripVertical className="feature-card-grip" aria-hidden="true" size={14} /> : null}
+                  {draggableFor(card.id) ? <GripVertical className="feature-card-grip" aria-hidden="true" size={14} /> : null}
                   {header.icon}
                   <h2>{header.title}</h2>
                 </div>
@@ -461,7 +468,7 @@ export function CardGrid({
               {childrenForCard(card.id)}
             </div>
 
-            {editable ? (
+            {draggableFor(card.id) ? (
               <div
                 className="card-resize-handle"
                 data-card-id={card.id}
