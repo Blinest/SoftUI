@@ -410,6 +410,12 @@ pub struct RuntimeStatus {
     pub last_command_ms: u64,
     pub command_high_watermark: usize,
     pub emergency_latched: bool,
+    /// 操作员是否通过「启动控制系统」使能过本设备。
+    ///
+    /// 状态帧里的 `system_state` 只有 0/1，且每来一帧就会被 `poll()` 重算 —— 下位机若不把
+    /// 使能状态回写（当前 STM32 的 `CR.state` 恒 0），使能会在下一帧被冲掉。这个标志由
+    /// `mark_control_enabled` 维护，不受状态帧影响，是**运动指令放行的依据**。
+    pub control_enabled: bool,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
 }
@@ -429,6 +435,8 @@ pub struct DeviceRuntime<T: Transport> {
     last_command_ms: u64,
     command_high_watermark: usize,
     emergency_latched: bool,
+    /// 操作员使能标志（`mark_control_enabled` 维护），不受状态帧重算影响。
+    control_enabled: bool,
     last_error: Option<String>,
     last_error_code: Option<String>,
 }
@@ -450,6 +458,7 @@ impl<T: Transport> DeviceRuntime<T> {
             last_command_ms: 0,
             command_high_watermark: 0,
             emergency_latched: false,
+            control_enabled: false,
             last_error: None,
             last_error_code: None,
         }
@@ -468,6 +477,7 @@ impl<T: Transport> DeviceRuntime<T> {
             last_command_ms: self.last_command_ms,
             command_high_watermark: self.command_high_watermark,
             emergency_latched: self.emergency_latched,
+            control_enabled: self.control_enabled,
             last_error: self.last_error.clone(),
             last_error_code: self.last_error_code.clone(),
         }
@@ -510,7 +520,9 @@ impl<T: Transport> DeviceRuntime<T> {
                     if self.state != DeviceConnectionState::Handshaking {
                         self.state = if self.emergency_latched {
                             DeviceConnectionState::EmergencyStopped
-                        } else if status.system_state != 0 {
+                        } else if self.control_enabled || status.system_state != 0 {
+                            // 操作员使能过就保持 Enabled：下位机不回写 system_state 时
+                            // （STM32 的 CR.state 恒 0），否则每帧都会把使能状态冲回 Ready。
                             DeviceConnectionState::Enabled
                         } else {
                             DeviceConnectionState::Ready
@@ -594,6 +606,7 @@ impl<T: Transport> DeviceRuntime<T> {
     }
 
     pub fn mark_control_enabled(&mut self, enabled: bool) {
+        self.control_enabled = enabled;
         if enabled {
             self.emergency_latched = false;
             self.state = DeviceConnectionState::Enabled;

@@ -47,6 +47,14 @@ const RIDGE: f64 = 1e-6;
 /// 依据：两组表的最近邻距离中位 ≈ 0.19 / 0.22、p90 ≈ 0.32 / 0.41、max ≈ 0.79 / 1.01。
 pub const COVERAGE_RADIUS_PER_M: f64 = 1.0;
 
+/// 表内**A 段** κ 的上限（1/m）。
+///
+/// 由 `assets/kappa_table_*.bin` 的样本统计得到（40N: 1.68、60N: 1.81），只用于
+/// 「超出覆盖范围」这类错误信息里给出可操作的范围提示 —— 不在查表逻辑里使用。
+pub const SEGMENT_A_MAX_KAPPA_PER_M: f64 = 1.8;
+/// 表内**B 段** κ 的上限（1/m）（40N: 2.83、60N: 4.24）。
+pub const SEGMENT_B_MAX_KAPPA_PER_M: f64 = 4.2;
+
 static TABLE_40: &[u8] = include_bytes!("../assets/kappa_table_40.bin");
 static TABLE_60: &[u8] = include_bytes!("../assets/kappa_table_60.bin");
 
@@ -217,6 +225,56 @@ impl KappaTable {
             nearest_distance,
             covered: nearest_distance <= COVERAGE_RADIUS_PER_M,
         })
+    }
+
+    /// 两段同向、方向遍历一圈时**仍被表覆盖**的最大曲率 κ（1/m）。
+    ///
+    /// 用途：UI 侧拖动 / 反解的运动范围上限。
+    ///
+    /// 背景：UI 原来的上限是写死的「85°/0.2m ≈ 7.4 1/m」，比表覆盖大 4 倍还多 —— 拖出来的形状
+    /// 后端根本查不到，下发必然报「曲率超出 κ 表覆盖范围」。这个值直接**从表数据扫出来**，
+    /// 所以换成导入的模型包（`model.tdcrmodel`）后，UI 上限会自动跟着变。
+    ///
+    /// 扫描口径偏保守（两段等大、方向任意都要落在覆盖半径内），宁可少给一点，
+    /// 也不要给一个「发出去必失败」的上限。
+    pub fn covered_kappa_limit(&self) -> f64 {
+        const DIRECTIONS: usize = 8;
+        const COARSE_STEP: f64 = 0.2;
+        const MAX_KAPPA: f64 = 16.0;
+
+        let covered_at = |kappa: f64| -> bool {
+            (0..DIRECTIONS).all(|step| {
+                let phi = std::f64::consts::TAU * step as f64 / DIRECTIONS as f64;
+                let (sin, cos) = phi.sin_cos();
+                let query = [kappa * cos, kappa * sin, kappa * cos, kappa * sin];
+                matches!(self.lookup(query), Ok(hit) if hit.covered)
+            })
+        };
+
+        if !covered_at(0.0) {
+            return 0.0;
+        }
+        let mut low = 0.0_f64;
+        let mut high = MAX_KAPPA;
+        let mut probe = 0.0_f64;
+        while probe < MAX_KAPPA {
+            probe = (probe + COARSE_STEP).min(MAX_KAPPA);
+            if !covered_at(probe) {
+                break;
+            }
+            low = probe;
+        }
+        high = (low + COARSE_STEP).min(MAX_KAPPA);
+        // 二分细化到 0.01
+        for _ in 0..12 {
+            let mid = 0.5 * (low + high);
+            if covered_at(mid) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        (low * 100.0).floor() / 100.0
     }
 }
 
@@ -452,6 +510,29 @@ mod tests {
             hit.displacement_mm[0],
             hit.displacement_mm[3],
         );
+    }
+
+    #[test]
+    fn covered_kappa_limit_is_inside_table_range() {
+        for kind in [KappaTableKind::Limit40n, KappaTableKind::Limit60n] {
+            let table = KappaTable::load(kind).expect("load");
+            let limit = table.covered_kappa_limit();
+            // 实测：40N ≈ 1.0、60N ≈ 1.0 上下；只要在 (0.3, 4.0) 内就说明扫描没跑飞。
+            assert!(
+                limit > 0.3 && limit < 4.0,
+                "{} limit={limit}",
+                kind.label()
+            );
+            // 上限处仍覆盖，再往外就应判超表（两段等大、方向 0）。
+            let at_limit = table
+                .lookup(features_from_segments([limit, limit], [0.0, 0.0]))
+                .expect("lookup");
+            assert!(at_limit.covered, "{} limit not covered", kind.label());
+            let beyond = table
+                .lookup(features_from_segments([limit + 1.0, limit + 1.0], [0.0, 0.0]))
+                .expect("lookup");
+            assert!(!beyond.covered, "{} beyond limit still covered", kind.label());
+        }
     }
 
     #[test]

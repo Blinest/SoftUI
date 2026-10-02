@@ -34,7 +34,13 @@
  * 这条关系用 `verifyDragSolver` 数值校验过，改动符号请重跑它。 */
 
 import type { BackboneOutput, CurvatureBasisSegment, CurvatureDistribution } from "./svcModel";
-import { buildBackboneFromCurvatureDistribution, mapSvcPointToThreeMm } from "./svcModel";
+import {
+  buildBackboneFromCurvatureDistribution,
+  mapSvcPointToThreeMm,
+  modelCurvatureLimit,
+  TOTAL_LENGTH_MM,
+} from "./svcModel";
+import { rpyToMat, rotationResidual, tipPoseOfDistribution } from "../robot/pose3d";
 
 /** 一次拖拽反解的输入。 */
 export interface DragSolveInput {
@@ -50,6 +56,19 @@ export interface DragSolveInput {
   iterations?: number;
   /** 每轮松弛系数（0~1.2），默认 0.9。越接近 1 收敛越快，过大易振荡。 */
   relaxation?: number;
+  /**
+   * **固定末端位姿**：只改臂体形状，末端位置与姿态保持不变（null-space 拖动）。
+   *
+   * 实现：每轮现算一次「抓取点 + 末端位姿」对 12 段曲率的数值 Jacobian，再解一个带权
+   * 正规方程 —— 抓取点误差作为目标、末端位姿误差用大权重压住。代价是每轮 ~14 次骨架积分，
+   * 比普通拖动贵，所以只在需要时打开。
+   */
+  lockTipPose?: boolean;
+  /**
+   * 固定末端位姿时的**末端权重**（默认 0.2，实测标定值）。越大末端越死、抓取点越难跟手；
+   * 太大反而会在曲率上限处来回振荡（实测 w=1~20 时漂移升到 30~50mm）。正常不用改。
+   */
+  tipWeight?: number;
 }
 
 export interface DragSolveResult {
@@ -62,6 +81,14 @@ export interface DragSolveResult {
   saturated: boolean;
   /** 实际执行的迭代轮数。 */
   iterations: number;
+  /**
+   * 末端位姿**漂移**（锁定模式的实际效果）：位置 mm、姿态 rad。
+   *
+   * 普通拖动恒为 0；锁定模式下这个数就是「末端到底有没有被固定住」的量化答案 ——
+   * 拖到曲率上限时它会涨上来，UI 应当把它显示出来，而不是假装仍然锁着。
+   */
+  tipDriftMm: number;
+  tipDriftRad: number;
 }
 
 /* ── 采样 ── */
@@ -125,10 +152,16 @@ function minimumCurvatureBasis(influence: readonly number[]): number[] {
   return influence.map((value) => value / squareSum);
 }
 
-/** 逐段曲率上限：基准最大值 + 2 1/m，兜底 3 1/m（对应约 34° 的段弯曲角）。 */
+/**
+ * 逐段曲率上限。
+ *
+ * 取「基准最大值 + 0.5」是为了让拖动有手感（不必每次都从零开始推），但**必须再被当前模型的
+ * κ 表覆盖上限兜住** —— 拖过覆盖边界只会得到一个后端查不到、下发必失败的形状。
+ * 上限由 `setModelCurvatureLimitPerM()`（来自 `model_status`）设置。
+ */
 function defaultLimits(base: CurvatureDistribution): number[] {
   const observed = base.segments.reduce((max, segment) => Math.max(max, segment.kappaAbsPerM), 0);
-  const limit = Math.max(observed + 2, 3);
+  const limit = Math.min(Math.max(observed + 0.5, 0.5), modelCurvatureLimit());
   return base.segments.map(() => limit);
 }
 
@@ -171,6 +204,16 @@ function withCurvature(
  */
 export function solveDragToPoint(input: DragSolveInput): DragSolveResult {
   const { sMm, toMm, base, iterations = 14, relaxation = 0.9 } = input;
+  if (input.lockTipPose) {
+    return solveDragLockingTip({
+      sMm,
+      toMm,
+      base,
+      iterations,
+      tipWeight: input.tipWeight ?? 0.2,
+      limitsPerM: input.limitsPerM,
+    });
+  }
 
   const kx = base.segments.map((segment) => segment.kxPerM);
   const ky = base.segments.map((segment) => segment.kyPerM);
@@ -232,71 +275,191 @@ export function solveDragToPoint(input: DragSolveInput): DragSolveResult {
     residualMm: Math.hypot(toMm[0] - reached[0], toMm[1] - reached[1], toMm[2] - reached[2]),
     saturated,
     iterations: used,
+    tipDriftMm: 0,
+    tipDriftRad: 0,
   };
 }
 
-/**
- * 由整个 backbone 直接反解（调用方只需给出抓取弧长与目标点）。
- */
-export function targetDistributionFromDrag(
-  actual: BackboneOutput,
-  sMm: number,
-  toMm: [number, number, number],
-  options: Omit<DragSolveInput, "sMm" | "toMm" | "base"> = {},
-): DragSolveResult {
-  return solveDragToPoint({ ...options, sMm, toMm, base: actual.distribution });
+/* ── 固定末端位姿的拖动（null-space） ── */
+
+/** 稠密线性方程组（列主元高斯消元）。固定末端位姿时每轮要解一次；导出以便数值自检。 */
+export function solveDenseSystem(matrix: number[][], rhs: number[]): number[] | null {
+  const n = rhs.length;
+  const a = matrix.map((row, index) => [...row, rhs[index]]);
+  for (let col = 0; col < n; col += 1) {
+    let pivot = col;
+    for (let row = col + 1; row < n; row += 1) {
+      if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+    }
+    if (Math.abs(a[pivot][col]) < 1e-12) return null;
+    [a[col], a[pivot]] = [a[pivot], a[col]];
+    for (let row = 0; row < n; row += 1) {
+      if (row === col) continue;
+      const factor = a[row][col] / a[col][col];
+      if (factor === 0) continue;
+      for (let k = col; k <= n; k += 1) a[row][k] -= factor * a[col][k];
+    }
+  }
+  return a.map((row, index) => row[n] / row[index]);
 }
 
-/* ── 把 12 段分布折回硬件要的两段语义 ── */
-
-export interface SectionEquivalents {
-  /** 每段的等效常曲率（1/m），取该段曲率向量的积分模长 ÷ 段长。 */
-  curvaturePerM: [number, number];
-  /** 每段的等效弯曲方向（度，0 上 / 90 右 / 180 下 / 270 左）。 */
-  directionDeg: [number, number];
-  /** 协议层的方向码（0~3），与 directionDeg 同义。 */
-  directionCode: [0 | 1 | 2 | 3, 0 | 1 | 2 | 3];
-}
-
 /**
- * 12 段曲率分布 → 两个「等效常曲率」。
+ * **固定末端位姿**的反解：末端位置/姿态被当作**硬约束**，只有臂体形状变。
  *
- * 硬件协议（`send_bend_command`）每段只吃一个角度 + 一个方向，所以下发前
- * 必须把分布折回两段。这里取的是**保持该段末端朝向不变**的等效值：
- * 先按弧长积分出该段的净转角向量，再除以段长还原成常曲率 —— 这正是
- * 常曲率圆弧与一般曲线在「端点切线」上等价的条件，也正是硬件两段命令
- * 唯一能表达的信息。
+ * 与普通拖动（`solveDragToPoint`）的区别只在约束：
+ * - 普通拖动：抓取点跟手，末端随便跟着走（解析柔度，很便宜）。
+ * - 固定末端：每轮解一个**等式约束最小二乘**
  *
- * 段边界取总长的中点，与 `curvatureDistributionFromSdmInputs` 里
- * 「uMid < 0.5 用 A 组锚点」的划分保持一致。
+ *   ```text
+ *   min ‖Jg·Δq − r_grab‖²   s.t.   Jt·Δq = −r_tip
+ *   ```
+ *
+ *   落地成三步（全部用数值 Jacobian，每段两个自由度 κx/κy，共 2N 维）：
+ *   1. `Jt`（6×2N）→ 末端误差的**最小范数修正** `Δq_c = Jtᵀ(JtJtᵀ+μI)⁻¹(−r_tip)`；
+ *   2. 抓取步沿用解析柔度方向 `d_g`，再**投影到末端零空间**：
+ *      `d_⊥ = d_g − Jtᵀ(JtJtᵀ+μI)⁻¹(Jt·d_g)`（零空间分量不会破坏末端约束）；
+ *   3. `Δq = d_⊥ + Δq_c`，最后按逐段曲率上限做**整体缩放** —— 零空间分量缩放不影响末端，
+ *      修正量缩放留下的残差由下一轮补，所以「拖到上限」时是**形状先顶住、末端仍然不放**。
+ *
+ * 只有 6×6 的小线性系统（`JtJtᵀ`），比解 24×24 更稳；代价是每轮 2N 次骨架积分。
  */
-export function sectionEquivalents(distribution: CurvatureDistribution): SectionEquivalents {
-  const segments = distribution.segments;
-  const total = segments.length > 0 ? segments[segments.length - 1].sEndMm : 0;
-  const boundary = total / 2;
+function solveDragLockingTip(args: {
+  sMm: number;
+  toMm: [number, number, number];
+  base: CurvatureDistribution;
+  iterations: number;
+  tipWeight: number;
+  limitsPerM?: readonly number[];
+}): DragSolveResult {
+  const { sMm, toMm, base, iterations, limitsPerM } = args;
+  const count = base.segments.length;
+  const dof = count * 2;
+  const armMm = base.totalLengthMm > 0 ? base.totalLengthMm : TOTAL_LENGTH_MM;
+  const limits = (limitsPerM ?? defaultLimits(base)).map((value) => Math.abs(value));
 
-  const sum: Array<{ kx: number; ky: number; lengthMm: number }> = [
-    { kx: 0, ky: 0, lengthMm: 0 },
-    { kx: 0, ky: 0, lengthMm: 0 },
-  ];
+  const kx = base.segments.map((segment) => segment.kxPerM);
+  const ky = base.segments.map((segment) => segment.kyPerM);
 
-  for (const segment of segments) {
-    // 段落在哪一半：用段中点判，避免边界段被两半各切一刀。
-    const half = segment.sMidMm < boundary ? 0 : 1;
-    const lengthMm = segment.sEndMm - segment.sStartMm;
-    sum[half].kx += segment.kxPerM * lengthMm;
-    sum[half].ky += segment.kyPerM * lengthMm;
-    sum[half].lengthMm += lengthMm;
+  const shapeAt = (kxArr: number[], kyArr: number[]) => withCurvature(base, kxArr, kyArr);
+  const grabAt = (shape: CurvatureDistribution) =>
+    pointAtS(buildBackboneFromCurvatureDistribution(shape), sMm);
+  /** 末端残差：位置 mm（3）+ 姿态 rad×总弧长（3，换算成 mm 才能和位置一起解）。 */
+  const tipResidualOf = (shape: CurvatureDistribution, ref: ReturnType<typeof tipPoseOfDistribution>) => {
+    const tip = tipPoseOfDistribution(shape.segments);
+    const dPos = [
+      (tip.positionM[0] - ref.positionM[0]) * 1000,
+      (tip.positionM[1] - ref.positionM[1]) * 1000,
+      (tip.positionM[2] - ref.positionM[2]) * 1000,
+    ];
+    const rot = rotationResidual(rpyToMat(tip.rpyRad), rpyToMat(ref.rpyRad)).map((v) => v * armMm);
+    return [dPos[0], dPos[1], dPos[2], rot[0], rot[1], rot[2]];
+  };
+
+  const reference = tipPoseOfDistribution(shapeAt(kx, ky).segments);
+
+  let reached = grabAt(shapeAt(kx, ky));
+  let saturated = false;
+  let used = 0;
+
+  const EPS = 1e-4;
+  const RIDGE = 1e-4;
+  const KKT_MU = 1e-6;
+
+  for (let step = 0; step < iterations; step += 1) {
+    used = step + 1;
+    const shape = shapeAt(kx, ky);
+    reached = grabAt(shape);
+    const gErr = [toMm[0] - reached[0], toMm[1] - reached[1], toMm[2] - reached[2]];
+    const gLen = Math.hypot(gErr[0], gErr[1], gErr[2]);
+    const tipErr = tipResidualOf(shape, reference);
+    if (gLen < 0.3 && Math.hypot(tipErr[0], tipErr[1], tipErr[2]) < 0.1) break;
+
+    // ① 数值 Jacobian：一次扰动同时得到抓取点（3）与末端残差（6）的变化率。
+    //
+    //    ⚠ 抓取点**必须**也用数值（不能拿解析的 `influenceVector` 代替）：解析柔度在
+    //    「抓取点之后」的段上恒为 0，于是那些段在抓取步里永远是 0 分量 —— 而「末端不动、
+    //    只改形状」恰恰需要**抓取点前后反向弯**（S 形）来互相抵消末端位移。用解析值等于
+    //    把补偿自由度全锁死，拖起来只能动几毫米。
+    const jacGrab: number[][] = [];
+    const jacTip: number[][] = [];
+    for (let index = 0; index < count; index += 1) {
+      for (let axis = 0; axis < 2; axis += 1) {
+        const kxProbe = [...kx];
+        const kyProbe = [...ky];
+        if (axis === 0) kxProbe[index] += EPS;
+        else kyProbe[index] += EPS;
+        const probeShape = shapeAt(kxProbe, kyProbe);
+        const probeGrab = grabAt(probeShape);
+        const probeTip = tipResidualOf(probeShape, reference);
+        jacGrab.push([
+          (probeGrab[0] - reached[0]) / EPS,
+          (probeGrab[1] - reached[1]) / EPS,
+          (probeGrab[2] - reached[2]) / EPS,
+        ]);
+        jacTip.push(probeTip.map((value, dim) => (value - tipErr[dim]) / EPS));
+      }
+    }
+
+    // ③ 等式约束最小二乘（KKT）：
+    //      min ‖Jg·Δq − r_grab‖²   s.t.  Jt·Δq = −r_tip
+    //    这里**不加权重**：约束走 KKT 的 ν 块，是精确约束，不受量纲/权重影响。
+    const kktSize = dof + 6;
+    const kkt: number[][] = Array.from({ length: kktSize }, () => new Array<number>(kktSize).fill(0));
+    const rhs = new Array<number>(kktSize).fill(0);
+    for (let i = 0; i < dof; i += 1) {
+      for (let j = 0; j < dof; j += 1) {
+        let sum = 0;
+        for (let dim = 0; dim < 3; dim += 1) sum += jacGrab[i][dim] * jacGrab[j][dim];
+        kkt[i][j] = sum + (i === j ? RIDGE : 0);
+      }
+      for (let dim = 0; dim < 3; dim += 1) rhs[i] += jacGrab[i][dim] * gErr[dim];
+      for (let dim = 0; dim < 6; dim += 1) {
+        kkt[i][dof + dim] = jacTip[i][dim];
+        kkt[dof + dim][i] = jacTip[i][dim];
+      }
+    }
+    // 乘子块对角加一个极小正数：KKT 是鞍点矩阵，对角块全 0 时列主元消元可能在中间某列
+    // 找不到非零主元（返回 null 直接退出，表现为「拖不动」）。加 μI 后等价于「软约束」，
+    // μ→0 时就是硬约束（Jt 元素量级 1e2~1e3，所以 1e-6 相对量级可忽略）。
+    for (let dim = 0; dim < 6; dim += 1) {
+      kkt[dof + dim][dof + dim] = KKT_MU;
+      rhs[dof + dim] = -tipErr[dim];
+    }
+
+    const solved = solveDenseSystem(kkt, rhs);
+    if (!solved) break;
+    const delta = solved.slice(0, dof);
+
+    // ④ 逐段限位：整体缩放（缩放会让约束带一点残差，下一轮 KKT 会补回来，
+    //    所以「拖到上限」时表现为形状先顶住、末端仍不放）。
+    let scale = 1;
+    for (let index = 0; index < count; index += 1) {
+      const nextX = kx[index] + delta[index * 2];
+      const nextY = ky[index] + delta[index * 2 + 1];
+      const nextMagnitude = Math.hypot(nextX, nextY);
+      const limit = limits[index] ?? Infinity;
+      if (nextMagnitude > limit && nextMagnitude > 0) {
+        scale = Math.min(scale, (limit / nextMagnitude) * 0.999);
+      }
+    }
+    if (scale < 1) saturated = true;
+    for (let index = 0; index < count; index += 1) {
+      kx[index] += delta[index * 2] * scale;
+      ky[index] += delta[index * 2 + 1] * scale;
+    }
   }
 
-  // 积分出的 (kx·L, ky·L) 单位是 m⁻¹·mm，除以段长（mm）还原成 m⁻¹。
-  const curvaturePerM = sum.map(({ kx, ky, lengthMm }) =>
-    lengthMm > 1e-9 ? Math.hypot(kx, ky) / lengthMm : 0) as [number, number];
-  const directionRad = sum.map(({ kx, ky }) => Math.atan2(-kx, ky)) as [number, number];
-  const directionDeg = directionRad.map((rad) => ((rad * 180) / Math.PI + 360) % 360) as [number, number];
-  const directionCode = directionDeg.map((deg) => (Math.round(deg / 90) % 4) as 0 | 1 | 2 | 3) as [0 | 1 | 2 | 3, 0 | 1 | 2 | 3];
-
-  return { curvaturePerM, directionDeg, directionCode };
+  const finalShape = shapeAt(kx, ky);
+  const drift = tipResidualOf(finalShape, reference);
+  return {
+    distribution: finalShape,
+    reachedMm: reached,
+    residualMm: Math.hypot(toMm[0] - reached[0], toMm[1] - reached[1], toMm[2] - reached[2]),
+    saturated,
+    iterations: used,
+    tipDriftMm: Math.hypot(drift[0], drift[1], drift[2]),
+    tipDriftRad: Math.hypot(drift[3], drift[4], drift[5]) / armMm,
+  };
 }
 
 /* ── 数值自检 ── */
@@ -309,7 +472,7 @@ export function sectionEquivalents(distribution: CurvatureDistribution): Section
  * 弄反 kx/ky 不会报错，只会让臂往**相反方向**弯，很容易被当成手感问题
  * 而不是 bug。返回空数组表示通过。
  */
-export function verifyDragSolver(totalLengthMm = 400): string[] {
+export function verifyDragSolver(totalLengthMm = TOTAL_LENGTH_MM): string[] {
   const failures: string[] = [];
   const count = 12;
   const lengthMm = totalLengthMm / count;
@@ -334,9 +497,14 @@ export function verifyDragSolver(totalLengthMm = 400): string[] {
   const sMm = totalLengthMm / 2;
   const from = pointAtS(straight, sMm);
 
+  // 自检只管**符号与闭环**，与「模型上限」无关：显式给一个宽松上限，
+  // 免得模型表收紧（κ 表覆盖变小）后这条自检因为钳制而误报。
+  const limitsPerM = Array.from({ length: count }, () => 20);
+  const solve = (toMm: [number, number, number]) => solveDragToPoint({ sMm, toMm, base, limitsPerM });
+
   // 朝 +x 拖 15mm：应当得到 ky > 0 的弯曲（见文件头符号表）。
   const towardX: [number, number, number] = [from[0] + 15, from[1], from[2]];
-  const solvedX = solveDragToPoint({ sMm, toMm: towardX, base });
+  const solvedX = solve(towardX);
   if (solvedX.residualMm > 2) {
     failures.push(`+x 方向残差过大：${solvedX.residualMm.toFixed(2)}mm`);
   }
@@ -350,7 +518,7 @@ export function verifyDragSolver(totalLengthMm = 400): string[] {
 
   // 朝 −z 拖：应当得到 kx > 0（kx 吃场景 −z）。
   const towardNegZ: [number, number, number] = [from[0], from[1], from[2] - 15];
-  const solvedZ = solveDragToPoint({ sMm, toMm: towardNegZ, base });
+  const solvedZ = solve(towardNegZ);
   const meanKxZ = solvedZ.distribution.segments.reduce((sum, seg) => sum + seg.kxPerM, 0) / count;
   if (meanKxZ <= 1e-6) failures.push(`-z 拖动应产生 kx>0，实际 mean kx=${meanKxZ.toFixed(6)}`);
   if (solvedZ.reachedMm[2] >= from[2]) {
@@ -360,8 +528,8 @@ export function verifyDragSolver(totalLengthMm = 400): string[] {
   // 左右对称：把 +x 与 −x 的拖拽结果互相镜像比对。
   // 这条是防「只往一边弯得动」的 —— 单看某一侧全对，另一侧可能要差一倍
   // 才看得出来，光靠肉眼拖动很容易漏掉。
-  const plusX = solveDragToPoint({ sMm, toMm: [from[0] + 15, from[1], from[2]], base });
-  const minusX = solveDragToPoint({ sMm, toMm: [from[0] - 15, from[1], from[2]], base });
+  const plusX = solve([from[0] + 15, from[1], from[2]]);
+  const minusX = solve([from[0] - 15, from[1], from[2]]);
   if (Math.abs(plusX.residualMm - minusX.residualMm) > 0.05) {
     failures.push(`左右不对称：残差 +x=${plusX.residualMm.toFixed(3)} vs -x=${minusX.residualMm.toFixed(3)}`);
   }
@@ -370,9 +538,32 @@ export function verifyDragSolver(totalLengthMm = 400): string[] {
   }
 
   // 不拖就不动：目标点就是当前位置时，分布应当基本不变。
-  const noop = solveDragToPoint({ sMm, toMm: from, base });
+  const noop = solve(from);
   const drift = noop.distribution.segments.reduce((max, seg) => Math.max(max, seg.kappaAbsPerM), 0);
   if (drift > 1e-6) failures.push(`目标点未移动却产生了曲率：max κ=${drift.toFixed(6)}`);
+
+  // 固定末端位姿：拖臂中点 20mm，末端位置/姿态都不该跟着跑。
+  // （这条自检同样只关心「锁没锁住」，所以沿用上面那个宽松的 20 1/m 上限。）
+  const locked = solveDragToPoint({
+    sMm,
+    toMm: [from[0] + 20, from[1], from[2]],
+    base,
+    limitsPerM,
+    lockTipPose: true,
+  });
+  if (locked.tipDriftMm > 3) {
+    failures.push(`固定末端位姿：末端位置漂移 ${locked.tipDriftMm.toFixed(2)}mm 过大（应 ≤ 3mm）`);
+  }
+  if (locked.tipDriftRad > 0.035) {
+    failures.push(
+      `固定末端位姿：末端姿态漂移 ${((locked.tipDriftRad * 180) / Math.PI).toFixed(2)}° 过大（应 ≤ 2°）`,
+    );
+  }
+  if (locked.reachedMm[0] <= from[0] + 1) {
+    failures.push(
+      `固定末端位姿：抓取点几乎没动（到达 x=${locked.reachedMm[0].toFixed(2)}，起始 ${from[0].toFixed(2)}）`,
+    );
+  }
 
   return failures;
 }

@@ -1691,6 +1691,8 @@ struct ModelStatus {
     summary: String,
     bundle_bytes: usize,
     persisted_path: Option<String>,
+    /// UI 侧运动范围上限（1/m）：当前生效模型 κ 表的覆盖边界，由表数据扫出。
+    kappa_limit_per_m: f64,
 }
 
 fn model_status_of() -> ModelStatus {
@@ -1708,6 +1710,7 @@ fn model_status_of() -> ModelStatus {
         summary,
         bundle_bytes: model::DEFAULT_BUNDLE.len(),
         persisted_path: persisted_model_path().map(|path| path.to_string_lossy().to_string()),
+        kappa_limit_per_m: current_model().kappa_limit_per_m,
     }
 }
 
@@ -1933,12 +1936,16 @@ fn runtime_allows_command(status: &device::RuntimeStatus, safety: CommandSafety)
     match safety {
         CommandSafety::Connected => connected,
         CommandSafety::Enabled => {
+            // 放行依据：操作员点过「启动控制系统」（`control_enabled`），或下位机状态帧自己
+            // 报了 `system_state != 0`。只看状态帧是不够的 —— 下位机不回写时（STM32 的
+            // CR.state 恒 0）按钮就永远发不出去，而操作员的使能意图是明确的。
             connected
-                && status
-                    .last_status
-                    .as_ref()
-                    .map(|latest| latest.system_state != 0)
-                    .unwrap_or(false)
+                && (status.control_enabled
+                    || status
+                        .last_status
+                        .as_ref()
+                        .map(|latest| latest.system_state != 0)
+                        .unwrap_or(false))
         }
     }
 }
@@ -1992,11 +1999,12 @@ fn guard_command_allowed(
     }
 
     let message = match safety {
-        CommandSafety::Connected => "device is not connected or ready",
+        CommandSafety::Connected => "设备未连接或未就绪：请先在左栏连接设备并等待状态帧",
         CommandSafety::Enabled => {
-            "device control is not enabled; enable control and wait for device feedback before sending motion commands"
+            "设备未使能，运动指令被拒绝：请先到「自动控制 → 系统操作」点「启动控制系统」再下发"
         }
     };
+    record_control_failure(state, device_id, message);
     Err(message.to_string())
 }
 
@@ -2022,6 +2030,26 @@ fn current_username(state: &State<'_, AppState>) -> Option<String> {
         .ok()
         .filter(|session| session.authenticated)
         .map(|session| session.username.clone())
+}
+
+/// 记录一次**被拒绝/失败**的控制指令。
+///
+/// 为什么需要它：成功的指令会留下 `* command sent` 记录，失败的**什么都没有** —— 前端可能只
+/// 显示一句「命令失败」，现场就只能猜是没使能、曲率超表还是串口问题。把原因同时写进
+/// Logs 页与 `softui-state.json`，排查时直接看日志即可。
+fn record_control_failure(state: &State<'_, AppState>, device_id: &str, message: &str) {
+    let message = format!("指令被拒绝：{message}");
+    let _ = state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Warn,
+            "control",
+            &message,
+            Some(device_id),
+            None,
+        ));
+    });
 }
 
 fn record_control_command<T: Serialize>(
@@ -2064,7 +2092,11 @@ fn audit_control_frame(
         &frame_hex,
         &serde_json::json!({ "message": message }),
     );
-    Ok(state.store.mutate(|data| {
+    // ⚠ 不能把 `store.mutate()` 的返回值直接当快照发回前端：
+    //   `build_snapshot()` 里 `auth_session` 固定是 `AuthSession::default()`（未登录），
+    //   前端拿到后会立刻跳回登录页。`AppState::snapshot()` 才负责把 auth / 控制运行态 /
+    //   实时环 / 诊断摘要填齐。下面三处命令返回值都遵循这一条。
+    state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
         data.logs.push(log_entry(
             data.sequence,
@@ -2074,7 +2106,8 @@ fn audit_control_frame(
             Some(&device_id),
             Some(&frame_hex),
         ));
-    }))
+    });
+    Ok(state.snapshot())
 }
 
 #[tauri::command]
@@ -2606,7 +2639,7 @@ fn submit_system_control(
         &frame_hex,
         &request,
     );
-    Ok(state.store.mutate(|data| {
+    state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
         match request.action {
             SystemControlActionRequest::Enable => data.connected = true,
@@ -2628,7 +2661,8 @@ fn submit_system_control(
             Some(&device_id),
             Some(&frame_hex),
         ));
-    }))
+    });
+    Ok(state.snapshot())
 }
 
 #[tauri::command]
@@ -2660,7 +2694,7 @@ fn send_motor_command(
         &frame_hex,
         &request,
     );
-    Ok(state.store.mutate(|data| {
+    state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
         data.logs.push(log_entry(
             data.sequence,
@@ -2670,7 +2704,8 @@ fn send_motor_command(
             Some(&device_id),
             Some(&frame_hex),
         ));
-    }))
+    });
+    Ok(state.snapshot())
 }
 
 #[tauri::command]
@@ -2721,6 +2756,7 @@ fn send_curvature_command(
     state: State<'_, AppState>,
     request: CurvatureCommandRequest,
 ) -> Result<RuntimeSnapshot, String> {
+    let device_id = selected_device_id(request.device_id.clone());
     // 1) 全阶 Cosserat 查表：曲率 → 6 丝位移
     let kind = match request.table_gauge_n.unwrap_or(60) {
         40 => kappatable::KappaTableKind::Limit40n,
@@ -2732,15 +2768,32 @@ fn send_curvature_command(
         request.segment_curvature_per_m,
         request.segment_direction_rad,
     );
-    let lookup = table.lookup(query).map_err(|error| format!("{error:?}"))?;
+    let lookup = match table.lookup(query) {
+        Ok(lookup) => lookup,
+        Err(error) => {
+            let message = format!("曲率查表失败：{error:?}");
+            record_control_failure(&state, &device_id, &message);
+            return Err(message);
+        }
+    };
 
-    // 2) 纯查表：超出覆盖范围直接报错，不再退回解析 PCC 模型
+    // 2) 纯查表：超出覆盖范围直接报错，不再退回解析 PCC 模型。
+    //    把「查的是什么」和「表能覆盖到哪」一起报出来 —— 否则现场只会看到一句「命令失败」，
+    //    既不知道是没使能、串口错，还是曲率太大。
     if !lookup.covered {
-        return Err(format!(
-            "曲率超出全阶 Cosserat 表覆盖范围（最近邻 {:.2} > {:.1}）",
+        let message = format!(
+            "曲率超出 κ 表覆盖范围：查询 κ=[{:.2}, {:.2}] 1/m，最近邻距离 {:.2} > {:.1}。\
+             表内两段 κ 上限约 {:.1} / {:.1} 1/m（{} 表），请把目标曲率调小后重试",
+            request.segment_curvature_per_m[0].abs(),
+            request.segment_curvature_per_m[1].abs(),
             lookup.nearest_distance,
             kappatable::COVERAGE_RADIUS_PER_M,
-        ));
+            kappatable::SEGMENT_A_MAX_KAPPA_PER_M,
+            kappatable::SEGMENT_B_MAX_KAPPA_PER_M,
+            kind.label(),
+        );
+        record_control_failure(&state, &device_id, &message);
+        return Err(message);
     }
     let positions_mm = lookup.displacement_mm;
 
@@ -2750,7 +2803,6 @@ fn send_curvature_command(
     )
     .map_err(|error| format!("{error:?}"))?;
 
-    let device_id = selected_device_id(request.device_id);
     audit_control_frame(
         state,
         device_id,
@@ -2778,16 +2830,23 @@ fn send_tip_pose_command(
         request.yaw,
     );
     let model_tables = current_model();
-    let lookup = model_tables
-        .pose(kind)
-        .lookup(&query)
-        .map_err(|error| format!("{error:?}"))?;
+    let device_id = selected_device_id(request.device_id.clone());
+    let lookup = match model_tables.pose(kind).lookup(&query) {
+        Ok(lookup) => lookup,
+        Err(error) => {
+            let message = format!("位姿查表失败：{error:?}");
+            record_control_failure(&state, &device_id, &message);
+            return Err(message);
+        }
+    };
     if !lookup.covered {
-        return Err(format!(
-            "位姿超出全阶 Cosserat 表覆盖范围（最近邻 {:.1} > {:.0}）",
+        let message = format!(
+            "位姿超出 Cosserat 位姿表覆盖范围：最近邻距离 {:.1} > {:.0}，请把末端目标移回可达空间内",
             lookup.nearest_distance,
             posetable::COVERAGE_RADIUS,
-        ));
+        );
+        record_control_failure(&state, &device_id, &message);
+        return Err(message);
     }
 
     let frame = protocol::encode_multi_motor_command(
@@ -2796,7 +2855,6 @@ fn send_tip_pose_command(
     )
     .map_err(|error| format!("{error:?}"))?;
 
-    let device_id = selected_device_id(request.device_id);
     audit_control_frame(
         state,
         device_id,
@@ -3665,6 +3723,7 @@ mod tests {
             last_command_ms: 0,
             command_high_watermark: 0,
             emergency_latched: false,
+            control_enabled: false,
             last_error: None,
             last_error_code: None,
         };
@@ -3727,6 +3786,7 @@ mod tests {
             last_command_ms: 0,
             command_high_watermark: 0,
             emergency_latched: false,
+            control_enabled: false,
             last_error: None,
             last_error_code: None,
         };
@@ -3767,6 +3827,7 @@ mod tests {
             last_command_ms: 110,
             command_high_watermark: 4,
             emergency_latched: true,
+            control_enabled: false,
             last_error: Some("checksum failed".to_string()),
             last_error_code: Some("PROTOCOL_FRAME".to_string()),
         };
@@ -3990,3 +4051,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+

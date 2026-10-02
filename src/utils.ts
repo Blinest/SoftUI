@@ -25,6 +25,29 @@ export function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * 从任意抛出物里取一段可读的错误文本。
+ *
+ * Tauri 的 `invoke` 在命令返回 `Err(String)`（Rust 侧的 `Result<_, String>`）时，reject 的是
+ * **字符串本身**，不是 `Error` 实例。所以 `err instanceof Error ? err.message : "命令失败"`
+ * 这种写法会把后端的真实原因整段吞掉，界面上只剩下无信息量的「命令失败」——
+ * 未使能、曲率超表、串口错误全都长一样。这里统一处理 string / Error / 带 message 的对象。
+ */
+export function errorText(error: unknown, fallback = "命令失败"): string {
+  if (typeof error === "string") return error.trim() || fallback;
+  if (error instanceof Error) return error.message.trim() || fallback;
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+    try {
+      return JSON.stringify(error);
+    } catch {
+      /* 循环引用：退回 fallback */
+    }
+  }
+  return fallback;
+}
+
 export function toneForLevel(level: LogLevel) {
   switch (level) {
     case "warn":

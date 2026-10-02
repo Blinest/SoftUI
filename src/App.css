@@ -5241,6 +5241,42 @@ button {
   color: #9dc0ff;
 }
 
+/* ---- 顶层命令反馈横幅 ----
+ * 命令结果（成功 / 未使能警告 / 失败原因）统一显示在页面内容区顶部，
+ * 与「回放提示」同层同形，用户点完按钮抬眼就能看到。 */
+.page-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--status-info) 45%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--status-info) 12%, transparent);
+  color: var(--status-info);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.page-notice.is-ok {
+  border-color: color-mix(in srgb, var(--status-ok) 45%, transparent);
+  background: color-mix(in srgb, var(--status-ok) 12%, transparent);
+  color: var(--status-ok);
+}
+
+.page-notice.is-warn {
+  border-color: color-mix(in srgb, var(--status-warning) 55%, transparent);
+  background: color-mix(in srgb, var(--status-warning) 16%, transparent);
+  color: var(--status-warning);
+}
+
+.page-notice.is-error {
+  border-color: color-mix(in srgb, var(--status-error) 50%, transparent);
+  background: color-mix(in srgb, var(--status-error) 14%, transparent);
+  color: var(--status-error);
+}
+
 /* 极简回放条：按钮放大到能轻松点中（原来是通用 .playback-btn，太小）。 */
 .playback-bar.is-minimal .playback-btn,
 .playback-bar.is-minimal .playback-btn.primary {

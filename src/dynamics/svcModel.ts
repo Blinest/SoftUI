@@ -96,7 +96,22 @@ const DEG2RAD = Math.PI / 180;
 const RAD2DEG = 180 / Math.PI;
 const LEGACY_MAX_BEND_DEG = 85;
 export const DEFAULT_CURVATURE_BASIS_SEGMENTS = 12;
-const DEFAULT_TOTAL_LENGTH_MM = 400;
+
+/**
+ * 与模型表对齐的**权威段长**（米）与总长（毫米）。
+ *
+ * 来源：`tools/build_model_bundle.py` 的 `seg_lengths()`（由腱耦合几何算出）
+ *   L1 = L2 = **0.2225887 m**，总长 **0.445177422 m**。
+ * κ 表（K40/K60）、位姿表（P40/P60）、形状表（S40/S60）的全部样本都是用这个长度生成的，
+ * 所以前端做 κ↔角度换算、骨架积分、反解都必须用同一个值，否则和表对不上。
+ *
+ * ⚠ 两个还**没对齐**的数字（需要硬件侧确认后再统一，不要在 UI 侧私自改）：
+ *   - 固件 `CR.arm_params[*].L = 0.225` m（与本值差约 1%）；
+ *   - 3D 网格 `CurvatureDragPreview.GEOMETRY.lengthMm = 404.8927`（图纸口径，差约 9%）。
+ */
+export const SEGMENT_LENGTH_M = 0.2225887;
+export const TOTAL_LENGTH_MM = 445.177422;
+const DEFAULT_TOTAL_LENGTH_MM = TOTAL_LENGTH_MM;
 
 export interface ForceChannelMapping {
   cableIndex: number;
@@ -151,8 +166,8 @@ export const DEFAULT_MOTOR_MAPPINGS: MotorCableMapping[] = [0, 1, 2, 3, 4, 5].ma
 }));
 
 export const DEFAULT_CURVATURE_DERIVATION_CONFIG: CurvatureDerivationConfig = {
-  segmentLengthM: [0.200, 0.200],
-  totalLengthMm: 400,
+  segmentLengthM: [SEGMENT_LENGTH_M, SEGMENT_LENGTH_M],
+  totalLengthMm: TOTAL_LENGTH_MM,
   basisSegmentCount: DEFAULT_CURVATURE_BASIS_SEGMENTS,
   cableRadiusM: 0.006,
   linearEiNm2: [0.04, 0.04],
@@ -167,20 +182,105 @@ export const DEFAULT_CURVATURE_DERIVATION_CONFIG: CurvatureDerivationConfig = {
 };
 
 export const DEFAULT_DYNAMICS_CONFIG: DynamicsConfig = {
-  segmentLengthM: [0.200, 0.200],
+  segmentLengthM: [SEGMENT_LENGTH_M, SEGMENT_LENGTH_M],
   cableRadiusM: 0.006,
   bendingStiffness: 0.2,
   forceBaseN: 4.0,
   forceAmpN: [90.0, 55.0],
   backbonePointsPerSegment: 60,
+  // 历史口径（85°/段）；运行时会被 `setModelCurvatureLimitPerM()` 覆盖为模型 κ 表的上限。
   maxCurvaturePerM: [
-    (LEGACY_MAX_BEND_DEG * DEG2RAD) / 0.200,
-    (LEGACY_MAX_BEND_DEG * DEG2RAD) / 0.200,
+    (LEGACY_MAX_BEND_DEG * DEG2RAD) / SEGMENT_LENGTH_M,
+    (LEGACY_MAX_BEND_DEG * DEG2RAD) / SEGMENT_LENGTH_M,
   ],
 };
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+/* ── 运动范围上限（来自当前模型包） ── */
+
+/**
+ * 模型上限取回前的兜底曲率上限（1/m，单段）。
+ *
+ * 实测（`cargo test kappatable::tests::covered_kappa_limit`）：内置表扫出的两段 κ 上限
+ * 是 **60N ≈ 1.73 1/m、40N ≈ 1.88 1/m**（默认档 60N）。UI 旧口径是 85°/0.2m ≈ 7.4 1/m，
+ * 大 4 倍还多 —— 所以旧版本「拖一下就下发失败」。
+ */
+export const FALLBACK_CURVATURE_LIMIT_PER_M = 1.6;
+
+/**
+ * 当前模型的**曲率上限**（1/m，单段）。
+ *
+ * 来源是后端 `ModelStatus.kappaLimitPerM` —— 由当前生效模型（内置包或导入的
+ * `.tdcrmodel`）的 κ 表覆盖范围扫出来，所以**换模型包，UI 的运动范围跟着变**。
+ *
+ * 在它被设置之前用 `FALLBACK_CURVATURE_LIMIT_PER_M` 兜底：宁可先保守（拖不动太多），
+ * 也不要先放开一个「发出去必失败」的范围。
+ */
+let modelCurvatureLimitPerM = FALLBACK_CURVATURE_LIMIT_PER_M;
+
+/**
+ * 设置当前模型的曲率上限（`modelBridge.fetchModelStatus()` 拿到后调用）。
+ *
+ * 同时回写 `DEFAULT_DYNAMICS_CONFIG.maxCurvaturePerM`：这个字段是历史遗留的
+ * 「模型参数」口径，仍有消费方读它，两边必须一致，否则会出现「预览一个上限、
+ * 下发另一个上限」。
+ */
+export function setModelCurvatureLimitPerM(limitPerM: number) {
+  if (!Number.isFinite(limitPerM) || limitPerM <= 0) return;
+  modelCurvatureLimitPerM = limitPerM;
+  DEFAULT_DYNAMICS_CONFIG.maxCurvaturePerM = [limitPerM, limitPerM];
+}
+
+/** 当前模型的曲率上限（1/m）。 */
+export function modelCurvatureLimit(): number {
+  return modelCurvatureLimitPerM;
+}
+
+/**
+ * 按上限等比缩回一个曲率向量（保留弯曲方向）。
+ *
+ * @returns 缩回后的 (kx, ky) 以及是否真的被钳制过（用于提示「已按模型上限钳制」）。
+ */
+export function clampCurvatureVector(
+  kxPerM: number,
+  kyPerM: number,
+  limitPerM: number = modelCurvatureLimitPerM,
+): { kxPerM: number; kyPerM: number; clamped: boolean } {
+  const magnitude = Math.hypot(kxPerM, kyPerM);
+  if (!(magnitude > limitPerM) || !(magnitude > 0)) {
+    return { kxPerM, kyPerM, clamped: false };
+  }
+  const scale = limitPerM / magnitude;
+  return { kxPerM: kxPerM * scale, kyPerM: kyPerM * scale, clamped: true };
+}
+
+/**
+ * 把整条分布按上限钳制。
+ *
+ * 钳在**分布**上而不是钳在下发 payload 上：3D 预览、末端位姿读数、峰值读数都从这条分布派生，
+ * 只有钳在这里，「看到的形状」与「发下去的形状」才是同一个。
+ */
+export function clampCurvatureDistribution(
+  distribution: CurvatureDistribution,
+  limitPerM: number = modelCurvatureLimitPerM,
+): CurvatureDistribution {
+  let clamped = false;
+  const segments = distribution.segments.map((segment) => {
+    const hit = clampCurvatureVector(segment.kxPerM, segment.kyPerM, limitPerM);
+    if (!hit.clamped) return segment;
+    clamped = true;
+    return {
+      ...segment,
+      kxPerM: hit.kxPerM,
+      kyPerM: hit.kyPerM,
+      kappaAbsPerM: Math.hypot(hit.kxPerM, hit.kyPerM),
+      phiRad: Math.atan2(-hit.kxPerM, hit.kyPerM),
+    };
+  });
+  return clamped ? { ...distribution, segments } : distribution;
 }
 
 function finiteOr(value: number, fallback: number) {

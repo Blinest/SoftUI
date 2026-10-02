@@ -196,6 +196,28 @@ export function tipPoseOf(transform: Mat4): TipPose {
   return { positionM: [transform[3], transform[7], transform[11]], rpyRad: matToRpy(transform) };
 }
 
+/**
+ * **任意段数**曲率分布 → 末端位姿（svc 坐标系，位置单位 m）。
+ *
+ * 与 `forwardKinematics` 用的是同一套段变换，只是段数不限于 2：拖动反解出来的是 12 段分布，
+ * 要拿它的**真实末端位姿**去查位姿表（6 维键）——而不是先折成两段、再从 4 维 (κA,κB) 均值键
+ * 去查 κ 表（那一步会丢掉段内形状）。
+ *
+ * @param segments 每段 (kxPerM, kyPerM, lengthMm)，顺序沿臂从根到尖
+ */
+export function tipPoseOfDistribution(
+  segments: readonly { kxPerM: number; kyPerM: number; lengthMm: number }[],
+): TipPose {
+  let transform = identityMat();
+  for (const segment of segments) {
+    transform = matMul(
+      transform,
+      segmentTransform(segment.kxPerM, segment.kyPerM, segment.lengthMm / 1000),
+    );
+  }
+  return tipPoseOf(transform);
+}
+
 /* ── 反解 ── */
 
 

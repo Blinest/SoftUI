@@ -100,6 +100,17 @@ export interface CurvatureDragPreviewProps {
   target: CurvatureDistribution | null;
   /** 编辑开关：关闭时完全不接管指针，视图保持纯 OrbitControls。 */
   enabled: boolean;
+  /**
+   * 固定末端位姿：只改臂体形状，末端位置/姿态保持不变（见 `curvatureDrag.solveDragLockingTip`）。
+   */
+  lockTipPose?: boolean;
+  /**
+   * 固定末端位姿时的**漂移阈值**（mm，默认 2）。
+   *
+   * 硬约束求解也会在上限处留下毫米级残差，超过这个阈值就说明「形状已经到极限、
+   * 末端开始被拖着走」，视图下方会把它标黄说清楚，而不是假装还锁着。
+   */
+  tipDriftToleranceMm?: number;
   showCables?: boolean;
   onTargetChange: (target: CurvatureDistribution | null) => void;
 }
@@ -114,18 +125,23 @@ export function CurvatureDragPreview({
   actual,
   target,
   enabled,
+  lockTipPose = false,
+  tipDriftToleranceMm = 2,
   showCables = true,
   onTargetChange,
 }: CurvatureDragPreviewProps) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   /** 最新输入。渲染循环与指针回调都从这里读，避免重建整个场景。 */
-  const inputRef = useRef({ actual, enabled });
-  inputRef.current = { actual, enabled };
+  const inputRef = useRef({ actual, enabled, lockTipPose });
+  inputRef.current = { actual, enabled, lockTipPose };
   const onChangeRef = useRef(onTargetChange);
   onChangeRef.current = onTargetChange;
 
   const [dragging, setDragging] = useState(false);
   const [saturated, setSaturated] = useState(false);
+  /** 固定末端位姿模式下的末端漂移（mm / rad）——「锁没锁住」的量化答案。 */
+  const [tipDriftMm, setTipDriftMm] = useState(0);
+  const [tipDriftRad, setTipDriftRad] = useState(0);
 
   // 指针回调与渲染循环都定义在下面这个 effect 里；它们需要读到最新的 target，
   // 但 target 每帧都在变，不能进依赖数组（否则场景会被反复销毁重建）。
@@ -295,8 +311,11 @@ export function CurvatureDragPreview({
         sMm: session.sMm,
         toMm,
         base: pickShape().distribution,
+        lockTipPose: inputRef.current.lockTipPose,
       });
       setSaturated(solved.saturated);
+      setTipDriftMm(solved.tipDriftMm);
+      setTipDriftRad(solved.tipDriftRad);
       onChangeRef.current(solved.distribution);
     };
 
@@ -387,11 +406,23 @@ export function CurvatureDragPreview({
         {!enabled ? (
           <span>拖动编辑已关闭 · 鼠标用于旋转视角</span>
         ) : dragging ? (
-          <span className={saturated ? "is-warn" : undefined}>
-            {saturated ? "已到曲率上限，继续拖不会再弯" : "拖动中 · 反解曲率分布"}
-          </span>
+          lockTipPose ? (
+            <span className={tipDriftMm > tipDriftToleranceMm ? "is-warn" : undefined}>
+              {tipDriftMm > tipDriftToleranceMm
+                ? `已到曲率上限：形状到极限，末端开始被拖着走（漂移 ${tipDriftMm.toFixed(1)} mm > 阈值 ${tipDriftToleranceMm.toFixed(1)} mm）`
+                : `拖动中 · 固定末端位姿（漂移 ${tipDriftMm.toFixed(1)} mm / ${((tipDriftRad * 180) / Math.PI).toFixed(1)}°，阈值 ${tipDriftToleranceMm.toFixed(1)} mm）`}
+            </span>
+          ) : (
+            <span className={saturated ? "is-warn" : undefined}>
+              {saturated ? "已到曲率上限，继续拖不会再弯" : "拖动中 · 反解曲率分布"}
+            </span>
+          )
         ) : (
-          <span>点住臂身拖动改变曲率分布 · 视角已锁定，关闭拖动编辑后才能转视角</span>
+          <span>
+            {lockTipPose
+              ? `固定末端位姿：末端不动，只改臂体形状（漂移阈值 ${tipDriftToleranceMm.toFixed(1)} mm）· 视角已锁定`
+              : "点住臂身拖动改变曲率分布 · 视角已锁定，关闭拖动编辑后才能转视角"}
+          </span>
         )}
       </div>
     </div>

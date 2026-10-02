@@ -48,6 +48,10 @@ pub struct ModelTables {
     pub kappa_60: KappaTable,
     pub pose_40: PoseTable,
     pub pose_60: PoseTable,
+    /// UI 侧运动范围上限（1/m），由 κ 表覆盖范围扫出来（见 [`KappaTable::covered_kappa_limit`]）。
+    ///
+    /// 放在这里而不是写死在 UI：换导入的模型包后，拖动/反解的上限会自动跟着新表走。
+    pub kappa_limit_per_m: f64,
 }
 
 impl ModelTables {
@@ -84,6 +88,8 @@ impl ModelTables {
         .map_err(|error| ModelError::Table(format!("P60: {error:?}")))?;
 
         Ok(Self {
+            // 默认档位是 60N，UI 上限就按 60N 表算（更严的 40N 表由下发时的 tableGaugeN 决定）。
+            kappa_limit_per_m: kappa_60.covered_kappa_limit(),
             kappa_40,
             kappa_60,
             pose_40,
@@ -108,9 +114,10 @@ impl ModelTables {
     /// 供 UI 展示的摘要。
     pub fn summary(&self) -> String {
         format!(
-            "40N {} 样本 / 60N {} 样本",
+            "40N {} 样本 / 60N {} 样本，κ 上限 {:.2} 1/m",
             self.kappa_40.len(),
             self.kappa_60.len(),
+            self.kappa_limit_per_m,
         )
     }
 }

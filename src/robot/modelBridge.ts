@@ -18,6 +18,14 @@ export interface ModelStatus {
   summary: string;
   bundleBytes: number;
   persistedPath: string | null;
+  /**
+   * UI 侧运动范围上限（1/m，单段）。
+   *
+   * 由后端从当前生效模型（内置包或导入的 `.tdcrmodel`）的 κ 表覆盖范围里扫出来 ——
+   * 拖动反解、等效折算、下发前检查都用它，不再用写死的「85°/段长 ≈ 7.85」。
+   * 超出这个值的形状后端查不到，下发只会回一句「曲率超出 κ 表覆盖范围」。
+   */
+  kappaLimitPerM: number;
 }
 
 /** 查询当前生效的模型。 */

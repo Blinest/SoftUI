@@ -26,7 +26,7 @@ export interface CardPlacement {
 }
 
 /** 布局数据结构版本。卡片集合有增删时递增，见 state/layoutStore.ts。 */
-export type LayoutSchemaVersion = 2;
+export type LayoutSchemaVersion = 3;
 
 export interface PageLayout {
   schemaVersion: LayoutSchemaVersion;
@@ -58,7 +58,6 @@ export type MonitorCardId =
 export type ManualCardId =
   | "modelPackage"
   | "curvatureDrag"
-  | "tipPose"
   | "motorControl"
   | "sensorMonitor";
 
@@ -321,6 +320,8 @@ export interface ConnectDeviceRequest {
 
 export interface DeviceRuntimeStatusView {
   state: string;
+  /** 操作员是否点过「启动控制系统」（后端 `RuntimeStatus::control_enabled`）。 */
+  controlEnabled?: boolean;
   receivedFrames: number;
   protocolErrors: number;
   sentCommands: number;

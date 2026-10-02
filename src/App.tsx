@@ -22,6 +22,7 @@ import {
 } from "./pages/WorkspacePage";
 import { resetLayout } from "./state/layoutStore";
 import { applyTheme, writeThemePreference } from "./state/themeStore";
+import { errorText } from "./utils";
 import { angleDegToCurvaturePerM, curvaturePerMToAngleDeg, DEFAULT_DYNAMICS_CONFIG } from "./dynamics/svcModel";
 
 // 懒加载重型页面组件，避免启动时加载 Three.js / uPlot / tanstack-table
@@ -292,6 +293,21 @@ function AppShell() {
    * 而不是后端报错 —— 这两种情况的排查方向完全不同。
    */
   const [playbackNotice, setPlaybackNotice] = useState<{ tone: "info" | "error"; text: string } | null>(null);
+  /**
+   * 顶层命令反馈横幅（由 WorkspacePage 的 `onNotice` 驱动）。
+   *
+   * 运动指令的成功 / 未使能警告 / 失败原因都显示在这里：用户点的是工作台里的按钮，
+   * 提示就必须出现在他视线所在的顶层，而不是散落到各张卡片的标题栏里。
+   */
+  const [commandNotice, setCommandNotice] = useState<{ tone: "ok" | "warn" | "error"; message: string } | null>(null);
+  /**
+   * 操作员**最后一次成功**的系统操作（启动 / 关闭 / 急停）。
+   *
+   * 下位机状态帧里的 `system_state` 只有 0/1，区分不了「从未使能」和「刚被关闭」；
+   * 而界面必须分得清（关掉要显示「已失能」，不是「未使能」）。所以「使能状态」以操作意图
+   * 为主，状态帧的 `system_state` 只用来校验「下位机有没有确认」。
+   */
+  const [lastSystemControl, setLastSystemControl] = useState<SystemControlAction | null>(null);
   /** 回放控件是否被收起（回放本身继续，只把界面藏起来）。 */
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
@@ -806,6 +822,18 @@ function AppShell() {
     };
   }, [playbackStatus?.active, fetchSnapshot]);
 
+  const handleCommandNotice = useCallback(
+    (notice: { tone: "ok" | "warn" | "error"; message: string } | null) => setCommandNotice(notice),
+    [],
+  );
+
+  // 横幅自动消失：警告只是一次操作的解释，不该长期占着页面顶部。
+  useEffect(() => {
+    if (!commandNotice) return;
+    const timer = window.setTimeout(() => setCommandNotice(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [commandNotice]);
+
   const submitSystemControl = useCallback(async (action: SystemControlAction) => {
     try {
       const next = await invoke<RuntimeSnapshot>("submit_system_control", {
@@ -815,8 +843,12 @@ function AppShell() {
         },
       });
       setSnapshot(next);
+      // 记下意图：界面靠它区分「已失能」和「未使能」。
+      setLastSystemControl(action);
     } catch (invokeError) {
+      // 命令失败必须有反馈：Tauri 的 reject 是字符串，直接并进顶层横幅。
       console.error(invokeError);
+      setCommandNotice({ tone: "error", message: errorText(invokeError, "系统操作失败") });
     }
   }, [snapshot.live.selectedDeviceId]);
 
@@ -833,7 +865,9 @@ function AppShell() {
       });
       setSnapshot(next);
     } catch (invokeError) {
+      // 同上：把失败原因交给 WorkspacePage 显示，不要吞。
       console.error(invokeError);
+      throw invokeError;
     }
   }, [snapshot.live.selectedDeviceId]);
 
@@ -877,7 +911,10 @@ function AppShell() {
       const next = await invoke<RuntimeSnapshot>(selected.name, { request: selected.request });
       setSnapshot(next);
     } catch (invokeError) {
+      // 不吞异常：WorkspacePage 靠 reject 显示失败原因（未使能 / 表外 / 串口未连接），
+      // 吞掉的话按钮会假装「命令已发送」，现场看到的就是「按了没反应」。
       console.error(invokeError);
+      throw invokeError;
     }
   }, [snapshot.calibration.targetAngles, snapshot.live.selectedDeviceId]);
 
@@ -934,6 +971,7 @@ function AppShell() {
         connectionLabel={snapshot.connection.state}
         currentUserLabel={snapshot.authSession.username}
         systemEnabled={snapshot.live.latest === null ? null : snapshot.live.latest.systemEnabled}
+        systemControlAction={lastSystemControl}
         recording={recorderStatus.active}
         emergencyLatched={emergencyLatched}
         theme={snapshot.theme}
@@ -944,6 +982,14 @@ function AppShell() {
 
       <main className="app-content">
         <div className="app-page-content">
+          {commandNotice ? (
+            <div className={`page-notice is-${commandNotice.tone}`} role="alert">
+              <span>{commandNotice.message}</span>
+              <button type="button" className="ghost-btn" onClick={() => setCommandNotice(null)}>
+                <span>知道了</span>
+              </button>
+            </div>
+          ) : null}
           {playbackNotice ? (
             <div className={`playback-error is-${playbackNotice.tone}`}>
               <span>{playbackNotice.text}</span>
@@ -993,6 +1039,8 @@ function AppShell() {
                   onSystemControl={submitSystemControl}
                   onSendMotor={sendMotorCommand}
                   onWorkspaceCommand={submitWorkspaceCommand}
+                  onNotice={handleCommandNotice}
+                  systemControlAction={lastSystemControl}
                 />
               }
             />

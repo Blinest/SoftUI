@@ -571,7 +571,7 @@
  *
  * `.manual-volume-panel` 原本是给**面板**用的 5 行模板（auto / 40vh / auto / auto / auto），
  * 第一行是面板自己的 header。卡片化之后 header 由 CardGrid 渲染，体里只剩 4 个块：
- *   3D 视图 host / 等效曲率读数 / 按钮行 / 说明文字
+ *   3D 视图 host / 末端位姿读数 / 按钮行 / 说明文字
  * 如果沿用 5 行模板，3D host 会落到第一行 `auto` —— 它是 minmax(0,1fr) 的 grid 且
  * overflow:hidden，没有内在高度，直接塌成 0，画布就看不见了（就是这次的 bug）。
  */
@@ -591,7 +591,7 @@
  * **不能写 `height: 100%`**：面板高度是内容撑出来的（.workspace-pane-grid 的
  * 行是 minmax(min-content, 1fr)，最小值取内容的 min-content），host 写 100%
  * 就是「我要和父级一样高」，而父级的高度又取决于 host —— 循环之下 host 直接
- * 吃掉整个面板高度，后面的等效曲率读数、按钮行、说明文字全部被面板的
+ * 吃掉整个面板高度，后面的末端位姿读数、按钮行、说明文字全部被面板的
  * overflow:hidden 裁掉。高度改由上面 .manual-volume-panel 的行定义给。 */
 .curvature-drag-host {
   display: grid;
@@ -647,6 +647,36 @@
   color: var(--status-warning);
 }
 
+/* 标题栏里的两个开关（拖动编辑 / 固定末端位姿）并排。 */
+.curvature-drag-toggles {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* 「漂移阈值」输入：紧跟在两个开关后面，窄一点。 */
+.curvature-drag-tolerance {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.curvature-drag-tolerance input {
+  width: 58px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .curvature-drag-toggle {
   display: flex;
   align-items: center;
@@ -666,26 +696,46 @@
   padding: 0 8px 12px;
 }
 
-.curvature-equivalent {
+.curvature-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px 12px;
   padding: 0 12px 10px;
 }
 
-.curvature-equivalent > div {
+.curvature-summary > div {
   display: grid;
   gap: 2px;
   min-width: 0;
 }
 
-.curvature-equivalent span {
+.curvature-summary span {
   color: var(--text-secondary);
   font-size: 12px;
 }
 
-.curvature-equivalent strong {
+.curvature-summary strong {
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 「目标末端位姿」三格输入：位置 xyz / 姿态 rpy 各一行三格。 */
+.curvature-summary-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.curvature-summary-fields input {
+  width: 100%;
+  min-width: 0;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -835,4 +885,62 @@
     grid-column: 1;
   }
 
+}
+
+/* ---- 左栏「未使能」警告 ----
+ * 运动指令在下位机未使能时会被后端 CommandSafety::Enabled 拦掉（串口零写入），
+ * 这条警告必须比任何卡片都先被看见，所以挂在常驻的设备上下文栏。 */
+.context-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--status-warning) 45%, transparent);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--status-warning) 12%, transparent);
+  color: var(--status-warning);
+}
+
+.context-warning > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.context-warning strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.context-warning span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.context-warning b {
+  color: var(--status-warning);
+  font-weight: 700;
+}
+
+.context-status-list strong.is-warn {
+  color: var(--status-warning);
+}
+
+.context-status-list strong.is-error {
+  color: var(--status-error);
+}
+
+/* 未使能时的「拦不住但会告诉你」按钮：换成警告色，但保持可点。
+ * 禁用只会让用户以为界面坏了；换色 + 点下去在顶层横幅说明原因，信息量更大。 */
+.primary-btn.is-blocked,
+.ghost-btn.is-blocked {
+  border-color: color-mix(in srgb, var(--status-warning) 55%, var(--border-default));
+  background: color-mix(in srgb, var(--status-warning) 16%, var(--button-default-bg));
+  color: var(--status-warning);
+}
+
+.primary-btn.is-blocked:hover,
+.ghost-btn.is-blocked:hover {
+  background: color-mix(in srgb, var(--status-warning) 24%, var(--button-default-bg));
 }

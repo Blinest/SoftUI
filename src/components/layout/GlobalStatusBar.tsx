@@ -7,6 +7,13 @@ interface GlobalStatusBarProps {
   currentUserLabel: string;
   /** 三态：未知（还没收到帧）/ 已使能 / 未使能。 */
   systemEnabled: boolean | null;
+  /**
+   * 操作员最后一次成功的系统操作。
+   *
+   * 下位机状态帧只有 0/1，分不出「从未使能」和「刚被关闭」；这里用操作意图补齐，
+   * 关闭后显示「已失能」而不是「未使能」。
+   */
+  systemControlAction?: "enable" | "disable" | "emergencyStop" | null;
   recording: boolean;
   emergencyLatched: boolean;
   theme: "dark" | "light";
@@ -20,7 +27,15 @@ type StatusSeverity = "danger" | "muted" | "ok" | "warning";
 function statusSeverity(label: string): StatusSeverity {
   const normalized = label.toLowerCase();
   if (label.includes("急停") || label.includes("故障") || normalized.includes("error")) return "danger";
-  if (label.includes("等待") || label.includes("录制中") || normalized.includes("warning")) return "warning";
+  if (
+    label.includes("等待") ||
+    label.includes("录制中") ||
+    label.includes("已失能") ||
+    label.includes("未确认") ||
+    normalized.includes("warning")
+  ) {
+    return "warning";
+  }
   if (["ready", "enabled", "正常", "已使能"].includes(label)) return "ok";
   return "muted";
 }
@@ -38,6 +53,7 @@ export const GlobalStatusBar = memo(function GlobalStatusBar({
   connectionLabel,
   currentUserLabel,
   systemEnabled,
+  systemControlAction,
   recording,
   emergencyLatched,
   theme,
@@ -45,7 +61,22 @@ export const GlobalStatusBar = memo(function GlobalStatusBar({
   onToggleTheme,
   onLogout,
 }: GlobalStatusBarProps) {
-  const enabledLabel = systemEnabled === null ? "无数据" : systemEnabled ? "已使能" : "未使能";
+  /**
+   * 使能状态的显示口径：
+   *   帧说已使能 → 已使能；刚点过关闭 → 已失能；刚点过启动但帧里还是 0 → 已使能（未确认）。
+   */
+  const enabledLabel =
+    systemEnabled === true
+      ? "已使能"
+      : systemControlAction === "emergencyStop"
+        ? "急停锁定"
+        : systemControlAction === "disable"
+          ? "已失能"
+          : systemControlAction === "enable"
+            ? "已使能（未确认）"
+            : systemEnabled === null
+              ? "无数据"
+              : "未使能";
   const recordingLabel = recording ? "录制中" : "未录制";
   const ThemeIcon = theme === "dark" ? SunMedium : MoonStar;
 

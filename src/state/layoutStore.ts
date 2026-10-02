@@ -22,7 +22,7 @@ const STORAGE_PREFIX = "softui:layout";
  * 布局数据结构版本。卡片集合有增删（例如把摄像头从 3D 卡片里拆出来）时递增，
  * 这样用户本地缓存的旧布局会被判为不合法并回落到新的默认布局，而不是缺卡片。
  */
-const LAYOUT_SCHEMA_VERSION = 2;
+const LAYOUT_SCHEMA_VERSION = 3;
 
 const DASHBOARD_CARD_IDS: DashboardCardId[] = [
   "connection",
@@ -48,7 +48,6 @@ const MONITOR_CARD_IDS: MonitorCardId[] = [
 const MANUAL_CARD_IDS: ManualCardId[] = [
   "modelPackage",
   "curvatureDrag",
-  "tipPose",
   "motorControl",
   "sensorMonitor",
 ];
@@ -174,8 +173,7 @@ export const defaultWorkspaceManualLayout: PageLayout = freezeLayout({
   schemaVersion: LAYOUT_SCHEMA_VERSION,
   cards: [
     { id: "modelPackage", size: "4x1", visible: true },
-    { id: "curvatureDrag", size: "2x2", visible: true },
-    { id: "tipPose", size: "2x2", visible: true },
+    { id: "curvatureDrag", size: "2x3", visible: true },
     { id: "motorControl", size: "2x1", visible: true },
     { id: "sensorMonitor", size: "2x1", visible: true },
   ],
