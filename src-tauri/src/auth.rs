@@ -415,8 +415,10 @@ fn normalize_username(username: &str) -> Result<String, String> {
 }
 
 fn validate_password(password: &str) -> Result<(), String> {
-    if password.len() < 8 {
-        return Err("password must contain at least 8 characters".to_string());
+    // 原为 8 位。按部署方要求放宽到 4 位，便于使用简短口令。
+    // 注意：这是一处**安全策略放宽**，公网部署时应评估是否可接受。
+    if password.len() < 4 {
+        return Err("password must contain at least 4 characters".to_string());
     }
     Ok(())
 }

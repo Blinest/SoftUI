@@ -451,13 +451,32 @@ export default function ArmObjectTracker() {
   useEffect(() => {
     let cancelled = false;
     const discover = async () => {
-      const all = await navigator.mediaDevices.enumerateDevices();
+      let all = await navigator.mediaDevices.enumerateDevices();
       if (cancelled) return;
+
+      // 首次访问必须主动要一次权限。未授权时 enumerateDevices 返回的
+      // label 和 deviceId 都是空串，pickPreferredCamera 会返回 "" —— 而调用处
+      // 原来用真值判断，空串被当成"没选中"，deviceId 永远是 null，
+      // 下面的开流 effect 直接 return，摄像头就永远不会被请求。
+      // 桌面端因为权限早就授过，看不出这个问题；换到浏览器首次访问必现。
+      const before = all.filter((device) => device.kind === "videoinput");
+      if (before.length === 0 || before.some((device) => !device.label || !device.deviceId)) {
+        try {
+          const warm = await navigator.mediaDevices.getUserMedia({ video: true });
+          warm.getTracks().forEach((track) => track.stop());
+          all = await navigator.mediaDevices.enumerateDevices();
+        } catch {
+          /* 用户拒绝或没有摄像头：按原列表继续，界面会给出提示 */
+        }
+        if (cancelled) return;
+      }
+
       const cams = all.filter((device) => device.kind === "videoinput");
       setDevices(cams);
+      // 注意用 !== null 而不是真值判断：deviceId 为空串是合法的"默认摄像头"
       const chosen = pickPreferredCamera(cams, deviceIdRef.current);
-      if (chosen) deviceIdRef.current = chosen;
-      setDeviceId((prev) => (chosen && prev !== chosen ? chosen : prev));
+      if (chosen !== null) deviceIdRef.current = chosen;
+      setDeviceId((prev) => (chosen !== null && prev !== chosen ? chosen : prev));
     };
     discover().catch(() => undefined);
     return () => { cancelled = true; };
@@ -478,7 +497,8 @@ export default function ArmObjectTracker() {
 
     requestCamera({
       video: {
-        deviceId: { exact: deviceId },
+        // deviceId 为空串表示"系统默认摄像头"，此时不能发 exact 约束
+        ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
         width: { ideal: 640 },
         height: { ideal: 480 },
       },

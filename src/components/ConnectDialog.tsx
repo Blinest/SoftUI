@@ -162,9 +162,8 @@ export default function ConnectDialog({
                 <option value="">-- 选择端口 --</option>
                 {availablePorts.map((p) => (
                   <option key={p.portName} value={p.portName}>
-                    {p.portName}
-                    {p.description ? ` (${p.description})` : ""}
-                    {p.manufacturer ? ` - ${p.manufacturer}` : ""}
+                    {/* 直接显示可读名：Web Serial 拿不到 COM3，只能靠 VID/PID 认设备 */}
+                    {p.description || p.portName}
                   </option>
                 ))}
               </select>

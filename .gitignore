@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# 部署产物与本机凭据：不入库
+serve/auth.txt
+data/
+*.bak
+*.bak-*

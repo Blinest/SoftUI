@@ -448,3 +448,63 @@ mod tests {
         assert!(!descriptor.likely_available);
     }
 }
+
+/* ── Web Serial 桥接传输 ─────────────────────────────────────────────
+ * 浏览器用 Web Serial 打开**用户本机**的串口，把收到的原始字节推给后端；
+ * 后端要把命令下发时，把字节排进 tx，由前端取走写进真实串口。
+ *
+ * 关键取舍：**协议解析不搬到前端**。前端只做字节搬运，帧头识别、校验、
+ * 状态解析、环形缓冲、动力学、控制、录制全部沿用 Rust 现有实现。
+ * 否则同一套协议会存在两份实现，一改就分叉。
+ * ─────────────────────────────────────────────────────────────────── */
+
+pub type WsRx = std::sync::Arc<std::sync::Mutex<VecDeque<u8>>>;
+pub type WsTx = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+pub struct WebSerialTransport {
+    rx: WsRx,
+    tx: WsTx,
+    closed: bool,
+}
+
+impl WebSerialTransport {
+    pub fn new(rx: WsRx, tx: WsTx) -> Self {
+        Self { rx, tx, closed: false }
+    }
+}
+
+impl Transport for WebSerialTransport {
+    /// 把当前攒下的字节一次性取走。没有数据时返回空 —— 上层
+    /// `poll_all` 对 `NoStatusFrame` 是显式容忍的（`(None, None, None)`），
+    /// 所以空读不会把设备判成错误，也不会刷日志。
+    fn read(&mut self) -> Result<Vec<u8>, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        let mut guard = self.rx.lock().map_err(|_| TransportError::Closed)?;
+        let take = guard.len().min(8192);
+        let mut out = Vec::with_capacity(take);
+        for _ in 0..take {
+            match guard.pop_front() {
+                Some(byte) => out.push(byte),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// 后端下发的命令字节排队，等前端来取。
+    fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        let mut guard = self.tx.lock().map_err(|_| TransportError::Closed)?;
+        guard.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.closed = true;
+        Ok(())
+    }
+}

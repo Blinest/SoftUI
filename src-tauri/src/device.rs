@@ -320,6 +320,49 @@ impl DeviceRegistry {
         results
     }
 
+    /// 用浏览器 Web Serial 建立一路设备：字节由前端推入 `rx`，命令字节从前端取走。
+    /// 同端口重复打开时先清掉旧的，保证幂等。
+    pub fn open_webserial(
+        &mut self,
+        port_name: &str,
+        baud_rate: u32,
+        device_name: Option<String>,
+        rx: crate::transport::WsRx,
+        tx: crate::transport::WsTx,
+    ) -> Result<DeviceConnectionRecord, DeviceRuntimeError> {
+        self.serial_devices.remove(port_name);
+        self.records.retain(|_, record| record.port_name != port_name);
+
+        let transport = crate::transport::WebSerialTransport::new(rx, tx);
+        let mut runtime = DeviceRuntime::new(Box::new(transport) as Box<dyn Transport>);
+        // 握手失败是正常的：串口刚打开时对端还没回帧，等前端推字节进来即可。
+        let _ = runtime.handshake();
+        let record = DeviceConnectionRecord {
+            // 显示名由前端给（例如 TDCR_v1）。给不出就退回 port_name，
+            // 至少不会是 "webserial:webserial:1" 这种双重前缀。
+            device_id: device_name.unwrap_or_else(|| port_name.to_string()),
+            connection_id: format!("conn-{}", self.next_connection),
+            port_name: port_name.to_string(),
+            baud_rate,
+            state: runtime.status().state,
+            connected_at_ms: now_ms(),
+        };
+        self.next_connection = self.next_connection.saturating_add(1);
+        self.serial_devices.insert(port_name.to_string(), runtime);
+        self.records.insert(record.device_id.clone(), record.clone());
+        Ok(record)
+    }
+
+    /// 关闭一路 Web Serial 设备。
+    pub fn close_webserial(&mut self, port_name: &str) -> Result<(), DeviceRuntimeError> {
+        let Some(mut runtime) = self.serial_devices.remove(port_name) else {
+            return Err(DeviceRuntimeError::DeviceNotFound(port_name.to_string()));
+        };
+        let _ = runtime.close();
+        self.records.retain(|_, record| record.port_name != port_name);
+        Ok(())
+    }
+
     /// Insert a simulator device under port "simulator".
     /// Used by AppState::new() to provide data even without real hardware.
     pub fn seed_simulator(&mut self) -> Result<DeviceConnectionRecord, DeviceRuntimeError> {

@@ -5,22 +5,29 @@ description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "softui_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# desktop：带 GUI 的 Tauri 应用（原行为）
+# server ：无 GUI 的 HTTP 网关，不编译 tauri，因而也不需要 webkit2gtk
+[features]
+default = ["desktop"]
+desktop = ["tauri", "tauri-build", "tauri-plugin-opener"]
+server = []
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-opener = "2"
+tauri = { version = "2", features = [], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serialport = "4"
 time = { version = "0.3", features = ["formatting", "macros"] }
+
+[profile.release]
+opt-level = 2
+debug = false
+strip = true

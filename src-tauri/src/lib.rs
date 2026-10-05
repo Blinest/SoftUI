@@ -25,6 +25,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+#[cfg(feature = "desktop")]
 use tauri::{Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1245,7 +1246,7 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         let devices = Arc::new(Mutex::new(device::DeviceRegistry::new()));
         {
             let mut guard = devices.lock().expect("device registry poisoned");
@@ -1715,13 +1716,13 @@ fn model_status_of() -> ModelStatus {
 }
 
 /// 查询当前模型（只读）。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn model_status() -> ModelStatus {
     model_status_of()
 }
 
 /// 导入模型包（`.tdcrmodel`）。校验通过后写入可执行文件同目录并立即生效。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn import_model(bytes: Vec<u8>, name: Option<String>) -> Result<ModelStatus, String> {
     let tables = model::ModelTables::from_bundle(&bytes)
         .map_err(|error| format!("模型包无效：{error:?}"))?;
@@ -1737,7 +1738,7 @@ fn import_model(bytes: Vec<u8>, name: Option<String>) -> Result<ModelStatus, Str
 }
 
 /// 恢复内置默认模型（并删除已持久化的模型文件）。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn reset_model() -> Result<ModelStatus, String> {
     if let Ok(mut guard) = imported_slot().lock() {
         *guard = None;
@@ -1780,7 +1781,7 @@ struct TipPoseShapeResponse {
 ///
 /// 取的是**最近表点的 0 阶形状**，不做插值：预览必须显示表里真实存在的解，
 /// 否则会出现「预览一个形状、发下去另一个」。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn lookup_tip_pose_shape(request: TipPoseShapeRequest) -> Result<TipPoseShapeResponse, String> {
     let kind = match request.table_gauge_n.unwrap_or(60) {
         40 => posetable::PoseTableKind::Limit40n,
@@ -2110,7 +2111,7 @@ fn audit_control_frame(
     Ok(state.snapshot())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn app_info() -> AppInfo {
     AppInfo {
         name: "SoftUI".to_string(),
@@ -2121,7 +2122,7 @@ fn app_info() -> AppInfo {
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn current_auth_session(state: State<'_, AppState>) -> Result<auth::AuthSession, String> {
     state
         .auth_session
@@ -2130,7 +2131,7 @@ fn current_auth_session(state: State<'_, AppState>) -> Result<auth::AuthSession,
         .map(|session| session.clone())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn login(
     state: State<'_, AppState>,
     request: auth::LoginRequest,
@@ -2157,7 +2158,7 @@ fn login(
     Ok(session)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn logout(state: State<'_, AppState>) -> Result<auth::AuthSession, String> {
     let previous = {
         let mut auth_session = state
@@ -2182,13 +2183,13 @@ fn logout(state: State<'_, AppState>) -> Result<auth::AuthSession, String> {
     current_auth_session(state)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_users(state: State<'_, AppState>) -> Result<Vec<auth::UserAccount>, String> {
     guard_permission(&state, auth::Permission::ManageUsers)?;
     Ok(state.auth_store.list_users())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn create_user(
     state: State<'_, AppState>,
     request: auth::CreateUserRequest,
@@ -2210,7 +2211,7 @@ fn create_user(
     Ok(account)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn change_password(
     state: State<'_, AppState>,
     request: auth::ChangePasswordRequest,
@@ -2246,7 +2247,7 @@ fn change_password(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn set_user_disabled(
     state: State<'_, AppState>,
     username: String,
@@ -2273,27 +2274,27 @@ fn set_user_disabled(
     Ok(account)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn bootstrap_state(state: State<'_, AppState>) -> RuntimeSnapshot {
     state.snapshot()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn tick_snapshot(state: State<'_, AppState>) -> RuntimeSnapshot {
     state.tick()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn toggle_connection(state: State<'_, AppState>) -> RuntimeSnapshot {
     state.toggle_connection()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn set_theme(state: State<'_, AppState>, theme: ThemeMode) -> RuntimeSnapshot {
     state.set_theme(theme)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn update_settings(
     state: State<'_, AppState>,
     settings: SettingsState,
@@ -2302,13 +2303,13 @@ fn update_settings(
     Ok(state.update_settings(settings))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn export_diagnostics_bundle(state: State<'_, AppState>) -> Result<String, String> {
     guard_permission(&state, auth::Permission::ViewDiagnostics)?;
     state.export_diagnostics_bundle()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn preview_legacy_migration(
     state: State<'_, AppState>,
     source_dir: String,
@@ -2329,7 +2330,7 @@ fn preview_legacy_migration(
     ))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn run_legacy_migration(
     state: State<'_, AppState>,
     source_dir: String,
@@ -2360,12 +2361,98 @@ fn run_legacy_migration(
     Ok(report)
 }
 
-#[tauri::command]
+/* ── Web Serial 桥接命令 ─────────────────────────────────────────────
+ * 前端用浏览器的 Web Serial 打开**用户本机**串口，把原始字节推给后端；
+ * 后端把要下发的命令排进 tx 等前端来取。协议解析全部留在 Rust。
+ * ─────────────────────────────────────────────────────────────────── */
+
+static WS_BUFFERS: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<String, (transport::WsRx, transport::WsTx)>>,
+> = std::sync::OnceLock::new();
+
+fn ws_buffers(
+) -> &'static Mutex<std::collections::HashMap<String, (transport::WsRx, transport::WsTx)>> {
+    WS_BUFFERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn webserial_open(
+    state: State<'_, AppState>,
+    port_name: String,
+    baud_rate: Option<u32>,
+    device_name: Option<String>,
+) -> Result<device::DeviceConnectionRecord, String> {
+    let (rx, tx) = {
+        let mut map = ws_buffers()
+            .lock()
+            .map_err(|_| "webserial buffer poisoned".to_string())?;
+        map.remove(&port_name);
+        let rx: transport::WsRx = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let tx: transport::WsTx = Arc::new(Mutex::new(Vec::new()));
+        map.insert(port_name.clone(), (rx.clone(), tx.clone()));
+        (rx, tx)
+    };
+    let mut devices = state
+        .devices
+        .lock()
+        .map_err(|_| "device registry poisoned".to_string())?;
+    devices
+        .open_webserial(&port_name, baud_rate.unwrap_or(115_200), device_name, rx, tx)
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// 前端把从串口读到的原始字节推进来。返回本次接受的字节数。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn webserial_push(port_name: String, bytes: Vec<u8>) -> Result<usize, String> {
+    let map = ws_buffers()
+        .lock()
+        .map_err(|_| "webserial buffer poisoned".to_string())?;
+    let (rx, _) = map
+        .get(&port_name)
+        .ok_or_else(|| format!("webserial 端口未打开：{port_name}"))?;
+    let mut guard = rx.lock().map_err(|_| "webserial rx poisoned".to_string())?;
+    let accepted = bytes.len();
+    guard.extend(bytes);
+    // 防止前端异常刷数据把内存撑爆：只保留最近 256 KB
+    while guard.len() > 256 * 1024 {
+        guard.pop_front();
+    }
+    Ok(accepted)
+}
+
+/// 前端取走后端要下发的命令字节。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn webserial_take_tx(port_name: String) -> Result<Vec<u8>, String> {
+    let map = ws_buffers()
+        .lock()
+        .map_err(|_| "webserial buffer poisoned".to_string())?;
+    let (_, tx) = map
+        .get(&port_name)
+        .ok_or_else(|| format!("webserial 端口未打开：{port_name}"))?;
+    let mut guard = tx.lock().map_err(|_| "webserial tx poisoned".to_string())?;
+    Ok(std::mem::take(&mut *guard))
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn webserial_close(state: State<'_, AppState>, port_name: String) -> Result<(), String> {
+    if let Ok(mut map) = ws_buffers().lock() {
+        map.remove(&port_name);
+    }
+    let mut devices = state
+        .devices
+        .lock()
+        .map_err(|_| "device registry poisoned".to_string())?;
+    devices
+        .close_webserial(&port_name)
+        .map_err(|error| format!("{error:?}"))
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_serial_ports() -> Result<Vec<transport::SerialPortDescriptor>, String> {
     transport::list_serial_ports().map_err(|error| format!("{error:?}"))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_connected_devices(
     state: State<'_, AppState>,
 ) -> Result<Vec<device::DeviceConnectionRecord>, String> {
@@ -2376,7 +2463,7 @@ fn list_connected_devices(
     Ok(devices.list())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn connect_device(
     state: State<'_, AppState>,
     request: ConnectDeviceRequest,
@@ -2420,7 +2507,7 @@ fn connect_device(
     Ok(record)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn disconnect_device(
     state: State<'_, AppState>,
     device_id: String,
@@ -2455,7 +2542,7 @@ fn disconnect_device(
     Ok(record)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn fetch_live_window(state: State<'_, AppState>, count: u32) -> Vec<DeviceSnapshot> {
     // ⚠ 回放激活时曲线必须来自**回放帧**。这两个命令原来直接读实时环，
     //   于是「点了播放，工作区/曲线还在跑模拟数据」—— 它们绕过了回放引擎。
@@ -2471,7 +2558,7 @@ fn fetch_live_window(state: State<'_, AppState>, count: u32) -> Vec<DeviceSnapsh
         .unwrap_or_default()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn fetch_live_stats(state: State<'_, AppState>) -> live::FrameStats {
     state
         .live_ring
@@ -2488,7 +2575,7 @@ fn fetch_live_stats(state: State<'_, AppState>) -> live::FrameStats {
 
 /// 轻量实时响应：最新一帧 + 环形缓冲统计。供总览/工作区等页面高频轮询，
 /// 只序列化一个帧与统计，远小于整份 RuntimeSnapshot。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn fetch_live_latest(state: State<'_, AppState>) -> LiveLatest {
     // 回放激活：工作区读数取回放游标那一帧（同上，必须绕开实时环）。
     let ring_stats = state
@@ -2547,7 +2634,7 @@ struct DeviceRuntimeStatusView {
     last_error_code: Option<String>,
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn device_runtime_status(
     state: State<'_, AppState>,
     device_id: String,
@@ -2575,7 +2662,7 @@ fn device_runtime_status(
     })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn submit_system_control(
     state: State<'_, AppState>,
     request: SystemControlRequest,
@@ -2665,7 +2752,7 @@ fn submit_system_control(
     Ok(state.snapshot())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_motor_command(
     state: State<'_, AppState>,
     request: MotorControlRequest,
@@ -2708,7 +2795,7 @@ fn send_motor_command(
     Ok(state.snapshot())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_home_command(
     state: State<'_, AppState>,
     request: HomeCommandRequest,
@@ -2729,7 +2816,7 @@ fn send_home_command(
 }
 
 /// 多电机同步位移：一次下发一组目标位移，速度由下位机按位移比例分配。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_multi_motor_command(
     state: State<'_, AppState>,
     request: MultiMotorCommandRequest,
@@ -2751,7 +2838,7 @@ fn send_multi_motor_command(
 
 /// 曲率 → 电机位移：**纯走全阶 Cosserat 查表**（超范围报错，无内置解析回退），
 /// 再走 0x04 多电机同步指令下发。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_curvature_command(
     state: State<'_, AppState>,
     request: CurvatureCommandRequest,
@@ -2814,7 +2901,7 @@ fn send_curvature_command(
 
 /// 末端位姿 → 电机位移：走**全阶 Cosserat 位姿查表**（`ik_table.PoseTable` 口径），
 /// 再经 0x04 多电机同步指令下发。取代原先「位姿 → 两段曲率 → 0x05 角度」的内置 PCC 链路。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_tip_pose_command(
     state: State<'_, AppState>,
     request: TipPoseCommandRequest,
@@ -2864,7 +2951,7 @@ fn send_tip_pose_command(
     )
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn calibrate_sensor(
     state: State<'_, AppState>,
     request: SensorCalibrationRequest,
@@ -2883,7 +2970,7 @@ fn calibrate_sensor(
     )
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_bend_command(
     state: State<'_, AppState>,
     request: BendCommandRequest,
@@ -2905,7 +2992,7 @@ fn send_bend_command(
     )
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn send_active_control_tick(
     state: State<'_, AppState>,
     request: ActiveControlRequest,
@@ -2921,7 +3008,7 @@ fn send_active_control_tick(
     )
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn control_runtime_status(state: State<'_, AppState>) -> Result<control::ControlStatus, String> {
     state
         .control_runtime
@@ -2930,7 +3017,7 @@ fn control_runtime_status(state: State<'_, AppState>) -> Result<control::Control
         .map(|control| control.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn update_pid_control(
     state: State<'_, AppState>,
     config: control::PidConfig,
@@ -2944,7 +3031,7 @@ fn update_pid_control(
         .map(|mut control| control.update_pid(config))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn configure_cycle_life(
     state: State<'_, AppState>,
     config: control::CycleLifeConfig,
@@ -2958,7 +3045,7 @@ fn configure_cycle_life(
         .map(|mut control| control.configure_cycle(config))
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn start_cycle_life(
     state: State<'_, AppState>,
     request: CycleLifeStartRequest,
@@ -2987,7 +3074,7 @@ fn start_cycle_life(
     Ok(state.snapshot())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn stop_cycle_life(
     state: State<'_, AppState>,
     reason: Option<String>,
@@ -3019,7 +3106,7 @@ fn stop_cycle_life(
 
 // ── Dynamics commands ──
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn dynamics_status(state: State<'_, AppState>) -> Result<dynamics::DynamicsStatus, String> {
     state
         .dynamics_runtime
@@ -3028,7 +3115,7 @@ fn dynamics_status(state: State<'_, AppState>) -> Result<dynamics::DynamicsStatu
         .map(|runtime| runtime.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn compute_live_dynamics(state: State<'_, AppState>) -> Result<dynamics::DynamicsOutput, String> {
     let status = state
         .dynamics_runtime
@@ -3040,7 +3127,7 @@ fn compute_live_dynamics(state: State<'_, AppState>) -> Result<dynamics::Dynamic
         .ok_or_else(|| "no dynamics output computed yet; wait for device frames".to_string())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn compute_dynamics_snapshot(state: State<'_, AppState>) -> Result<dynamics::DynamicsOutput, String> {
     let frame = state
         .live_ring
@@ -3056,7 +3143,7 @@ fn compute_dynamics_snapshot(state: State<'_, AppState>) -> Result<dynamics::Dyn
         .step_frame(&frame, 50)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn update_dynamics_config(
     state: State<'_, AppState>,
     config: dynamics::DynamicsConfig,
@@ -3069,7 +3156,7 @@ fn update_dynamics_config(
         .update_config(config)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn reset_dynamics(state: State<'_, AppState>) -> Result<dynamics::DynamicsStatus, String> {
     guard_permission(&state, auth::Permission::ManageSettings)?;
     Ok(state
@@ -3079,7 +3166,7 @@ fn reset_dynamics(state: State<'_, AppState>) -> Result<dynamics::DynamicsStatus
         .reset())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn start_recording(
     state: State<'_, AppState>,
     name: Option<String>,
@@ -3110,7 +3197,7 @@ fn start_recording(
     Ok(info)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn stop_recording(state: State<'_, AppState>) -> Result<session::SessionInfo, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     let info = state
@@ -3122,7 +3209,7 @@ fn stop_recording(state: State<'_, AppState>) -> Result<session::SessionInfo, St
     Ok(info)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     state
@@ -3132,7 +3219,7 @@ fn pause_recording(state: State<'_, AppState>) -> Result<(), String> {
         .pause()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn resume_recording(state: State<'_, AppState>) -> Result<(), String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     state
@@ -3142,7 +3229,7 @@ fn resume_recording(state: State<'_, AppState>) -> Result<(), String> {
         .resume()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn recorder_status(state: State<'_, AppState>) -> session::RecorderStatus {
     state
         .recorder
@@ -3158,7 +3245,7 @@ fn recorder_status(state: State<'_, AppState>) -> session::RecorderStatus {
         })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_sessions(state: State<'_, AppState>) -> Vec<session::SessionInfo> {
     let sessions = state
         .recorder
@@ -3173,7 +3260,7 @@ fn list_sessions(state: State<'_, AppState>) -> Vec<session::SessionInfo> {
 
 // ── Playback commands ──
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_load(
     state: State<'_, AppState>,
     session_id: String,
@@ -3205,7 +3292,7 @@ fn playback_load(
     Ok(pb.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_play(state: State<'_, AppState>) -> Result<playback::PlaybackStatus, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     let mut pb = state
@@ -3216,7 +3303,7 @@ fn playback_play(state: State<'_, AppState>) -> Result<playback::PlaybackStatus,
     Ok(pb.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_pause(state: State<'_, AppState>) -> Result<playback::PlaybackStatus, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     let mut pb = state
@@ -3227,7 +3314,7 @@ fn playback_pause(state: State<'_, AppState>) -> Result<playback::PlaybackStatus
     Ok(pb.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_stop(state: State<'_, AppState>) -> Result<playback::PlaybackStatus, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     let mut pb = state
@@ -3241,7 +3328,7 @@ fn playback_stop(state: State<'_, AppState>) -> Result<playback::PlaybackStatus,
 }
 
 /// 单帧步进：`delta` = ±1（或 ±N）。步进会自动暂停播放。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_step_frame(
     state: State<'_, AppState>,
     delta: i64,
@@ -3255,7 +3342,7 @@ fn playback_step_frame(
     Ok(pb.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_seek(state: State<'_, AppState>, ms: u64) -> Result<playback::PlaybackStatus, String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     let mut pb = state
@@ -3266,7 +3353,7 @@ fn playback_seek(state: State<'_, AppState>, ms: u64) -> Result<playback::Playba
     Ok(pb.status())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_set_speed(
     state: State<'_, AppState>,
     speed: f64,
@@ -3281,7 +3368,7 @@ fn playback_set_speed(
 }
 
 /// 游标之前 `window_ms` 毫秒内的设备帧（「最近 N 分钟」的原始数据）。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_recent_window(
     state: State<'_, AppState>,
     window_ms: u64,
@@ -3294,7 +3381,7 @@ fn playback_recent_window(
 }
 
 /// 当前回放会话记录的控制指令（配合 `playback_status` 的游标切窗口）。
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_commands(
     state: State<'_, AppState>,
 ) -> Result<Vec<session::SessionCommandRow>, String> {
@@ -3305,7 +3392,7 @@ fn playback_commands(
     Ok(pb.commands().to_vec())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_status(state: State<'_, AppState>) -> playback::PlaybackStatus {
     // ⚠ 播放的**推进**挂在这里。
     //
@@ -3334,7 +3421,7 @@ fn playback_status(state: State<'_, AppState>) -> playback::PlaybackStatus {
         })
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_get_frame(state: State<'_, AppState>) -> Option<DeviceSnapshot> {
     state
         .playback
@@ -3343,7 +3430,7 @@ fn playback_get_frame(state: State<'_, AppState>) -> Option<DeviceSnapshot> {
         .and_then(|p| p.current_frame().cloned())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn playback_get_window(state: State<'_, AppState>, count: u32) -> Vec<DeviceSnapshot> {
     state
         .playback
@@ -3359,7 +3446,7 @@ fn playback_get_window(state: State<'_, AppState>, count: u32) -> Vec<DeviceSnap
 
 // ── Session management commands ──
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     state
@@ -3370,7 +3457,7 @@ fn delete_session(state: State<'_, AppState>, id: String) -> Result<(), String> 
     state.sqlite.delete_session(&id)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn rename_session(state: State<'_, AppState>, id: String, name: String) -> Result<(), String> {
     guard_permission(&state, auth::Permission::ManageSessions)?;
     state
@@ -3390,7 +3477,7 @@ fn rename_session(state: State<'_, AppState>, id: String, name: String) -> Resul
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn update_session_metadata(
     state: State<'_, AppState>,
     id: String,
@@ -3414,7 +3501,7 @@ fn update_session_metadata(
     Ok(())
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn export_session_csv(
     state: State<'_, AppState>,
     id: String,
@@ -3437,7 +3524,7 @@ fn export_session_csv(
     }
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn read_session_frames(
     state: State<'_, AppState>,
     id: String,
@@ -3474,7 +3561,7 @@ fn read_session_frames(
     Ok(frames)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn export_chart_csv(
     state: State<'_, AppState>,
     session_id: Option<String>,
@@ -3589,12 +3676,12 @@ fn csv_escape(value: &str) -> String {
 
 // ── Connection profile commands ──
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_connection_profiles(state: State<'_, AppState>) -> Vec<profiles::ConnectionProfile> {
     state.profile_store.list()
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn save_connection_profile(
     state: State<'_, AppState>,
     profile: profiles::ConnectionProfile,
@@ -3603,7 +3690,7 @@ fn save_connection_profile(
     state.profile_store.save(profile)
 }
 
-#[tauri::command]
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn delete_connection_profile(state: State<'_, AppState>, id: String) -> Result<(), String> {
     guard_permission(&state, auth::Permission::ManageSettings)?;
     state.profile_store.delete(&id)
@@ -3843,6 +3930,126 @@ mod tests {
     }
 }
 
+/// 后台设备轮询线程：桌面模式和 HTTP 网关模式共用，避免两份实现走偏。
+fn spawn_device_poller(app_state: &AppState) {
+    // 先把需要的 Arc 克隆出来，线程里不再借用 app_state。
+    let app_state = app_state;
+    let bg_devices = app_state.devices.clone();
+    let bg_dynamics = app_state.dynamics_runtime.clone();
+    let bg_live_ring = app_state.live_ring.clone();
+    let bg_recorder = app_state.recorder.clone();
+    let bg_playback = app_state.playback.clone();
+    let bg_control = app_state.control_runtime.clone();
+    let bg_sqlite = app_state.sqlite.clone();
+    let bg_worker_stop = app_state.worker_stop.clone();
+
+
+    std::thread::Builder::new()
+        .name("device-poller".into())
+        .spawn(move || {
+            let mut seq: u64 = 0;
+            while !bg_worker_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let results = match bg_devices.lock() {
+                    Ok(mut d) => d.poll_all(),
+                    Err(_) => continue,
+                };
+                for result in &results {
+                    if let Some(error) = &result.error {
+                        let _ = bg_sqlite.insert_log(&storage::LogRow {
+                            id: now_ms(),
+                            timestamp_ms: now_ms(),
+                            level: "error".to_string(),
+                            scope: "serial".to_string(),
+                            message: result
+                                .error_code
+                                .as_deref()
+                                .map(|code| format!("{code}: {error}"))
+                                .unwrap_or_else(|| error.clone()),
+                            device_id: Some(result.record.device_id.clone()),
+                            frame_hex: None,
+                        });
+                    }
+                    if let Some(status) = &result.status {
+                        seq = seq.saturating_add(1);
+                        let frame =
+                            make_device_frame(&result.record, status, &result.runtime, seq);
+                        // Skip recording during playback
+                        let is_playback = bg_playback
+                            .lock()
+                            .map(|p| p.status().active)
+                            .unwrap_or(false);
+                        let dynamics_result = bg_dynamics
+                            .lock()
+                            .map_err(|_| ())
+                            .and_then(|mut dynamics| dynamics.step_frame(&frame, 50).map_err(|_| ()))
+                            .ok();
+                        if let Ok(mut control) = bg_control.lock() {
+                            let safety = control::SafetyInput {
+                                connected: matches!(
+                                    result.runtime.state,
+                                    device::DeviceConnectionState::Ready
+                                        | device::DeviceConnectionState::Enabled
+                                ),
+                                enabled: frame.system_enabled,
+                                emergency_latched: result.runtime.emergency_latched,
+                                playback_mode: is_playback,
+                            };
+                            let dynamics_input = dynamics::dynamics_input_from_frame(&frame, 50);
+                            let feedback = control::ControlFeedback {
+                                target_curvature_per_m: dynamics_input
+                                    .sections
+                                    .first()
+                                    .map(|section| section.curvature_per_m)
+                                    .unwrap_or(0.0),
+                                dynamics_input,
+                                dynamics_output: dynamics_result.clone(),
+                                pressure: frame
+                                    .sensors
+                                    .first()
+                                    .map(|sensor| sensor.filtered[2])
+                                    .unwrap_or(0.0),
+                            };
+                            control.step_cycle(feedback, safety, 50);
+                        }
+                        if !is_playback {
+                            if let Ok(mut rec) = bg_recorder.lock() {
+                                let rec_status = rec.status();
+                                rec.write_frame_calib(
+                                    &frame,
+                                    &make_calib_row(&frame, dynamics_result.as_ref()),
+                                );
+                                if rec_status.active && !rec_status.paused {
+                                    let _ = bg_sqlite.insert_snapshot(
+                                        &rec_status.session_id,
+                                        frame.sequence,
+                                        frame.received_at_ms,
+                                        &frame.device_id,
+                                        &frame,
+                                    );
+                                    if let Some(output) = &dynamics_result {
+                                        let _ = bg_sqlite.insert_dynamics_output(
+                                            &rec_status.session_id,
+                                            frame.sequence,
+                                            frame.received_at_ms,
+                                            &frame.device_id,
+                                            output,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Ok(mut ring) = bg_live_ring.lock() {
+                            ring.push(frame);
+                        }
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn device poller");
+}
+
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -3854,121 +4061,8 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("softui-state.json");
             let app_state = AppState::new(state_path);
-
-            let bg_devices = app_state.devices.clone();
-            let bg_dynamics = app_state.dynamics_runtime.clone();
-            let bg_live_ring = app_state.live_ring.clone();
-            let bg_recorder = app_state.recorder.clone();
-            let bg_playback = app_state.playback.clone();
-            let bg_control = app_state.control_runtime.clone();
-            let bg_sqlite = app_state.sqlite.clone();
-            let bg_worker_stop = app_state.worker_stop.clone();
-
+            spawn_device_poller(&app_state);
             app.manage(app_state);
-
-            std::thread::Builder::new()
-                .name("device-poller".into())
-                .spawn(move || {
-                    let mut seq: u64 = 0;
-                    while !bg_worker_stop.load(Ordering::SeqCst) {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        let results = match bg_devices.lock() {
-                            Ok(mut d) => d.poll_all(),
-                            Err(_) => continue,
-                        };
-                        for result in &results {
-                            if let Some(error) = &result.error {
-                                let _ = bg_sqlite.insert_log(&storage::LogRow {
-                                    id: now_ms(),
-                                    timestamp_ms: now_ms(),
-                                    level: "error".to_string(),
-                                    scope: "serial".to_string(),
-                                    message: result
-                                        .error_code
-                                        .as_deref()
-                                        .map(|code| format!("{code}: {error}"))
-                                        .unwrap_or_else(|| error.clone()),
-                                    device_id: Some(result.record.device_id.clone()),
-                                    frame_hex: None,
-                                });
-                            }
-                            if let Some(status) = &result.status {
-                                seq = seq.saturating_add(1);
-                                let frame =
-                                    make_device_frame(&result.record, status, &result.runtime, seq);
-                                // Skip recording during playback
-                                let is_playback = bg_playback
-                                    .lock()
-                                    .map(|p| p.status().active)
-                                    .unwrap_or(false);
-                                let dynamics_result = bg_dynamics
-                                    .lock()
-                                    .map_err(|_| ())
-                                    .and_then(|mut dynamics| dynamics.step_frame(&frame, 50).map_err(|_| ()))
-                                    .ok();
-                                if let Ok(mut control) = bg_control.lock() {
-                                    let safety = control::SafetyInput {
-                                        connected: matches!(
-                                            result.runtime.state,
-                                            device::DeviceConnectionState::Ready
-                                                | device::DeviceConnectionState::Enabled
-                                        ),
-                                        enabled: frame.system_enabled,
-                                        emergency_latched: result.runtime.emergency_latched,
-                                        playback_mode: is_playback,
-                                    };
-                                    let dynamics_input = dynamics::dynamics_input_from_frame(&frame, 50);
-                                    let feedback = control::ControlFeedback {
-                                        target_curvature_per_m: dynamics_input
-                                            .sections
-                                            .first()
-                                            .map(|section| section.curvature_per_m)
-                                            .unwrap_or(0.0),
-                                        dynamics_input,
-                                        dynamics_output: dynamics_result.clone(),
-                                        pressure: frame
-                                            .sensors
-                                            .first()
-                                            .map(|sensor| sensor.filtered[2])
-                                            .unwrap_or(0.0),
-                                    };
-                                    control.step_cycle(feedback, safety, 50);
-                                }
-                                if !is_playback {
-                                    if let Ok(mut rec) = bg_recorder.lock() {
-                                        let rec_status = rec.status();
-                                        rec.write_frame_calib(
-                                            &frame,
-                                            &make_calib_row(&frame, dynamics_result.as_ref()),
-                                        );
-                                        if rec_status.active && !rec_status.paused {
-                                            let _ = bg_sqlite.insert_snapshot(
-                                                &rec_status.session_id,
-                                                frame.sequence,
-                                                frame.received_at_ms,
-                                                &frame.device_id,
-                                                &frame,
-                                            );
-                                            if let Some(output) = &dynamics_result {
-                                                let _ = bg_sqlite.insert_dynamics_output(
-                                                    &rec_status.session_id,
-                                                    frame.sequence,
-                                                    frame.received_at_ms,
-                                                    &frame.device_id,
-                                                    output,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Ok(mut ring) = bg_live_ring.lock() {
-                                    ring.push(frame);
-                                }
-                            }
-                        }
-                    }
-                })
-                .expect("failed to spawn device poller");
 
             Ok(())
         })
@@ -4052,3 +4146,521 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+
+
+/* ── server 模式：无 GUI 的 HTTP 网关 ─────────────────────────────────
+ * 前端原来走 Tauri IPC：invoke(cmd, args)。
+ * 这里换成 POST /rpc  {"cmd":"...","args":{...}}，复用同一批命令函数。
+ *
+ * 为什么不需要 WebSocket：前端全程轮询（fetch_live_latest 500ms、
+ * fetch_live_window 100ms），没有任何事件订阅，请求-响应模型就够。
+ *
+ * 为什么手写 HTTP/1.1 而不用 axum+tokio：只要一个端点，引入它们会多出
+ * 上百个依赖和几百 MB 磁盘，而本机磁盘紧张。std 足够。
+ * ──────────────────────────────────────────────────────────────────── */
+
+#[cfg(not(feature = "desktop"))]
+#[derive(Clone, Copy)]
+pub struct State<'a, T>(pub &'a T);
+
+#[cfg(not(feature = "desktop"))]
+impl<'a, T> std::ops::Deref for State<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0
+    }
+}
+
+/// `device_id` → `deviceId`。Tauri 会把 JS 的 camelCase 映射到 Rust 的
+/// snake_case，网关必须做同样的事，否则这些参数一律反序列化失败。
+#[cfg(not(feature = "desktop"))]
+fn to_camel(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            upper = true;
+            continue;
+        }
+        if upper {
+            out.extend(ch.to_uppercase());
+            upper = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "desktop"))]
+fn arg_value<'a>(args: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
+    if let Some(v) = args.get(name) {
+        return Some(v);
+    }
+    let camel = to_camel(name);
+    if camel != name {
+        args.get(&camel)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(feature = "desktop"))]
+fn arg<T: serde::de::DeserializeOwned>(args: &serde_json::Value, name: &str) -> Result<T, String> {
+    let v = arg_value(args, name).ok_or_else(|| format!("缺少参数 `{name}`"))?;
+    serde_json::from_value(v.clone()).map_err(|e| format!("参数 `{name}` 解析失败：{e}"))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn arg_opt<T: serde::de::DeserializeOwned>(
+    args: &serde_json::Value,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match arg_value(args, name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => serde_json::from_value(v.clone())
+            .map(Some)
+            .map_err(|e| format!("参数 `{name}` 解析失败：{e}")),
+    }
+}
+
+/// 命令分发：74 个分支与 `#[tauri::command]` 函数一一对应。
+#[cfg(not(feature = "desktop"))]
+fn dispatch(
+    state: &AppState,
+    cmd: &str,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let st = State(state);
+    match cmd {
+        "model_status" => {
+            serde_json::to_value(model_status()).map_err(|e| e.to_string())
+        }
+        "import_model" => {
+            let bytes: Vec<u8> = arg(args, "bytes")?;
+            let name: Option<String> = arg_opt(args, "name")?;
+            import_model(bytes, name).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "reset_model" => {
+            reset_model().and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "lookup_tip_pose_shape" => {
+            let request: TipPoseShapeRequest = arg(args, "request")?;
+            lookup_tip_pose_shape(request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "app_info" => {
+            serde_json::to_value(app_info()).map_err(|e| e.to_string())
+        }
+        "current_auth_session" => {
+            current_auth_session(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "login" => {
+            let request: auth::LoginRequest = arg(args, "request")?;
+            login(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "logout" => {
+            logout(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "list_users" => {
+            list_users(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "create_user" => {
+            let request: auth::CreateUserRequest = arg(args, "request")?;
+            create_user(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "change_password" => {
+            let request: auth::ChangePasswordRequest = arg(args, "request")?;
+            change_password(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "set_user_disabled" => {
+            let username: String = arg(args, "username")?;
+            let disabled: bool = arg(args, "disabled")?;
+            set_user_disabled(st, username, disabled).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "bootstrap_state" => {
+            serde_json::to_value(bootstrap_state(st)).map_err(|e| e.to_string())
+        }
+        "tick_snapshot" => {
+            serde_json::to_value(tick_snapshot(st)).map_err(|e| e.to_string())
+        }
+        "toggle_connection" => {
+            serde_json::to_value(toggle_connection(st)).map_err(|e| e.to_string())
+        }
+        "set_theme" => {
+            let theme: ThemeMode = arg(args, "theme")?;
+            serde_json::to_value(set_theme(st, theme)).map_err(|e| e.to_string())
+        }
+        "update_settings" => {
+            let settings: SettingsState = arg(args, "settings")?;
+            update_settings(st, settings).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "export_diagnostics_bundle" => {
+            export_diagnostics_bundle(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "preview_legacy_migration" => {
+            let source_dir: String = arg(args, "source_dir")?;
+            let target_dir: Option<String> = arg_opt(args, "target_dir")?;
+            preview_legacy_migration(st, source_dir, target_dir).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "run_legacy_migration" => {
+            let source_dir: String = arg(args, "source_dir")?;
+            let target_dir: Option<String> = arg_opt(args, "target_dir")?;
+            run_legacy_migration(st, source_dir, target_dir).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "list_serial_ports" => {
+            list_serial_ports().and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "list_connected_devices" => {
+            list_connected_devices(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "connect_device" => {
+            let request: ConnectDeviceRequest = arg(args, "request")?;
+            connect_device(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "disconnect_device" => {
+            let device_id: String = arg(args, "device_id")?;
+            disconnect_device(st, device_id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "fetch_live_window" => {
+            let count: u32 = arg(args, "count")?;
+            serde_json::to_value(fetch_live_window(st, count)).map_err(|e| e.to_string())
+        }
+        "fetch_live_stats" => {
+            serde_json::to_value(fetch_live_stats(st)).map_err(|e| e.to_string())
+        }
+        "fetch_live_latest" => {
+            serde_json::to_value(fetch_live_latest(st)).map_err(|e| e.to_string())
+        }
+        "device_runtime_status" => {
+            let device_id: String = arg(args, "device_id")?;
+            device_runtime_status(st, device_id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "submit_system_control" => {
+            let request: SystemControlRequest = arg(args, "request")?;
+            submit_system_control(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_motor_command" => {
+            let request: MotorControlRequest = arg(args, "request")?;
+            send_motor_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_home_command" => {
+            let request: HomeCommandRequest = arg(args, "request")?;
+            send_home_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_multi_motor_command" => {
+            let request: MultiMotorCommandRequest = arg(args, "request")?;
+            send_multi_motor_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_curvature_command" => {
+            let request: CurvatureCommandRequest = arg(args, "request")?;
+            send_curvature_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_tip_pose_command" => {
+            let request: TipPoseCommandRequest = arg(args, "request")?;
+            send_tip_pose_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "calibrate_sensor" => {
+            let request: SensorCalibrationRequest = arg(args, "request")?;
+            calibrate_sensor(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_bend_command" => {
+            let request: BendCommandRequest = arg(args, "request")?;
+            send_bend_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "send_active_control_tick" => {
+            let request: ActiveControlRequest = arg(args, "request")?;
+            send_active_control_tick(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "control_runtime_status" => {
+            control_runtime_status(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "update_pid_control" => {
+            let config: control::PidConfig = arg(args, "config")?;
+            update_pid_control(st, config).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "configure_cycle_life" => {
+            let config: control::CycleLifeConfig = arg(args, "config")?;
+            configure_cycle_life(st, config).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "start_cycle_life" => {
+            let request: CycleLifeStartRequest = arg(args, "request")?;
+            start_cycle_life(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "stop_cycle_life" => {
+            let reason: Option<String> = arg_opt(args, "reason")?;
+            stop_cycle_life(st, reason).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "dynamics_status" => {
+            dynamics_status(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "compute_live_dynamics" => {
+            compute_live_dynamics(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "compute_dynamics_snapshot" => {
+            compute_dynamics_snapshot(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "update_dynamics_config" => {
+            let config: dynamics::DynamicsConfig = arg(args, "config")?;
+            update_dynamics_config(st, config).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "reset_dynamics" => {
+            reset_dynamics(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "start_recording" => {
+            let name: Option<String> = arg_opt(args, "name")?;
+            start_recording(st, name).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "stop_recording" => {
+            stop_recording(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "pause_recording" => {
+            pause_recording(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "resume_recording" => {
+            resume_recording(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "recorder_status" => {
+            serde_json::to_value(recorder_status(st)).map_err(|e| e.to_string())
+        }
+        "list_sessions" => {
+            serde_json::to_value(list_sessions(st)).map_err(|e| e.to_string())
+        }
+        "playback_load" => {
+            let session_id: String = arg(args, "session_id")?;
+            playback_load(st, session_id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_play" => {
+            playback_play(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_pause" => {
+            playback_pause(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_stop" => {
+            playback_stop(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_step_frame" => {
+            let delta: i64 = arg(args, "delta")?;
+            playback_step_frame(st, delta).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_seek" => {
+            let ms: u64 = arg(args, "ms")?;
+            playback_seek(st, ms).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_set_speed" => {
+            let speed: f64 = arg(args, "speed")?;
+            playback_set_speed(st, speed).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_recent_window" => {
+            let window_ms: u64 = arg(args, "window_ms")?;
+            playback_recent_window(st, window_ms).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_commands" => {
+            playback_commands(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "playback_status" => {
+            serde_json::to_value(playback_status(st)).map_err(|e| e.to_string())
+        }
+        "playback_get_frame" => {
+            serde_json::to_value(playback_get_frame(st)).map_err(|e| e.to_string())
+        }
+        "playback_get_window" => {
+            let count: u32 = arg(args, "count")?;
+            serde_json::to_value(playback_get_window(st, count)).map_err(|e| e.to_string())
+        }
+        "delete_session" => {
+            let id: String = arg(args, "id")?;
+            delete_session(st, id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "rename_session" => {
+            let id: String = arg(args, "id")?;
+            let name: String = arg(args, "name")?;
+            rename_session(st, id, name).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "update_session_metadata" => {
+            let id: String = arg(args, "id")?;
+            let meta: session::SessionMetadata = arg(args, "meta")?;
+            update_session_metadata(st, id, meta).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "export_session_csv" => {
+            let id: String = arg(args, "id")?;
+            let output_path: Option<String> = arg_opt(args, "output_path")?;
+            export_session_csv(st, id, output_path).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "read_session_frames" => {
+            let id: String = arg(args, "id")?;
+            let max_count: Option<u32> = arg_opt(args, "max_count")?;
+            read_session_frames(st, id, max_count).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "export_chart_csv" => {
+            let session_id: Option<String> = arg_opt(args, "session_id")?;
+            let channel_names: Vec<String> = arg(args, "channel_names")?;
+            let max_count: Option<u32> = arg_opt(args, "max_count")?;
+            export_chart_csv(st, session_id, channel_names, max_count).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "list_connection_profiles" => {
+            serde_json::to_value(list_connection_profiles(st)).map_err(|e| e.to_string())
+        }
+        "save_connection_profile" => {
+            let profile: profiles::ConnectionProfile = arg(args, "profile")?;
+            save_connection_profile(st, profile).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "delete_connection_profile" => {
+            let id: String = arg(args, "id")?;
+            delete_connection_profile(st, id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "webserial_open" => {
+            let port_name: String = arg(args, "port_name")?;
+            let baud_rate: Option<u32> = arg_opt(args, "baud_rate")?;
+            let device_name: Option<String> = arg_opt(args, "device_name")?;
+            webserial_open(st, port_name, baud_rate, device_name)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "webserial_push" => {
+            let port_name: String = arg(args, "port_name")?;
+            let bytes: Vec<u8> = arg(args, "bytes")?;
+            webserial_push(port_name, bytes)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "webserial_take_tx" => {
+            let port_name: String = arg(args, "port_name")?;
+            webserial_take_tx(port_name)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "webserial_close" => {
+            let port_name: String = arg(args, "port_name")?;
+            webserial_close(st, port_name)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        other => Err(format!("未知命令：{other}")),
+    }
+}
+
+#[cfg(not(feature = "desktop"))]
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(not(feature = "desktop"))]
+fn write_json(stream: &mut std::net::TcpStream, status: u16, body: &str) {
+    use std::io::Write;
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Cache-Control: no-store\r\n\r\n",
+        body.as_bytes().len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.flush();
+}
+
+#[cfg(not(feature = "desktop"))]
+fn handle_rpc(stream: &mut std::net::TcpStream, state: &Arc<AppState>) {
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 16384];
+    let header_end = loop {
+        match stream.read(&mut tmp) {
+            Ok(0) => return,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return,
+        }
+        if let Some(pos) = find_header_end(&buf) {
+            break pos + 4;
+        }
+        if buf.len() > 128 * 1024 {
+            return;
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split(' ');
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+
+    if method == "GET" && path == "/health" {
+        return write_json(
+            stream,
+            200,
+            "{\"ok\":true,\"data\":{\"status\":\"up\",\"mode\":\"server\"}}",
+        );
+    }
+    if method != "POST" || path != "/rpc" {
+        return write_json(stream, 200, "{\"ok\":false,\"error\":\"only POST /rpc\"}");
+    }
+
+    let mut body = buf[header_end..].to_vec();
+    while body.len() < content_length {
+        match stream.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            Err(_) => break,
+        }
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            let payload = serde_json::json!({ "ok": false, "error": format!("请求体不是合法 JSON：{error}") });
+            return write_json(stream, 200, &payload.to_string());
+        }
+    };
+    let cmd = parsed.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+    let args = parsed
+        .get("args")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let payload = match dispatch(state, cmd, &args) {
+        Ok(data) => serde_json::json!({ "ok": true, "data": data }),
+        Err(error) => serde_json::json!({ "ok": false, "error": error }),
+    };
+    write_json(stream, 200, &payload.to_string());
+}
+
+/// server 模式入口：绑定 127.0.0.1:8787，只暴露 POST /rpc 与 GET /health。
+#[cfg(not(feature = "desktop"))]
+pub fn run_server() {
+    let addr = std::env::var("SOFTUI_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
+    let state_path = std::env::var("SOFTUI_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+
+    let app_state = Arc::new(AppState::new(state_path));
+    spawn_device_poller(&app_state);
+
+    let listener = match std::net::TcpListener::bind(&addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("[softui-server] 无法绑定 {addr}：{error}");
+            std::process::exit(1);
+        }
+    };
+    println!("[softui-server] 监听 http://{addr}  (POST /rpc, GET /health)");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let shared = app_state.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_nodelay(true);
+                    handle_rpc(&mut stream, &shared);
+                });
+            }
+            Err(_) => continue,
+        }
+    }
+}

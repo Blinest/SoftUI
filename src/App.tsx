@@ -247,7 +247,6 @@ function LoginPage({
               <CheckCircle2 size={16} />
               <span>{busy ? "登录中" : "登录"}</span>
             </button>
-            <div className="auth-hint">首次安装默认管理员为 admin / admin123，登录后必须修改密码。</div>
           </form>
         ) : (
           <form className="auth-form" onSubmit={submitPasswordChange}>
@@ -426,12 +425,15 @@ function AppShell() {
       // Fetch runtime status for each device (skip simulator)
       const statuses: Record<string, DeviceRuntimeStatusView> = {};
       for (const d of devices) {
-        if (d.deviceId.startsWith("serial:")) {
-          try {
-            const s = await invoke<DeviceRuntimeStatusView>("device_runtime_status", { deviceId: d.deviceId });
-            statuses[d.deviceId] = s;
-          } catch { /* ignore */ }
-        }
+        // 只跳过内置模拟设备。真实设备都要取状态 —— 包括 Web Serial 接入的
+        // 设备（deviceId 是业务名如 TDCR_v1，不再以 "serial:" 开头）。
+        // 原来按前缀过滤，会把 Web Serial 设备一起漏掉，它的帧数/错误数永远不更新。
+        const isSimulator = d.deviceId.includes("simulator") || d.portName === "simulator";
+        if (isSimulator) continue;
+        try {
+          const s = await invoke<DeviceRuntimeStatusView>("device_runtime_status", { deviceId: d.deviceId });
+          statuses[d.deviceId] = s;
+        } catch { /* ignore */ }
       }
       setDeviceStatuses(statuses);
     } catch { /* ignore */ }
