@@ -220,15 +220,6 @@ impl DeviceRegistry {
     }
 
     pub fn poll_all(&mut self) -> Vec<DevicePollResult> {
-        // 自愈：一台设备都没有时把模拟设备补回来。
-        // 光在 webserial_close 里补是不够的 —— 前端若异常退出、端口被系统
-        // 拔掉、或连接过程中抛错没走到 disconnect，这里就没人补了，
-        // 结果界面上一台设备都没有、曲线全停（实际遇到过）。
-        // poll_all 每 50ms 跑一次，放在这里是最可靠的位置。
-        if self.records.is_empty() {
-            let _ = self.seed_simulator();
-        }
-
         let mut results = Vec::new();
         let device_ids = self.records.keys().cloned().collect::<Vec<_>>();
 
@@ -327,6 +318,13 @@ impl DeviceRegistry {
         }
 
         results
+    }
+
+    /// 当前是否有模拟设备在线。
+    pub fn has_simulator(&self) -> bool {
+        self.records
+            .values()
+            .any(|record| record.port_name == "simulator")
     }
 
     /// 是否还有真实的（非模拟）设备接入。

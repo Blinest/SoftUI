@@ -604,6 +604,8 @@ export function WorkspacePage({
       }
     };
     window.addEventListener("softui:remote-ui", onRemoteUi);
+    // 挂载（或从别的页切回来）时补要一次：桩早早派发的那批事件在本组件挂载前就丢了
+    window.dispatchEvent(new CustomEvent("softui:ui-resync"));
     return () => window.removeEventListener("softui:remote-ui", onRemoteUi);
   }, [handleDragTarget]);
 
@@ -645,6 +647,41 @@ export function WorkspacePage({
     },
     [publishUi],
   );
+
+  /**
+   * 响应别端的重发请求：把本端全部 UI 状态再发布一遍。
+   *
+   * 同步槽位是纯内存的，网关重启即清空。新端加入时若后端已经空了，
+   * 只有老端重新发布才能把状态补齐 —— 否则要手动碰每个控件才同步。
+   */
+  useEffect(() => {
+    const onRepublish = () => {
+      publishUi("drag", dragTarget);
+      publishUi("dragEnabled", dragEnabled);
+      publishUi("lockTipPose", lockTipPose);
+      publishUi("tip", tipDraft);
+      publishUi("tipTargetActive", tipTargetActive);
+      publishUi("motor", motorDraft);
+      publishUi("sensorDraft", sensorDraft);
+      publishUi("pidDraft", pidDraft);
+      publishUi("cycleParams", {
+        low: cycleLowThreshold,
+        high: cycleHighThreshold,
+        target: cycleTargetPosition,
+      });
+      publishUi("sensorThreshold", sensorThreshold);
+      publishUi("tipDriftTolerance", tipDriftToleranceMm);
+      publishUi("cycleLifeEnabled", cycleLifeEnabled);
+      publishUi("activeControlEnabled", activeControlEnabled);
+    };
+    window.addEventListener("softui:ui-republish", onRepublish);
+    return () => window.removeEventListener("softui:ui-republish", onRepublish);
+  }, [
+    publishUi, dragTarget, dragEnabled, lockTipPose, tipDraft, tipTargetActive,
+    motorDraft, sensorDraft, pidDraft, cycleLowThreshold, cycleHighThreshold,
+    cycleTargetPosition, sensorThreshold, tipDriftToleranceMm, cycleLifeEnabled,
+    activeControlEnabled,
+  ]);
 
   /** PID 三个参数：整份下发，避免差分漏帧导致对端错位。 */
   const applyPidDraft = useCallback(

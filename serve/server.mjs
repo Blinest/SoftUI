@@ -242,6 +242,13 @@ const server = http.createServer((req, res) => {
     if (fs.statSync(filePath).isDirectory()) filePath = path.join(filePath, "index.html");
     fs.statSync(filePath);
   } catch {
+    // 带扩展名的请求（.js/.css/.png…）找不到就老实 404。
+    // 以前一律回退到 index.html，结果缺失的脚本会返回一段 HTML，
+    // 浏览器把它当 JS 执行 —— 报错信息完全指不到真正的原因（实际踩到过）。
+    if (path.extname(urlPath)) {
+      return send(res, 404, { "content-type": "text/plain; charset=utf-8" }, `not found: ${urlPath}`);
+    }
+    // 只有无扩展名的前端路由才回退到首页
     filePath = path.join(ROOT, "index.html");
     try {
       fs.statSync(filePath);

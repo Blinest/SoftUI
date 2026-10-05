@@ -566,7 +566,19 @@
     return out;
   }
 
-  function doRpc(cmd, args) {
+  /* 这些命令只在服务端有意义，**绝不能**退回浏览器仿真：
+   * 仿真根本不认识它们，只能返回一个快照副本 —— 调用方会以为"成功了"，
+   * 实际这次数据变更被静默丢弃（实测踩到过：网络一抖，同步就永久停在旧值）。
+   * 只有真正的界面渲染类命令（bootstrap_state / fetch_live_* 等）才该有兜底。 */
+  var NO_FALLBACK_CMDS = {
+    ui_publish: 1, ui_state: 1, ui_wait: 1,
+    drag_publish: 1, drag_latest: 1,
+    sync_poll: 1, sync_emit: 1, sync_hello: 1,
+    webserial_open: 1, webserial_push: 1, webserial_take_tx: 1, webserial_close: 1,
+    simulator_start: 1, simulator_stop: 1,
+  };
+
+  function doRpc(cmd, args, noFallback) {
     lastCalls.push({ cmd: cmd, args: args, at: nowMs() });
     if (lastCalls.length > 200) lastCalls.shift();
 
@@ -592,6 +604,12 @@
       .catch(function (error) {
         if (error && error.__appError) {
           backend.errors += 1;
+          throw error;
+        }
+        // 服务端专属命令：把失败如实抛出去，让调用方重试，而不是假装成功
+        if (noFallback || NO_FALLBACK_CMDS[cmd]) {
+          backend.errors += 1;
+          backend.lastError = String((error && error.message) || error);
           throw error;
         }
         // 传输层失败（Rust 服务没起、网络断）→ 退回浏览器仿真，界面不至于白掉
@@ -748,35 +766,80 @@
    * ─────────────────────────────────────────────────────────────── */
   var wsActive = null;
   var wsRxBuf = [];
-  var wsPumpTimer = null;
+
+  var WS_SEQ = 0;             // 接收块序号：后端按它去重，重试因此是安全的
+  var wsPushPending = null;   // 待发送/重试中的块
+  var wsFlushTimer = null;    // 接收侧的定时冲刷
 
   function wsFlushRx() {
-    if (!wsActive || wsRxBuf.length === 0) return;
-    var bytes = wsRxBuf;
+    if (!wsActive || !wsActive.running) return;
+    if (wsPushPending) return; // 上一块还在重试，先攒着
+    if (wsRxBuf.length === 0) return;
+    var bytes = wsRxBuf.slice();
     wsRxBuf = [];
-    doRpc("webserial_push", { portName: wsActive.name, bytes: bytes }).catch(function (e) {
-      console.warn("[webserial] 推字节失败:", e && e.message);
-    });
+    wsPushPending = { name: wsActive.name, seq: ++WS_SEQ, bytes: bytes, tries: 0 };
+    sendRxChunk();
   }
 
-  function wsPumpTick() {
+  /**
+   * 送出一块接收字节，失败就带**同一个 seq** 重试。
+   *
+   * 原来是把缓冲清空后才发、失败直接扔 —— 一次网络抖动就凭空截断一帧，
+   * 后端表现为 InvalidChecksum。实测曾出现 131 个校验错 / 43 个有效帧。
+   * 现在后端按 seq 去重，重复到达会被忽略，所以重试不会让数据重复。
+   */
+  function sendRxChunk() {
+    var chunk = wsPushPending;
+    if (!chunk) return;
+    doRpc("webserial_push", { portName: chunk.name, seq: chunk.seq, bytes: chunk.bytes }, true)
+      .then(function () {
+        wsPushPending = null;
+        if (wsRxBuf.length) wsFlushRx();
+      })
+      .catch(function (error) {
+        chunk.tries += 1;
+        if (chunk.tries % 10 === 1) {
+          console.warn("[webserial] 推字节失败，重试中:", error && error.message);
+        }
+        setTimeout(sendRxChunk, 150);
+      });
+  }
+
+  /**
+   * 取后端待发命令 —— **挂起式长轮询**，替代原来每 20ms 一次的轮询。
+   *
+   * 原来 wsPumpTick 每 20ms 发两个请求（take_tx + 可能的 push），
+   * 等于 100 req/s；在往返 100ms 的隧道上必然大面积失败，
+   * 而接收字节又恰好在同一个循环里发 —— 失败就连带把字节丢掉。
+   * 改成挂起后，空闲时链路上只有一个未完成的请求。
+   */
+  function wsTxLoop() {
     if (!wsActive || !wsActive.running) return;
-    wsFlushRx();
-    doRpc("webserial_take_tx", { portName: wsActive.name })
+    doRpc("webserial_wait_tx", { portName: wsActive.name, timeoutMs: 15000 }, true)
       .then(function (bytes) {
-        if (!bytes || bytes.length === 0 || !wsActive || !wsActive.running) return;
+        if (!wsActive || !wsActive.running) return;
+        if (!bytes || bytes.length === 0) return;
         var writable = wsActive.port.writable;
         if (!writable) return;
         var writer = writable.getWriter();
         return writer
           .write(new Uint8Array(bytes))
-          .then(function () { writer.releaseLock(); })
-          .catch(function (e) {
-            try { writer.releaseLock(); } catch (ignored) {}
-            console.warn("[webserial] 写串口失败:", e && e.message);
-          });
+          .then(
+            function () { writer.releaseLock(); },
+            function (error) {
+              try { writer.releaseLock(); } catch (ignored) {}
+              console.warn("[webserial] 写串口失败:", error && error.message);
+            },
+          );
       })
-      .catch(function () { /* 后端暂时不可达，下一拍再试 */ });
+      .catch(function (error) {
+        if (wsActive && wsActive.running) {
+          console.warn("[webserial] 取命令失败:", error && error.message);
+        }
+      })
+      .then(function () {
+        if (wsActive && wsActive.running) wsTxLoop();
+      });
   }
 
   function wsStartRead() {
@@ -812,6 +875,25 @@
     })();
   }
 
+  /* ── 页面卸载时清理串口通道 ──────────────────────────────────────────
+   * Web Serial 的端口对象属于**当前页面**，刷新/关闭即释放。但后端不知道，
+   * 于是留下一个永远收不到字节的"僵尸设备"：界面显示已连接，实际没数据，
+   * 新加入的端也跟着看不到任何东西（实测踩到过，排查了很久）。
+   * 用 sendBeacon 发一个 keepalive 请求关掉它 —— 普通 fetch 在卸载时会
+   * 被浏览器取消，sendBeacon 不会。
+   * ─────────────────────────────────────────────────────────────────── */
+  window.addEventListener("pagehide", function () {
+    if (!wsActive) return;
+    var name = wsActive.name;
+    wsActive.running = false;
+    try {
+      var payload = JSON.stringify({ cmd: "webserial_close", args: { portName: name } });
+      navigator.sendBeacon("/rpc", new Blob([payload], { type: "application/json" }));
+    } catch (error) {
+      /* 卸载阶段尽力而为，失败就算了 */
+    }
+  });
+
   function wsConnect(index, baudRate) {
     var port = wsPorts[index];
     if (!port) {
@@ -833,9 +915,12 @@
       })
       .then(function (record) {
         wsActive = { index: index, name: name, port: port, running: true };
+        wsPushPending = null;
+        WS_SEQ = 0;
         wsStartRead();
-        if (wsPumpTimer) clearInterval(wsPumpTimer);
-        wsPumpTimer = setInterval(wsPumpTick, 20);
+        wsTxLoop(); // 命令：挂起式长轮询，不再 20ms 一轮
+        if (wsFlushTimer) clearInterval(wsFlushTimer);
+        wsFlushTimer = setInterval(wsFlushRx, 50); // 接收：有数据才发，50ms 一拍
         console.info("[webserial] 已打开本机串口 " + name + " @ " + baud);
         return record;
       })
@@ -862,7 +947,8 @@
     var name = wsActive.name;
     var port = wsActive.port;
     wsActive.running = false;
-    if (wsPumpTimer) { clearInterval(wsPumpTimer); wsPumpTimer = null; }
+    if (wsFlushTimer) { clearInterval(wsFlushTimer); wsFlushTimer = null; }
+    wsPushPending = null;
     wsFlushRx();
     wsActive = null;
     return doRpc("webserial_close", { portName: name })
@@ -954,9 +1040,26 @@
    * 速率自适应：有人在动时 50ms，空闲 1s —— 拖动是连续流，空闲时不该占带宽。
    * 自己写的那份按 from 跳过，天然防回环。
    * ─────────────────────────────────────────────────────────────────── */
+  /* 模拟设备是否在线：徽标上的「模拟数据」按钮据此显示开/关。 */
+  var SIM_ON = null;
+
+  function refreshSimState() {
+    doRpc("list_connected_devices", {})
+      .then(function (devices) {
+        SIM_ON = Array.isArray(devices)
+          ? devices.some(function (d) { return d.portName === "simulator"; })
+          : null;
+      })
+      .catch(function () {});
+  }
+
   var UI_SEEN = {};          // key -> 已应用的 seq
+  var UI_REMOTE = {};        // key -> 最近一次收到的别端值（用于补发）
+  var UI_LOCAL = {};         // key -> 本端是否改过（改过就不再用远端值覆盖）
   var UI_PUB = 0;            // 本端发布次数
   var UI_RECV = 0;           // 收到别端次数
+  var UI_TOTAL = 0;          // 后端当前拥有的槽位数（进度分母）
+  var UI_LAST_RECV_AT = 0;   // 最近一次收到远端值的时刻
   var UI_BOOST_UNTIL = 0;
 
   /* 本端改动的发送策略：**合并 + 限频**。
@@ -987,12 +1090,24 @@
       delete UI_PENDING[key];
       UI_INFLIGHT[key] = (UI_INFLIGHT[key] || 0) + 1;
       UI_PUB += 1;
-      doRpc("ui_publish", { clientId: SYNC_ID, key: key, payload: payload })
-        .catch(function () {})
-        .then(function () {
+      doRpc("ui_publish", { clientId: SYNC_ID, key: key, payload: payload }).then(
+        function () {
           UI_INFLIGHT[key] -= 1;
           if (Object.prototype.hasOwnProperty.call(UI_PENDING, key)) scheduleFlush();
-        });
+        },
+        function (error) {
+          UI_INFLIGHT[key] -= 1;
+          // 失败必须把值放回队列重试。原来发之前就 delete 掉、失败又不管，
+          // 一次网络抖动就让这次改动**永久丢失** —— 对端停在旧值上，
+          // 必须手动再动一次才同步（这就是"显示已同步但数据是上一轮的"根因）。
+          // 期间如果用户已经改了新值，用新值，别用旧的覆盖。
+          if (!Object.prototype.hasOwnProperty.call(UI_PENDING, key)) {
+            UI_PENDING[key] = payload;
+          }
+          console.warn("[softui] 同步发布失败，已排队重试:", key, error && error.message);
+          scheduleFlush();
+        },
+      );
     });
   }
 
@@ -1001,6 +1116,7 @@
     var detail = (event && event.detail) || {};
     if (!detail.key) return;
     UI_PENDING[detail.key] = detail.payload === undefined ? null : detail.payload;
+    UI_LOCAL[detail.key] = true; // 本端改过这个键，补发时不再用远端值覆盖它
     scheduleFlush();
   });
 
@@ -1013,11 +1129,23 @@
       .then(function (res) {
         if (res && typeof res.seq === "number") UI_GLOBAL_SEQ = res.seq;
         var entries = (res && res.entries) || {};
+        // 进度分母：后端当前真实持有的槽位数（排除纯信号键）
+        var counted = Object.keys(entries).filter(function (key) {
+          return key !== "deviceChange" && key !== UI_RESYNC_KEY;
+        }).length;
+        if (counted > UI_TOTAL) UI_TOTAL = counted;
         Object.keys(entries).forEach(function (key) {
           var entry = entries[key];
           if (!entry || entry.from === SYNC_ID) return;
           if (UI_SEEN[key] === entry.seq) return;
           UI_SEEN[key] = entry.seq;
+          UI_LAST_RECV_AT = Date.now();
+          // 别端请求重发：本端组件把自己的当前状态再发布一遍
+          if (key === UI_RESYNC_KEY) {
+            window.dispatchEvent(new CustomEvent("softui:ui-republish"));
+            return;
+          }
+          UI_REMOTE[key] = entry.payload;
           UI_RECV += 1;
           UI_BOOST_UNTIL = Date.now() + 1200;
           window.dispatchEvent(
@@ -1031,11 +1159,45 @@
         return new Promise(function (resolve) { setTimeout(resolve, 1000); });
       })
       .then(function () {
-        uiTick();
+        // 就地判断：调度这一刻是否还有人在动。
+        // 最小间隔 30ms —— 长轮询一旦立刻返回（后端异常、seq 落后、代理瞬断），
+        // 不加下限就会退化成毫秒级忙轮询，把服务端打满。宁可慢一点也不能打爆。
+        var fast = Date.now() < UI_BOOST_UNTIL;
+        setTimeout(uiTick, fast ? 30 : 1000);
       });
   }
 
-  setTimeout(uiTick, 900);
+  /**
+   * 补发：组件挂载时主动要一次当前远端状态。
+   *
+   * 为什么必须补发：桩在页面加载后约 900ms 就开始派发远端值，而 WorkspacePage
+   * 要等登录完成、再切到工作台才挂载 —— 那时的派发全被丢掉了。
+   * 表现就是"新设备打开看不到当前状态，必须旧设备再动一次才同步"。
+   *
+   * 只补发**本端没改过**的键，避免把用户的新操作覆盖回旧值。
+   */
+  var UI_RESYNC_KEY = "resyncRequest";
+
+  window.addEventListener("softui:ui-resync", function () {
+    // ① 先用本地缓存的远端值补一遍
+    Object.keys(UI_REMOTE).forEach(function (key) {
+      if (UI_LOCAL[key]) return;
+      window.dispatchEvent(
+        new CustomEvent("softui:remote-ui", { detail: { key: key, payload: UI_REMOTE[key] } }),
+      );
+    });
+    // ② 再请其它端重新发布一次。
+    //    为什么必要：同步槽位是**纯内存**的，网关一重启就全没了。
+    //    这时新加入的端从后端什么都拿不到，只有老端重新发布才能补齐 ——
+    //    否则必须手动去碰每一个控件，这正是"更新好几次才对"的来源。
+    doRpc("ui_publish", {
+      clientId: SYNC_ID,
+      key: UI_RESYNC_KEY,
+      payload: Date.now(),
+    }).catch(function () {});
+  });
+
+  setTimeout(uiTick, 300); // 早一点开始拉，少一点"打开后空等"
 
   var windowInFlight = null;
   var windowLast = null;
@@ -1106,7 +1268,7 @@
   };
 
   window.__SOFTUI_SHIM__ = {
-    version: 9.0,
+    version: 10.0,
     calls: function () { return lastCalls.slice(); },
     snapshot: function () { return clone(snapshot); },
   };
@@ -1115,36 +1277,138 @@
    * 存在的意义：让"数据到底有没有在动"变成肉眼可判断的事，
    * 不用开控制台猜。计数器在跳 = 仿真在送帧；不动 = 桩没加载或被浏览器缓存了旧版。
    * 用 ?badge=0 关掉。 */
+  /* ── 状态徽标：默认收缩成小球，避免遮挡内容 ────────────────────────
+   * 常驻的横条会压住右下角的界面元素（尤其是工作台的卡片）。改成：
+   *   - 默认显示一个 16px 小圆球，颜色即状态（绿=真后端 / 黄=仿真兜底 / 灰=未知）
+   *   - 点球展开完整信息与「模拟数据」按钮，展开后 6 秒无操作自动收回
+   *   - 鼠标移出面板 1.2 秒后收回，不用手动点
+   * ─────────────────────────────────────────────────────────────── */
   function mountBadge() {
     if (/[?&]badge=0\b/.test(location.search)) return;
+
     var el = document.createElement("div");
     el.id = "softui-shim-badge";
     el.style.cssText = [
       "position:fixed", "right:10px", "bottom:10px", "z-index:2147483647",
-      "padding:6px 10px", "border-radius:8px",
-      "background:rgba(16,18,24,.82)", "color:#e6e8ef",
       "font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace",
-      "border:1px solid rgba(255,255,255,.14)", "pointer-events:none",
-      "letter-spacing:.2px", "white-space:nowrap",
+      "letter-spacing:.2px",
     ].join(";");
+
+    var ball = document.createElement("button");
+    ball.type = "button";
+    ball.title = "运行状态（点击展开）";
+    ball.setAttribute("aria-label", "展开运行状态");
+    ball.style.cssText =
+      "pointer-events:auto;cursor:pointer;display:block;margin-left:auto;" +
+      "width:16px;height:16px;padding:0;border-radius:50%;" +
+      "border:1px solid rgba(255,255,255,.45);background:#8b949e;" +
+      "box-shadow:0 2px 8px rgba(0,0,0,.35);transition:opacity 160ms ease";
+
+    var panel = document.createElement("div");
+    panel.style.cssText =
+      "display:none;align-items:center;padding:6px 10px;border-radius:8px;" +
+      "background:rgba(16,18,24,.82);color:#e6e8ef;pointer-events:auto;" +
+      "border:1px solid rgba(255,255,255,.14);white-space:nowrap";
+
+    var label = document.createElement("span");
+    var simButton = document.createElement("button");
+    simButton.type = "button";
+    simButton.style.cssText =
+      "margin-left:8px;cursor:pointer;font:inherit;padding:1px 7px;" +
+      "border-radius:4px;color:inherit;background:transparent;" +
+      "border:1px solid rgba(255,255,255,.28)";
+    simButton.addEventListener("click", function () {
+      var next = SIM_ON ? "simulator_stop" : "simulator_start";
+      simButton.disabled = true;
+      simButton.textContent = "切换中…";
+      doRpc(next, {})
+        .then(function (value) {
+          SIM_ON = !!value;
+          refreshSimState();
+          window.dispatchEvent(new CustomEvent("softui:ui-resync"));
+        })
+        .catch(function (error) {
+          console.warn("[softui] 切换模拟数据失败:", error && error.message);
+        })
+        .then(function () {
+          simButton.disabled = false;
+        });
+    });
+    panel.appendChild(label);
+    panel.appendChild(simButton);
+    el.appendChild(ball);
+    el.appendChild(panel);
+
+    var hideTimer = null;
+    function collapse() {
+      panel.style.display = "none";
+      ball.style.display = "block";
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    }
+    function expand() {
+      ball.style.display = "none";
+      panel.style.display = "inline-flex";
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(collapse, 6000); // 展开后 6 秒无操作自动收回
+    }
+    ball.addEventListener("click", function (event) {
+      event.stopPropagation();
+      expand();
+    });
+    panel.addEventListener("mouseenter", function () {
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    });
+    panel.addEventListener("mouseleave", function () {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(collapse, 1200);
+    });
+    collapse();
+
+    refreshSimState();
     (document.body || document.documentElement).appendChild(el);
 
     setInterval(function () {
+      // 小球颜色直接表达状态，不用展开也能看出后端是否正常
+      var color = backend.mode === "rust"
+        ? "#3fb950"
+        : backend.mode === "sim"
+          ? "#d29922"
+          : "#8b949e";
+
       var role = OBSERVER ? "观察端" : "数据源端";
       var src = SYNC_SOURCE
         ? (SYNC_SOURCE.self ? " · 本端供数" : " · 源:" + (SYNC_SOURCE.label || SYNC_SOURCE.clientId))
         : " · 无串口";
       var multi = SYNC_CLIENTS > 0 ? " · 多端" + SYNC_CLIENTS + (SYNC_ON ? "(跟随)" : "") : "";
+
       if (backend.mode === "rust") {
-        el.textContent =
-          "Rust · " + role + src + multi + " · 同步↑" + UI_PUB + "↓" + UI_RECV;
-        el.style.borderColor = "rgba(80,200,120,.55)";
+        var applied = 0;
+        Object.keys(UI_SEEN).forEach(function (key) {
+          if (key !== "deviceChange" && key !== UI_RESYNC_KEY) applied += 1;
+        });
+        // 用"距上次收到远端值多久"代替"已同步/未同步"：
+        // 前者是事实，后者只是"经手过的键数够了"，容易在数据陈旧时误报正常。
+        var sinceRecv = UI_LAST_RECV_AT ? (Date.now() - UI_LAST_RECV_AT) / 1000 : -1;
+        var pending = Object.keys(UI_PENDING).length;
+        var syncLabel = UI_TOTAL === 0
+          ? ""
+          : " · " + applied + "/" + UI_TOTAL +
+            (sinceRecv < 0 ? "" : " · " + (sinceRecv < 10 ? sinceRecv.toFixed(1) + "s前" : "空转" + Math.round(sinceRecv) + "s")) +
+            (pending > 0 ? " · 待发" + pending : "");
+        label.textContent = "Rust · " + role + src + multi + syncLabel;
+        // 同步中让小球半透明呼吸，一眼看出在干活
+        ball.style.opacity = sinceRecv >= 0 && sinceRecv < 1.5 ? "0.55" : "1";
       } else if (backend.mode === "sim") {
-        el.textContent = "后端 浏览器仿真（Rust 不可达）· 仿真 " + backend.sim + " 次";
-        el.style.borderColor = "rgba(230,170,60,.55)";
+        label.textContent = "后端 浏览器仿真（Rust 不可达）· 仿真 " + backend.sim + " 次";
+        ball.style.opacity = "1";
       } else {
-        el.textContent = "等待后端…";
+        label.textContent = "等待后端…";
+        ball.style.opacity = "1";
       }
+
+      simButton.textContent =
+        SIM_ON === null ? "模拟数据 ?" : SIM_ON ? "模拟数据 开" : "模拟数据 关";
+      ball.style.background = color;
     }, 200);
   }
 
@@ -1154,5 +1418,5 @@
     mountBadge();
   }
 
-  console.warn("[tauri-shim v9.0] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
+  console.warn("[tauri-shim v10.0] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
 })();

@@ -348,8 +348,16 @@ function AppShell() {
       }
     };
     window.addEventListener("softui:remote-ui", onRemoteUi);
+    window.dispatchEvent(new CustomEvent("softui:ui-resync"));
     return () => window.removeEventListener("softui:remote-ui", onRemoteUi);
   }, []);
+
+  // 响应别端的重发请求（见 WorkspacePage 里的说明）
+  useEffect(() => {
+    const onRepublish = () => publishUi("systemControl", lastSystemControl);
+    window.addEventListener("softui:ui-republish", onRepublish);
+    return () => window.removeEventListener("softui:ui-republish", onRepublish);
+  }, [publishUi, lastSystemControl]);
   /** 回放控件是否被收起（回放本身继续，只把界面藏起来）。 */
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
@@ -489,6 +497,26 @@ function AppShell() {
     const interval = setInterval(() => { void refreshConnectedDevices(); }, 1000);
     return () => clearInterval(interval);
   }, [refreshConnectedDevices, authenticated]);
+
+  /**
+   * 设备接入/断开时**立刻**拉一次，而不是等下一次轮询。
+   *
+   * 后端在 webserial_open / webserial_close 里往同步通道塞一个 deviceChange 事件，
+   * 所有端（含发起端自己）收到就重新取快照、设备列表和最新帧。
+   * 否则在新设备上来后的那 0.5~1 秒里，界面还停在旧设备上，
+   * 看起来就是"接了新设备但没同步"。
+   */
+  useEffect(() => {
+    const onDeviceChange = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as { key?: string };
+      if (detail.key !== "deviceChange") return;
+      void fetchSnapshot("bootstrap_state");
+      void refreshConnectedDevices();
+      void fetchLiveLatest();
+    };
+    window.addEventListener("softui:remote-ui", onDeviceChange);
+    return () => window.removeEventListener("softui:remote-ui", onDeviceChange);
+  }, [fetchSnapshot, refreshConnectedDevices, fetchLiveLatest]);
 
   // Load connection profiles
   const refreshConnectionProfiles = useCallback(async () => {

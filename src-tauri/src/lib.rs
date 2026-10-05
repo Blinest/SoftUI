@@ -1247,11 +1247,10 @@ struct AppState {
 
 impl AppState {
     pub fn new(path: PathBuf) -> Self {
+        // 启动时**不再**自动播种模拟设备：模拟数据改由界面上的
+        // 「模拟数据」按钮显式开启。自动播种会让"真实设备出问题"和
+        // "本来就没设备"都悄悄变成"有数据"，操作员分不清真假。
         let devices = Arc::new(Mutex::new(device::DeviceRegistry::new()));
-        {
-            let mut guard = devices.lock().expect("device registry poisoned");
-            let _ = guard.seed_simulator();
-        }
         let session_dir = path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
@@ -2366,6 +2365,25 @@ fn run_legacy_migration(
  * 后端把要下发的命令排进 tx 等前端来取。协议解析全部留在 Rust。
  * ─────────────────────────────────────────────────────────────────── */
 
+/// 每端口的接收序号水位，用于给 `webserial_push` 去重。
+///
+/// 前端失败会带**同一个 seq** 重试；这里按 seq 忽略重复到达，
+/// 重试因此是安全的 —— 既不会丢字节，也不会把同一块喂两遍给解码器。
+#[cfg(not(feature = "desktop"))]
+#[derive(Default)]
+struct WsMeta {
+    last_seq: u64,
+    gaps: u64,
+    duplicates: u64,
+}
+
+#[cfg(not(feature = "desktop"))]
+fn ws_meta() -> &'static Mutex<std::collections::HashMap<String, WsMeta>> {
+    static META: std::sync::OnceLock<Mutex<std::collections::HashMap<String, WsMeta>>> =
+        std::sync::OnceLock::new();
+    META.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
 static WS_BUFFERS: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, (transport::WsRx, transport::WsTx)>>,
 > = std::sync::OnceLock::new();
@@ -2467,6 +2485,37 @@ fn ui_wait(since: u64, timeout_ms: u64) -> Result<serde_json::Value, String> {
     ui_snapshot()
 }
 
+/// 设备接入/断开时往 UI 同步通道塞一个事件，让所有端**立刻**拉一次。
+///
+/// 不广播的话，别的端只能等自己的轮询周期（设备列表 1s、实时帧 500ms），
+/// 这段时间里界面还停在旧设备上，看起来就是"接入后没同步"。
+#[cfg(not(feature = "desktop"))]
+fn notify_device_change() {
+    let _ = ui_publish(
+        "server".to_string(),
+        "deviceChange".to_string(),
+        serde_json::json!(now_ms()),
+    );
+}
+
+#[cfg(feature = "desktop")]
+fn notify_device_change() {}
+
+/* 关于"槽位要不要过期"的最终结论：**一律不过期**。
+ *
+ * 我在这里先后错过两次：
+ *   ① 一刀切 30 秒过期 → 新设备拉不到末端位姿、PID 等持久设置
+ *   ② 只让 drag 5 秒过期 → 新设备拉不到拖动目标，臂体停在初始形状
+ *
+ * 根因是我想当然地把 dragTarget 当成了"一次进行中的拖动"。它不是 ——
+ * 这个应用里 dragTarget 是**持久状态**：松手后依然存在，要靠「清空目标」
+ * 按钮或关掉「拖动编辑」才清掉，两者都会显式发布 null。
+ *
+ * 所以过期机制本身就是多余的：每个键都有明确的清空路径，
+ * 客户端崩溃留下的陈旧值也与"用户上次设的目标"在语义上一致。
+ * 真需要清理时，由客户端显式发布 null 即可。
+ */
+
 #[cfg(not(feature = "desktop"))]
 fn ui_publish(client_id: String, key: String, payload: serde_json::Value) -> Result<u64, String> {
     let mut state = ui_sync_lock().lock().map_err(|_| "ui sync poisoned".to_string())?;
@@ -2488,11 +2537,7 @@ fn ui_snapshot() -> Result<serde_json::Value, String> {
     let now = now_ms();
     let mut entries = serde_json::Map::new();
     for (key, entry) in state.entries.iter() {
-        // 超过 30 秒没更新的槽位不再下发：否则别的端会一直卡在某个旧值上，
-        // 而发起端那边其实早就清空了。
-        if now.saturating_sub(entry.at_ms) > 30_000 {
-            continue;
-        }
+        // 不过期：保证新加入的端一定能拿到当前完整状态（见上面的说明）。
         entries.insert(
             key.clone(),
             serde_json::json!({
@@ -2674,6 +2719,42 @@ fn sync_emit(client_id: String, mut event: serde_json::Value) -> Result<u64, Str
     Ok(seq)
 }
 
+/* ── 模拟数据开关 ────────────────────────────────────────────────────
+ * 显式开关，替代原来的"自动补回"。按钮在界面右下角的运行状态徽标上。
+ * ─────────────────────────────────────────────────────────────────── */
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn simulator_start(state: State<'_, AppState>) -> Result<bool, String> {
+    let mut devices = state
+        .devices
+        .lock()
+        .map_err(|_| "device registry poisoned".to_string())?;
+    if devices.has_simulator() {
+        return Ok(true);
+    }
+    devices
+        .seed_simulator()
+        .map_err(|error| format!("{error:?}"))?;
+    drop(devices);
+    notify_device_change();
+    Ok(true)
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn simulator_stop(state: State<'_, AppState>) -> Result<bool, String> {
+    let mut devices = state
+        .devices
+        .lock()
+        .map_err(|_| "device registry poisoned".to_string())?;
+    devices.remove_simulator();
+    drop(devices);
+    if let Ok(mut ring) = state.live_ring.lock() {
+        ring.clear(); // 别让模拟帧留在缓冲里冒充真实数据
+    }
+    notify_device_change();
+    Ok(false)
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn webserial_open(
     state: State<'_, AppState>,
@@ -2709,12 +2790,37 @@ fn webserial_open(
     }
     // 记下是谁在供数据：手机端据此显示"数据来自电脑端"
     sync_set_source(client_id);
+    notify_device_change();
     Ok(record)
 }
 
 /// 前端把从串口读到的原始字节推进来。返回本次接受的字节数。
 #[cfg_attr(feature = "desktop", tauri::command)]
-fn webserial_push(port_name: String, bytes: Vec<u8>) -> Result<usize, String> {
+fn webserial_push(
+    port_name: String,
+    bytes: Vec<u8>,
+    seq: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    if let Some(value) = seq {
+        let mut meta = ws_meta()
+            .lock()
+            .map_err(|_| "webserial meta poisoned".to_string())?;
+        let entry = meta.entry(port_name.clone()).or_default();
+        if value <= entry.last_seq {
+            entry.duplicates = entry.duplicates.saturating_add(1);
+            return Ok(serde_json::json!({
+                "accepted": 0, "duplicate": true,
+                "gaps": entry.gaps, "duplicates": entry.duplicates,
+            }));
+        }
+        // 序号跳变 = 中间有块没到。解码器会靠扫描帧头自愈，这里只记账，
+        // 让"丢了多少次"变成可观测的数字，而不是悄悄变成校验错误。
+        if value > entry.last_seq.saturating_add(1) {
+            entry.gaps = entry.gaps.saturating_add(1);
+        }
+        entry.last_seq = value;
+    }
+
     let map = ws_buffers()
         .lock()
         .map_err(|_| "webserial buffer poisoned".to_string())?;
@@ -2728,7 +2834,53 @@ fn webserial_push(port_name: String, bytes: Vec<u8>) -> Result<usize, String> {
     while guard.len() > 256 * 1024 {
         guard.pop_front();
     }
-    Ok(accepted)
+    let (gaps, duplicates) = ws_meta()
+        .lock()
+        .map(|meta| {
+            let entry = meta.get(&port_name);
+            (
+                entry.map(|e| e.gaps).unwrap_or(0),
+                entry.map(|e| e.duplicates).unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    Ok(serde_json::json!({
+        "accepted": accepted, "duplicate": false, "gaps": gaps, "duplicates": duplicates,
+    }))
+}
+
+/// 待发命令的**长轮询**：有字节立刻返回，没有就挂到超时。
+///
+/// 替代前端原来每 20ms 一次的 `webserial_take_tx` —— 那是 50 req/s，
+/// 在往返 100ms 的隧道上必然大面积失败，而失败又会连带丢掉接收字节
+/// （实测 131 个校验错 vs 43 个有效帧，就是这么来的）。
+/// 改成挂起式之后，空闲时连接上只有一个未完成的请求。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn webserial_wait_tx(
+    port_name: String,
+    timeout_ms: Option<u64>,
+) -> Result<Vec<u8>, String> {
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 30_000));
+    loop {
+        {
+            let map = ws_buffers()
+                .lock()
+                .map_err(|_| "webserial buffer poisoned".to_string())?;
+            let (_, tx) = map
+                .get(&port_name)
+                .ok_or_else(|| format!("webserial 端口未打开：{port_name}"))?;
+            let mut guard = tx.lock().map_err(|_| "webserial tx poisoned".to_string())?;
+            if !guard.is_empty() {
+                return Ok(std::mem::take(&mut *guard));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(Vec::new());
+        }
+        // 5ms 轮询足够快（远比往返时延小），又不必引入 Condvar 的锁序问题
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// 前端取走后端要下发的命令字节。
@@ -2749,6 +2901,9 @@ fn webserial_close(state: State<'_, AppState>, port_name: String) -> Result<(), 
     if let Ok(mut map) = ws_buffers().lock() {
         map.remove(&port_name);
     }
+    if let Ok(mut meta) = ws_meta().lock() {
+        meta.remove(&port_name);
+    }
     let mut devices = state
         .devices
         .lock()
@@ -2756,11 +2911,13 @@ fn webserial_close(state: State<'_, AppState>, port_name: String) -> Result<(), 
     devices
         .close_webserial(&port_name)
         .map_err(|error| format!("{error:?}"))?;
-    // 真实设备全断了：清掉数据源标记，并补回模拟设备
+    // 真实设备全断了：只清掉数据源标记，**不再自动补回模拟设备**。
+    // 要不要看模拟数据由操作员按「模拟数据」按钮决定 ——
+    // 否则真实设备一断就悄悄变成假数据，操作员不知道自己在看什么。
     if !devices.has_real_device() {
         sync_set_source(None);
     }
-    devices.ensure_simulator();
+    notify_device_change();
     Ok(())
 }
 
@@ -4836,7 +4993,14 @@ fn dispatch(
         "webserial_push" => {
             let port_name: String = arg(args, "port_name")?;
             let bytes: Vec<u8> = arg(args, "bytes")?;
-            webserial_push(port_name, bytes)
+            let seq: Option<u64> = arg_opt(args, "seq")?;
+            webserial_push(port_name, bytes, seq)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "webserial_wait_tx" => {
+            let port_name: String = arg(args, "port_name")?;
+            let timeout_ms: Option<u64> = arg_opt(args, "timeout_ms")?;
+            webserial_wait_tx(port_name, timeout_ms)
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "webserial_take_tx" => {
@@ -4893,6 +5057,12 @@ fn dispatch(
             let timeout_ms: Option<u64> = arg_opt(args, "timeout_ms")?;
             ui_wait(since, timeout_ms.unwrap_or(20_000))
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "simulator_start" => {
+            simulator_start(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "simulator_stop" => {
+            simulator_stop(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         other => Err(format!("未知命令：{other}")),
     }
