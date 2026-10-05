@@ -901,7 +901,10 @@
    * 避免本机与后端出现两份略有差异的视图。
    * 开关：出错可置 false 回退到"原始字节推送"老路径。
    * ──────────────────────────────────────────────────────────────── */
-  var P1_LOCAL_PARSE = true;
+  // 可在地址栏加 ?p1=0 回退到"原始字节推送 + 后端解析"的老路径。
+  // 老路径的完整代码都保留着（wsRxBuf / wsFlushRx / rpcInvoke 的代理分支），
+  // 所以这个开关是把整条链路切回去，而不是只关一半。
+  var P1_LOCAL_PARSE = !/[?&]p1=0\b/.test(location.search);
   var WS_CAPACITY = 600;
   var wsCodec = window.__SOFTUI_PROTOCOL__ ? new window.__SOFTUI_PROTOCOL__.LegacyV1Codec() : null;
   var wsRing = [];
@@ -1400,7 +1403,7 @@
   };
 
   window.__SOFTUI_SHIM__ = {
-    version: 11.0,
+    version: 11.1,
     calls: function () { return lastCalls.slice(); },
     snapshot: function () { return clone(snapshot); },
   };
@@ -1508,6 +1511,7 @@
           : "#8b949e";
 
       var role = OBSERVER ? "观察端" : "数据源端";
+      var parseMode = P1_LOCAL_PARSE ? "本机解析" : "后端解析";
       var src = SYNC_SOURCE
         ? (SYNC_SOURCE.self ? " · 本端供数" : " · 源:" + (SYNC_SOURCE.label || SYNC_SOURCE.clientId))
         : " · 无串口";
@@ -1527,7 +1531,7 @@
           : " · " + applied + "/" + UI_TOTAL +
             (sinceRecv < 0 ? "" : " · " + (sinceRecv < 10 ? sinceRecv.toFixed(1) + "s前" : "空转" + Math.round(sinceRecv) + "s")) +
             (pending > 0 ? " · 待发" + pending : "");
-        label.textContent = "Rust · " + role + src + multi + syncLabel;
+        label.textContent = "Rust · " + role + " · " + parseMode + src + multi + syncLabel;
         // 同步中让小球半透明呼吸，一眼看出在干活
         ball.style.opacity = sinceRecv >= 0 && sinceRecv < 1.5 ? "0.55" : "1";
       } else if (backend.mode === "sim") {
@@ -1550,5 +1554,5 @@
     mountBadge();
   }
 
-  console.warn("[tauri-shim v11.0] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
+  console.warn("[tauri-shim v11.1] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
 })();
