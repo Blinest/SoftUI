@@ -589,17 +589,23 @@ impl<T: Transport> DeviceRuntime<T> {
                     self.last_frame_ms = now_ms();
                     self.last_error = None;
                     self.last_error_code = None;
-                    if self.state != DeviceConnectionState::Handshaking {
-                        self.state = if self.emergency_latched {
-                            DeviceConnectionState::EmergencyStopped
-                        } else if self.control_enabled || status.system_state != 0 {
-                            // 操作员使能过就保持 Enabled：下位机不回写 system_state 时
-                            // （STM32 的 CR.state 恒 0），否则每帧都会把使能状态冲回 Ready。
-                            DeviceConnectionState::Enabled
-                        } else {
-                            DeviceConnectionState::Ready
-                        };
-                    }
+                    // 收到有效帧就说明链路是通的，**从 Handshaking 也必须能推出去**。
+                    //
+                    // 原来是 `if state != Handshaking`，配合 handshake() 的实现
+                    // （先置 Handshaking，再连续同步读 5 次；读不到就 Err 返回、
+                    // 状态留在 Handshaking）会形成一个死局：
+                    // Web Serial 打开端口的那一刻浏览器还没送来字节，那 5 次必然
+                    // 全部落空 —— 此后帧照收，但状态永远停在 handshaking，
+                    // 使能 / 急停这类要求 ready 的操作全被挡住（实际踩到过）。
+                    self.state = if self.emergency_latched {
+                        DeviceConnectionState::EmergencyStopped
+                    } else if self.control_enabled || status.system_state != 0 {
+                        // 操作员使能过就保持 Enabled：下位机不回写 system_state 时
+                        // （STM32 的 CR.state 恒 0），否则每帧都会把使能状态冲回 Ready。
+                        DeviceConnectionState::Enabled
+                    } else {
+                        DeviceConnectionState::Ready
+                    };
                     return Ok(status);
                 }
                 Err(error) => {

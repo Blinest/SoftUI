@@ -770,6 +770,7 @@
   var WS_SEQ = 0;             // 接收块序号：后端按它去重，重试因此是安全的
   var wsPushPending = null;   // 待发送/重试中的块
   var wsFlushTimer = null;    // 接收侧的定时冲刷
+  var wsSyncTimer = null;     // 本机 → 后端的帧上报（10Hz）
 
   function wsFlushRx() {
     if (!wsActive || !wsActive.running) return;
@@ -862,9 +863,26 @@
             }
             var value = result.value;
             if (value && value.length) {
-              for (var i = 0; i < value.length; i += 1) wsRxBuf.push(value[i]);
-              // 攒到一定量就先发，避免等下一拍造成延迟
-              if (wsRxBuf.length >= 4096) wsFlushRx();
+              if (P1_LOCAL_PARSE && wsCodec) {
+                // 本机解析：字节不出浏览器，解析结果直接进本地环形缓冲
+                wsCodec.pushBytes(value).forEach(function (decoded) {
+                  if (decoded.ok) {
+                    wsFrameSeq += 1;
+                    var snap = buildSnapshot(decoded.ok, wsFrameSeq);
+                    wsLastFrame = snap;
+                    wsDirtyFrame = snap; // 等 10Hz 上报
+                    wsRing.push(snap);
+                    if (wsRing.length > WS_CAPACITY) {
+                      wsRing.splice(0, wsRing.length - WS_CAPACITY);
+                    }
+                  } else if (decoded.error === "InvalidChecksum") {
+                    wsErrors += 1;
+                  }
+                });
+              } else {
+                for (var i = 0; i < value.length; i += 1) wsRxBuf.push(value[i]);
+                if (wsRxBuf.length >= 4096) wsFlushRx();
+              }
             }
             pump();
           })
@@ -873,6 +891,96 @@
           });
       })();
     })();
+  }
+
+  /* ── A. 前端本地解析（P1）────────────────────────────────────────────
+   * 串口字节在**本机**解析成 DeviceSnapshot：
+   *   - 本机渲染零往返（fetch_live_latest / fetch_live_window 直接答本地环形缓冲）
+   *   - 只把解析好的帧按 10Hz 上报给后端，供其它端和录制使用
+   * 字段映射与后端 make_device_frame / adapt_* 逐条对齐（"同构"），
+   * 避免本机与后端出现两份略有差异的视图。
+   * 开关：出错可置 false 回退到"原始字节推送"老路径。
+   * ──────────────────────────────────────────────────────────────── */
+  var P1_LOCAL_PARSE = true;
+  var WS_CAPACITY = 600;
+  var wsCodec = window.__SOFTUI_PROTOCOL__ ? new window.__SOFTUI_PROTOCOL__.LegacyV1Codec() : null;
+  var wsRing = [];
+  var wsLastFrame = null;
+  var wsFrameSeq = 0;
+  var wsErrors = 0;
+  var wsDirtyFrame = null;
+
+  function adaptMotor(id, motor) {
+    return {
+      id: id,
+      positionMm: motor.positionMm,
+      velocityMmPerSec: motor.velocityMmPerSec,
+      accelerationMmPerSec2: motor.accelerationMmPerSec2,
+      running: motor.status !== 0,
+      targetPositionMm: motor.positionMm + 1.5,
+    };
+  }
+
+  function adaptSensor(id, sensor, seq) {
+    var raw = [sensor.x, sensor.y, sensor.z];
+    return {
+      id: id,
+      raw: raw,
+      filtered: [raw[0] * 0.96, raw[1] * 0.95, raw[2] * 0.94],
+      alias: ["X", "Y", "Z"],
+      unit: "N",
+      quality: seq % 15 === 0 ? "warning" : "ok",
+    };
+  }
+
+  function adaptBend(angleDeg, direction, seq) {
+    return {
+      angleDeg: angleDeg,
+      targetAngleDeg: angleDeg + 4.0,
+      direction: direction,
+      quality: seq % 17 === 0 ? "warning" : "ok",
+    };
+  }
+
+  function buildSnapshot(status, seq) {
+    return {
+      deviceId: DEVICE_NAME,
+      connectionId: "webserial",
+      receivedAtMs: Date.now(),
+      sequence: seq,
+      protocolVersion: "Legacy V1",
+      systemEnabled: status.systemState !== 0,
+      motors: status.motors.map(function (m, i) { return adaptMotor(i + 1, m); }),
+      sensors: status.sensors.map(function (s, i) { return adaptSensor(i + 1, s, seq); }),
+      bend: {
+        section1: adaptBend(status.bendAngle1Deg, "up", seq),
+        section2: adaptBend(status.bendAngle2Deg, "right", seq),
+      },
+      quality: {
+        status: wsErrors === 0 ? "ok" : "warning",
+        latencyMs: 0,
+        droppedFrames: wsErrors,
+        checksumOk: wsErrors === 0,
+      },
+    };
+  }
+
+  function localStats() {
+    return {
+      storedFrames: wsRing.length,
+      capacity: WS_CAPACITY,
+      totalFrames: wsFrameSeq,
+      droppedFrames: wsErrors,
+      frameRateHz: 0, // 由后端帧率兜底；本机不额外计时，避免再引一个定时器
+    };
+  }
+
+  /* 把解析好的帧按 10Hz 上报：本机不需要高频，其它端看的是"趋势"。 */
+  function wsSyncUp() {
+    if (!P1_LOCAL_PARSE || !wsActive || !wsDirtyFrame) return;
+    var frame = wsDirtyFrame;
+    wsDirtyFrame = null;
+    doRpc("frame_ingest", { frame: frame }, true).catch(function () { /* 下个周期不重试，遥测允许丢单帧 */ });
   }
 
   /* ── 页面卸载时清理串口通道 ──────────────────────────────────────────
@@ -917,6 +1025,13 @@
         wsActive = { index: index, name: name, port: port, running: true };
         wsPushPending = null;
         WS_SEQ = 0;
+        wsRing = [];
+        wsLastFrame = null;
+        wsFrameSeq = 0;
+        wsErrors = 0;
+        wsDirtyFrame = null;
+        if (wsCodec) wsCodec = new window.__SOFTUI_PROTOCOL__.LegacyV1Codec();
+        if (!wsSyncTimer) wsSyncTimer = setInterval(wsSyncUp, 100); // 10Hz
         wsStartRead();
         wsTxLoop(); // 命令：挂起式长轮询，不再 20ms 一轮
         if (wsFlushTimer) clearInterval(wsFlushTimer);
@@ -948,7 +1063,9 @@
     var port = wsActive.port;
     wsActive.running = false;
     if (wsFlushTimer) { clearInterval(wsFlushTimer); wsFlushTimer = null; }
+    if (wsSyncTimer) { clearInterval(wsSyncTimer); wsSyncTimer = null; }
     wsPushPending = null;
+    wsSyncUp(); // 断开前把最后一帧送出去
     wsFlushRx();
     wsActive = null;
     return doRpc("webserial_close", { portName: name })
@@ -1213,6 +1330,21 @@
     // 串口枚举走本机，且必须同步发起以保留"用户手势"（requestPort 的硬性要求）
     if (cmd === "list_serial_ports") return listLocalSerialPorts();
 
+    // 拥有串口的那一端直接答本地数据：零往返、零下行流量
+    if (P1_LOCAL_PARSE && wsActive && wsCodec) {
+      if (cmd === "fetch_live_latest") {
+        return Promise.resolve({
+          selectedDeviceId: DEVICE_NAME,
+          latest: wsLastFrame,
+          stats: localStats(),
+        });
+      }
+      if (cmd === "fetch_live_window") {
+        var n = Math.max(1, Math.min(WS_CAPACITY, (args && args.count) || 240));
+        return Promise.resolve(wsRing.slice(-n));
+      }
+    }
+
     // 本机串口的连接/断开由前端处理：真实串口在用户机器上，后端够不着
     if (cmd === "connect_device") {
       var req = (args && args.request) || {};
@@ -1268,7 +1400,7 @@
   };
 
   window.__SOFTUI_SHIM__ = {
-    version: 10.0,
+    version: 11.0,
     calls: function () { return lastCalls.slice(); },
     snapshot: function () { return clone(snapshot); },
   };
@@ -1418,5 +1550,5 @@
     mountBadge();
   }
 
-  console.warn("[tauri-shim v10.0] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
+  console.warn("[tauri-shim v11.0] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
 })();

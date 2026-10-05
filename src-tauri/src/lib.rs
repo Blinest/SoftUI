@@ -2723,6 +2723,107 @@ fn sync_emit(client_id: String, mut event: serde_json::Value) -> Result<u64, Str
  * 显式开关，替代原来的"自动补回"。按钮在界面右下角的运行状态徽标上。
  * ─────────────────────────────────────────────────────────────────── */
 
+/* ── 前端解析后的帧直接灌入 ──────────────────────────────────────────
+ * P1 的核心接口：串口字节由**拥有串口的那台浏览器**自己解析，只把解析好的
+ * DeviceSnapshot 按低频（10Hz 左右）送上来。
+ *
+ * 为什么不再送原始字节：实测那条路的代价是"下行 0.8 MB/s + 上行原始字节"，
+ * 而且字节一旦在链路上被截断就整帧校验失败（曾出现 131 错 / 43 好帧）。
+ * 解析放在本机后，本机渲染零往返；这里只负责让**其它端和录制**照旧能看到数据。
+ *
+ * 后处理逻辑与 spawn_device_poller 里的逐条一致（动力学 / 控制 / 录制 / 环形缓冲）。
+ * ⚠ 两份实现目前是重复的，抽成共用函数需要动轮询线程（风险更高），留作后续重构。
+ * ─────────────────────────────────────────────────────────────────── */
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn frame_ingest(state: State<'_, AppState>, frame: DeviceSnapshot) -> Result<u64, String> {
+    let sequence = frame.sequence;
+
+    let runtime = {
+        let devices = state
+            .devices
+            .lock()
+            .map_err(|_| "device registry poisoned".to_string())?;
+        if !devices.list().iter().any(|r| r.device_id == frame.device_id) {
+            return Err(format!("未知设备：{}", frame.device_id));
+        }
+        devices
+            .runtime_status(&frame.device_id)
+            .map_err(|error| format!("{error:?}"))?
+    };
+
+    let is_playback = state
+        .playback
+        .lock()
+        .map(|p| p.status().active)
+        .unwrap_or(false);
+
+    let dynamics_result = state
+        .dynamics_runtime
+        .lock()
+        .map_err(|_| "dynamics poisoned".to_string())
+        .and_then(|mut dynamics| dynamics.step_frame(&frame, 50).map_err(|e| format!("{e:?}")))
+        .ok();
+
+    if let Ok(mut control) = state.control_runtime.lock() {
+        let safety = control::SafetyInput {
+            connected: matches!(
+                runtime.state,
+                device::DeviceConnectionState::Ready | device::DeviceConnectionState::Enabled
+            ),
+            enabled: frame.system_enabled,
+            emergency_latched: runtime.emergency_latched,
+            playback_mode: is_playback,
+        };
+        let dynamics_input = dynamics::dynamics_input_from_frame(&frame, 50);
+        let feedback = control::ControlFeedback {
+            target_curvature_per_m: dynamics_input
+                .sections
+                .first()
+                .map(|section| section.curvature_per_m)
+                .unwrap_or(0.0),
+            dynamics_input,
+            dynamics_output: dynamics_result.clone(),
+            pressure: frame
+                .sensors
+                .first()
+                .map(|sensor| sensor.filtered[2])
+                .unwrap_or(0.0),
+        };
+        control.step_cycle(feedback, safety, 50);
+    }
+
+    if !is_playback {
+        if let Ok(mut recorder) = state.recorder.lock() {
+            let rec_status = recorder.status();
+            recorder.write_frame_calib(&frame, &make_calib_row(&frame, dynamics_result.as_ref()));
+            if rec_status.active && !rec_status.paused {
+                let _ = state.sqlite.insert_snapshot(
+                    &rec_status.session_id,
+                    frame.sequence,
+                    frame.received_at_ms,
+                    &frame.device_id,
+                    &frame,
+                );
+                if let Some(output) = &dynamics_result {
+                    let _ = state.sqlite.insert_dynamics_output(
+                        &rec_status.session_id,
+                        frame.sequence,
+                        frame.received_at_ms,
+                        &frame.device_id,
+                        output,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Ok(mut ring) = state.live_ring.lock() {
+        ring.push(frame);
+    }
+    Ok(sequence)
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn simulator_start(state: State<'_, AppState>) -> Result<bool, String> {
     let mut devices = state
@@ -5063,6 +5164,10 @@ fn dispatch(
         }
         "simulator_stop" => {
             simulator_stop(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "frame_ingest" => {
+            let frame: DeviceSnapshot = arg(args, "frame")?;
+            frame_ingest(st, frame).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         other => Err(format!("未知命令：{other}")),
     }

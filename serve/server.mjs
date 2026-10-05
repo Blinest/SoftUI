@@ -183,7 +183,10 @@ function proxyRpc(req, res) {
  * 不带版本号：缓存由下面的 no-store 负责，不需要靠 URL 变化来绕过。
  * ─────────────────────────────────────────────────────────────────── */
 const SHIM_FILE = path.join(ROOT, "tauri-shim.js");
-let shimStamp = { mtime: -1, tag: '<script src="/tauri-shim.js"></script>' };
+const PROTOCOL_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "protocol.js");
+// 协议模块必须先于桩：桩要用它把串口字节在本地解析成帧
+const PROTOCOL_TAG = '<script src="/protocol.global.js"></script>';
+let shimStamp = { mtime: -1, tag: PROTOCOL_TAG + '\n    <script src="/tauri-shim.js"></script>' };
 
 /**
  * 桩脚本的引用标签，查询串是**桩文件内容的短哈希**。
@@ -202,7 +205,10 @@ function shimTag() {
   }
   if (stat.mtimeMs === shimStamp.mtime) return shimStamp.tag;
   const hash = crypto.createHash("sha1").update(fs.readFileSync(SHIM_FILE)).digest("hex").slice(0, 10);
-  shimStamp = { mtime: stat.mtimeMs, tag: `<script src="/tauri-shim.js?h=${hash}"></script>` };
+  shimStamp = {
+    mtime: stat.mtimeMs,
+    tag: `${PROTOCOL_TAG}\n    <script src="/tauri-shim.js?h=${hash}"></script>`,
+  };
   return shimStamp.tag;
 }
 
@@ -230,6 +236,28 @@ const server = http.createServer((req, res) => {
     urlPath = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
   } catch {
     return send(res, 400, { "content-type": "text/plain" }, "bad request");
+  }
+
+  /* 协议模块是 ESM（测试要 import），但浏览器脚本需要全局。
+   * 这里按需转译而不是另存一份：只去掉行首的 `export `、包一层 IIFE 挂到 window，
+   * 于是永远只有一个真源，不会出现两份文件各自漂移。 */
+  if (urlPath === "/protocol.global.js") {
+    let source;
+    try {
+      source = fs.readFileSync(PROTOCOL_FILE, "utf8");
+    } catch {
+      return send(res, 404, { "content-type": "text/plain" }, "protocol.js not found");
+    }
+    const body =
+      "(function(){\n" +
+      source.replace(/^export /gm, "") +
+      "\nwindow.__SOFTUI_PROTOCOL__ = { LegacyV1Codec: LegacyV1Codec, parseStatusFrame: parseStatusFrame, encodeStatusFrame: encodeStatusFrame, checksum: checksum, ProtocolError: ProtocolError };\n})();\n";
+    return send(
+      res,
+      200,
+      { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store" },
+      body,
+    );
   }
 
   const candidate = path.resolve(ROOT, "." + urlPath);
