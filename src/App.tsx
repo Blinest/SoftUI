@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Fingerprint, CheckCircle2 } from "lucide-react";
 import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
@@ -307,6 +307,49 @@ function AppShell() {
    * 为主，状态帧的 `system_state` 只用来校验「下位机有没有确认」。
    */
   const [lastSystemControl, setLastSystemControl] = useState<SystemControlAction | null>(null);
+
+  /**
+   * 「系统使能」这个**操作员意图**必须跨端同步。
+   *
+   * 全局状态栏的「已使能（未确认）→ 已使能」是两阶段语义：
+   *   ① 操作员点了使能 —— 只代表意图，设备还没回值，显示"已使能（未确认）"
+   *   ② 设备回帧里 system_state 变 1 —— 才显示"已使能"
+   * ② 由服务端共享的实时帧驱动，本来就一致；缺的是 ①。
+   * 它原来只存在本端，所以手机点了使能，电脑端的状态栏还停在"未使能"。
+   */
+  const applyingRemoteUiRef = useRef(false);
+  const systemControlSeenRef = useRef(false);
+
+  const publishUi = useCallback((key: string, payload: unknown) => {
+    if (applyingRemoteUiRef.current) return;
+    window.dispatchEvent(new CustomEvent("softui:local-ui", { detail: { key, payload } }));
+  }, []);
+
+  useEffect(() => {
+    // 首帧不发：新加入的端应当先采纳共享状态，
+    // 否则会拿本地的 null 去覆盖别端已经置好的"已使能（未确认）"。
+    if (!systemControlSeenRef.current) {
+      systemControlSeenRef.current = true;
+      return;
+    }
+    publishUi("systemControl", lastSystemControl);
+  }, [lastSystemControl, publishUi]);
+
+  useEffect(() => {
+    const onRemoteUi = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as { key?: string; payload?: unknown };
+      if (detail.key !== "systemControl") return;
+      // 加防回环标记，否则两端会把同一个值互相回发，来回无限
+      applyingRemoteUiRef.current = true;
+      try {
+        setLastSystemControl((detail.payload as SystemControlAction | null) ?? null);
+      } finally {
+        applyingRemoteUiRef.current = false;
+      }
+    };
+    window.addEventListener("softui:remote-ui", onRemoteUi);
+    return () => window.removeEventListener("softui:remote-ui", onRemoteUi);
+  }, []);
   /** 回放控件是否被收起（回放本身继续，只把界面藏起来）。 */
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
@@ -315,7 +358,8 @@ function AppShell() {
   const [migrationReport, setMigrationReport] = useState<LegacyMigrationReport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  // 启动即折叠：导航占了横向空间，默认收起让主内容区更宽，需要时点左上角展开。
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const authenticated = snapshot.authSession.authenticated && !snapshot.authSession.mustChangePassword;
 
   // 全局急停锁存：任一已连接设备锁存即视为全局锁存。

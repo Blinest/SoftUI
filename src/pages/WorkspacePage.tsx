@@ -175,6 +175,14 @@ export function WorkspacePage({
     accelerationMmPerSec2: 3,
   });
   const [sensorDraft, setSensorDraft] = useState({ sensorId: 1, calibrationValue: 0 });
+  /**
+   * 「启动控制系统」的驱动方。
+   *
+   * 这个开关和别的输入不同：打开后**本端**会每 200ms 发一条主动控制 tick。
+   * 所以远端只镜像显示、绝不能跟着发 tick —— 否则两端各发一条，设备收到双份。
+   * `local` = 本端开启并负责驱动；`remote` = 镜像显示，不驱动。
+   */
+  const [controlEnabledBy, setControlEnabledBy] = useState<"local" | "remote" | null>(null);
   const [pidDraft, setPidDraft] = useState({ kp: 0.5, ki: 0.01, kd: 0.01 });  const [activeControlEnabled, setActiveControlEnabled] = useState(false);
   const [cycleLifeEnabled, setCycleLifeEnabled] = useState(false);
   const [cycleCount, setCycleCount] = useState(0);
@@ -464,6 +472,15 @@ export function WorkspacePage({
         : "未使能";
   const enableStateTone = systemControlAction === "emergencyStop" ? "error" : motionAllowed ? "ok" : "warn";
 
+  /** 正在应用远端状态时为 true，用于掐断「本端 → 远端 → 本端」的回环。 */
+  const applyingRemoteUiRef = useRef(false);
+
+  /** 把本端 UI 状态广播给其它端。换一个 key 就能同步一种新状态，不用改传输层。 */
+  const publishUi = useCallback((key: string, payload: unknown) => {
+    if (applyingRemoteUiRef.current) return;
+    window.dispatchEvent(new CustomEvent("softui:local-ui", { detail: { key, payload } }));
+  }, []);
+
   /**
    * 清空目标：拖动目标、位姿目标、查表结果一起清掉，6 个输入框一并归零。
    *
@@ -474,8 +491,14 @@ export function WorkspacePage({
     setDragTarget(null);
     setTipTargetActive(false);
     setTableShape(null);
-    setTipDraft({ x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0 });
-  }, []);
+    const zeroDraft = { x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0 };
+    setTipDraft(zeroDraft);
+    // 「清空」必须把三样一起广播：只发 drag=null 的话，对端的 tipDraft 还是旧值，
+    // 它的防抖查表会立刻把目标形状重新算出来 —— 表现就是"点了清空，对面目标还在"。
+    publishUi("drag", null);
+    publishUi("tip", zeroDraft);
+    publishUi("tipTargetActive", false);
+  }, [publishUi]);
 
   /**
    * 手输目标末端位姿（拖动卡片里的 6 个格子）。
@@ -488,9 +511,14 @@ export function WorkspacePage({
     (key: "x" | "y" | "z" | "roll" | "pitch" | "yaw", value: number) => {
       setDragTarget(null);
       setTipTargetActive(true);
-      setTipDraft((draft) => ({ ...draft, [key]: value }));
+      // 整份草稿下发，而不是只发改动的那个字段：
+      // 通道只保留最新值，发差分一旦漏一帧，别的端就会永久错位。
+      const next = { ...tipDraft, [key]: value };
+      setTipDraft(next);
+      publishUi("tip", next);
+      publishUi("tipTargetActive", true);
     },
-    [],
+    [tipDraft, publishUi],
   );
 
   /**
@@ -504,9 +532,12 @@ export function WorkspacePage({
    * 不另开一行文字说明「当前来自拖动」—— 数值本身就是说明。
    */
   const handleDragTarget = useCallback((next: CurvatureDistribution | null) => {
+    // 只广播本端真实操作的拖动；应用远端来的值时不往回复发
+    publishUi("drag", next);
     setDragTarget(next);
     if (!next) return;
     setTipTargetActive(true);
+    publishUi("tipTargetActive", true);
     const tip = tipPoseOfDistribution(next.segments);
     setTipDraft({
       x: tip.positionM[0] * 1000,
@@ -517,6 +548,64 @@ export function WorkspacePage({
       yaw: (tip.rpyRad[2] * 180) / Math.PI,
     });
   }, []);
+
+  /**
+   * 接收其它端的拖动预览。
+   *
+   * 拖动目标原来只存在本端 React 状态里，别的端的浏览器根本无从得知
+   * （实测：手机端拖动，电脑端毫无反应）。现在由 shim 经后端单槽通道转发，
+   * 这里只负责**应用**，不回报、也不下发指令 ——
+   * 指令始终由发起拖动的那一端发出，远端只做同步预览。
+   */
+  useEffect(() => {
+    const onRemoteUi = (event: Event) => {
+      const detail = ((event as CustomEvent).detail || {}) as { key?: string; payload?: unknown };
+      applyingRemoteUiRef.current = true;
+      try {
+        if (detail.key === "drag") {
+          handleDragTarget(detail.payload as CurvatureDistribution | null);
+        } else if (detail.key === "tip" && detail.payload) {
+          // 激活位由独立的 tipTargetActive 键决定，这里不擅自置 true ——
+          // 否则"清空"时两个键会打架，最终状态取决于应用顺序。
+          setDragTarget(null);
+          setTipDraft(detail.payload as typeof tipDraft);
+        } else if (detail.key === "tipTargetActive" && typeof detail.payload === "boolean") {
+          setTipTargetActive(detail.payload);
+        } else if (detail.key === "motor" && detail.payload) {
+          setMotorDraft(detail.payload as typeof motorDraft);
+        } else if (detail.key === "sensorDraft" && detail.payload) {
+          setSensorDraft(detail.payload as typeof sensorDraft);
+        } else if (detail.key === "pidDraft" && detail.payload) {
+          setPidDraft(detail.payload as typeof pidDraft);
+        } else if (detail.key === "cycleParams" && detail.payload) {
+          const p = detail.payload as { low: number; high: number; target: number };
+          setCycleLowThreshold(p.low);
+          setCycleHighThreshold(p.high);
+          setCycleTargetPosition(p.target);
+        } else if (detail.key === "sensorThreshold" && typeof detail.payload === "number") {
+          setSensorThreshold(detail.payload);
+        } else if (detail.key === "tipDriftTolerance" && typeof detail.payload === "number") {
+          setTipDriftToleranceMm(detail.payload);
+        } else if (detail.key === "cycleLifeEnabled" && typeof detail.payload === "boolean") {
+          setCycleLifeEnabled(detail.payload);
+        } else if (detail.key === "activeControlEnabled" && typeof detail.payload === "boolean") {
+          // 远端置位：只镜像显示，驱动方标记为 remote，本端不发 tick
+          setActiveControlEnabled(detail.payload);
+          setControlEnabledBy(detail.payload ? "remote" : null);
+        } else if (detail.key === "dragEnabled" && typeof detail.payload === "boolean") {
+          // 先开开关再给目标，顺序反了的话预览会被 enabled=false 挡掉一帧
+          setDragEnabled(detail.payload);
+          if (!detail.payload) setDragTarget(null);
+        } else if (detail.key === "lockTipPose" && typeof detail.payload === "boolean") {
+          setLockTipPose(detail.payload);
+        }
+      } finally {
+        applyingRemoteUiRef.current = false;
+      }
+    };
+    window.addEventListener("softui:remote-ui", onRemoteUi);
+    return () => window.removeEventListener("softui:remote-ui", onRemoteUi);
+  }, [handleDragTarget]);
 
   const runSystemControl = useCallback(async (action: SystemControlAction) => {
     if (action === "disable" || action === "emergencyStop") {
@@ -530,6 +619,116 @@ export function WorkspacePage({
       setCommandStatus({ tone: "error", message: errorText(err) });
     }
   }, [onSystemControl]);
+
+  /**
+   * 「拖动编辑」开关。
+   *
+   * 必须同步：三维编辑器是 `enabled={dragEnabled}`，没勾选就不渲染目标预览 ——
+   * 所以手机端勾上了、电脑端没勾，电脑端即使收到拖动目标也不会显示，
+   * 表现就是"拖了但对面没反应"。这是根因，不是传输问题。
+   */
+  const editDragEnabled = useCallback(
+    (next: boolean) => {
+      setDragEnabled(next);
+      // 关掉编辑时一并清掉目标，视图立刻回到真实形状。
+      if (!next) setDragTarget(null);
+      publishUi("dragEnabled", next);
+    },
+    [publishUi],
+  );
+
+  /** 「固定末端位姿」开关，同样影响三维预览的语义，一并同步。 */
+  const editLockTipPose = useCallback(
+    (next: boolean) => {
+      setLockTipPose(next);
+      publishUi("lockTipPose", next);
+    },
+    [publishUi],
+  );
+
+  /** PID 三个参数：整份下发，避免差分漏帧导致对端错位。 */
+  const applyPidDraft = useCallback(
+    (next: typeof pidDraft) => {
+      setPidDraft(next);
+      publishUi("pidDraft", next);
+    },
+    [publishUi],
+  );
+
+  /** 循环寿命的三个参数，合成一个 key 一起发。 */
+  const editCycleParams = useCallback(
+    (patch: { low?: number; high?: number; target?: number }) => {
+      const next = {
+        low: patch.low ?? cycleLowThreshold,
+        high: patch.high ?? cycleHighThreshold,
+        target: patch.target ?? cycleTargetPosition,
+      };
+      if (patch.low !== undefined) setCycleLowThreshold(patch.low);
+      if (patch.high !== undefined) setCycleHighThreshold(patch.high);
+      if (patch.target !== undefined) setCycleTargetPosition(patch.target);
+      publishUi("cycleParams", next);
+    },
+    [cycleLowThreshold, cycleHighThreshold, cycleTargetPosition, publishUi],
+  );
+
+  const editSensorThreshold = useCallback(
+    (next: number) => {
+      setSensorThreshold(next);
+      publishUi("sensorThreshold", next);
+    },
+    [publishUi],
+  );
+
+  const editTipDriftTolerance = useCallback(
+    (next: number) => {
+      setTipDriftToleranceMm(next);
+      publishUi("tipDriftTolerance", next);
+    },
+    [publishUi],
+  );
+
+  const editCycleLifeEnabled = useCallback(
+    (next: boolean) => {
+      editCycleLifeEnabled(next);
+      publishUi("cycleLifeEnabled", next);
+    },
+    [publishUi],
+  );
+
+  /** 「启动控制系统」：本端开启时由本端驱动 tick，远端只镜像。 */
+  const editActiveControl = useCallback(
+    (next: boolean) => {
+      editActiveControl(next);
+      setControlEnabledBy(next ? "local" : null);
+      publishUi("activeControlEnabled", next);
+    },
+    [publishUi],
+  );
+
+  /**
+   * 压力传感器校准草稿（传感器 ID + 校准值）。
+   *
+   * 压力实时数据表本身是服务端共享数据，本来就同步；缺的是这张卡上的**输入**，
+   * 它原来只存在本端 state 里，别的端看到的校准参数是旧的。
+   */
+  const editSensorDraft = useCallback(
+    (patch: Partial<typeof sensorDraft>) => {
+      const next = { ...sensorDraft, ...patch };
+      setSensorDraft(next);
+      publishUi("sensorDraft", next);
+    },
+    [sensorDraft, publishUi],
+  );
+
+  /** 电机草稿改值：本端改完广播；别的端只同步显示，不下发指令。 */
+  const editMotorDraft = useCallback(
+    (patch: Partial<MotorCommandDraft>) => {
+      const next = { ...motorDraft, ...patch };
+      setMotorDraft(next);
+      publishUi("motor", next);
+    },
+    [motorDraft, publishUi],
+  );
 
   const runMotorCommand = useCallback(async (command: MotorCommandDraft, message = "电机命令已发送") => {
     if (!requireSystemEnabled("电机命令")) return;
@@ -666,7 +865,9 @@ export function WorkspacePage({
 
   // 主动控制：开启后每 200ms 发一次 tick，直到失能或手动停止。
   useEffect(() => {
-    if (!activeControlEnabled || !motionAllowed) return;
+    // 只有本端开启时才驱动 tick；远端镜像来的 activeControlEnabled 不发 tick，
+    // 否则两端各发一条 200ms tick，设备收到双份主动控制。
+    if (!activeControlEnabled || controlEnabledBy !== "local" || !motionAllowed) return;
     runWorkspaceCommand("activeTick", undefined, "主动控制 tick 已发送");
     const timer = window.setInterval(() => {
       // tick 直接走 onWorkspaceCommand（不刷新 commandStatus，200ms 一条太吵）；
@@ -674,7 +875,7 @@ export function WorkspacePage({
       void Promise.resolve(onWorkspaceCommand("activeTick")).catch(() => undefined);
     }, 200);
     return () => window.clearInterval(timer);
-  }, [activeControlEnabled, motionAllowed, onWorkspaceCommand, runWorkspaceCommand, snapshot.live.selectedDeviceId]);
+  }, [activeControlEnabled, controlEnabledBy, motionAllowed, onWorkspaceCommand, runWorkspaceCommand, snapshot.live.selectedDeviceId]);
 
   useEffect(() => {
     if (activeControlEnabled && !motionAllowed) setActiveControlEnabled(false);
@@ -719,12 +920,7 @@ export function WorkspacePage({
               <input
                 type="checkbox"
                 checked={dragEnabled}
-                onChange={(event) => {
-                  const next = event.target.checked;
-                  setDragEnabled(next);
-                  // 关掉编辑时一并清掉目标，视图立刻回到真实形状。
-                  if (!next) setDragTarget(null);
-                }}
+                onChange={(event) => editDragEnabled(event.target.checked)}
               />
               <span>拖动编辑</span>
             </label>
@@ -732,7 +928,7 @@ export function WorkspacePage({
               <input
                 type="checkbox"
                 checked={lockTipPose}
-                onChange={(event) => setLockTipPose(event.target.checked)}
+                onChange={(event) => editLockTipPose(event.target.checked)}
               />
               <span>固定末端位姿</span>
             </label>
@@ -744,7 +940,7 @@ export function WorkspacePage({
                   min={0.2}
                   onChange={(event) => {
                     const next = Number(event.target.value);
-                    if (Number.isFinite(next)) setTipDriftToleranceMm(Math.min(20, Math.max(0.2, next)));
+                    if (Number.isFinite(next)) editTipDriftTolerance(Math.min(20, Math.max(0.2, next)));
                   }}
                   step={0.5}
                   type="number"
@@ -846,7 +1042,7 @@ export function WorkspacePage({
                 sensorMax,
                 sensorAlarmCount,
                 sensorThreshold,
-                onSensorThresholdChange: setSensorThreshold,
+                onSensorThresholdChange: editSensorThreshold,
                 curvatureSummary,
               })}
           />
@@ -1083,24 +1279,24 @@ export function WorkspacePage({
               <div className="workspace-form-grid workspace-form-grid-motor">
                 <label className="workspace-field">
                   <span>电机 ID</span>
-                  <select value={motorDraft.motorId} onChange={(event) => setMotorDraft((draft) => ({ ...draft, motorId: Number(event.target.value) }))}>
+                  <select value={motorDraft.motorId} onChange={(event) => editMotorDraft({ motorId: Number(event.target.value) })}>
                     {motors.map((motor) => <option key={motor.id} value={motor.id}>{motor.id}</option>)}
                   </select>
                 </label>
                 <label className="workspace-field">
                   <span>位移 mm</span>
                   <input type="number" min={-80} max={80} step={0.1} value={motorDraft.positionMm}
-                    onChange={(event) => setMotorDraft((draft) => ({ ...draft, positionMm: clamp(Number(event.target.value), -80, 80) }))} />
+                    onChange={(event) => editMotorDraft({ positionMm: clamp(Number(event.target.value), -80, 80) })} />
                 </label>
                 <label className="workspace-field">
                   <span>速度 mm/s</span>
                   <input type="number" min={0} step={0.1} value={motorDraft.velocityMmPerSec}
-                    onChange={(event) => setMotorDraft((draft) => ({ ...draft, velocityMmPerSec: Number(event.target.value) }))} />
+                    onChange={(event) => editMotorDraft({ velocityMmPerSec: Number(event.target.value) })} />
                 </label>
                 <label className="workspace-field">
                   <span>加速度 mm/s²</span>
                   <input type="number" min={0} step={0.1} value={motorDraft.accelerationMmPerSec2}
-                    onChange={(event) => setMotorDraft((draft) => ({ ...draft, accelerationMmPerSec2: Number(event.target.value) }))} />
+                    onChange={(event) => editMotorDraft({ accelerationMmPerSec2: Number(event.target.value) })} />
                 </label>
                 <button type="button" className={blockedClass("primary-btn")}
                   title={blockedHint("发至电机")}
@@ -1131,14 +1327,14 @@ export function WorkspacePage({
               <div className="workspace-form-grid">
                 <label className="workspace-field">
                   <span>压力传感器 ID</span>
-                  <select value={sensorDraft.sensorId} onChange={(event) => setSensorDraft((draft) => ({ ...draft, sensorId: Number(event.target.value) }))}>
+                  <select value={sensorDraft.sensorId} onChange={(event) => editSensorDraft({ sensorId: Number(event.target.value) })}>
                     {sensors.map((sensor) => <option key={sensor.id} value={sensor.id}>{sensor.id}</option>)}
                   </select>
                 </label>
                 <label className="workspace-field">
                   <span>校准值 N</span>
                   <input type="number" step={0.01} value={sensorDraft.calibrationValue}
-                    onChange={(event) => setSensorDraft((draft) => ({ ...draft, calibrationValue: Number(event.target.value) }))} />
+                    onChange={(event) => editSensorDraft({ calibrationValue: Number(event.target.value) })} />
                 </label>
               </div>
               <div className="workspace-action-row">
@@ -1209,7 +1405,7 @@ export function WorkspacePage({
                   <label className="workspace-field" key={key}>
                     <span>{key.toUpperCase()}</span>
                     <input type="number" step={0.01} value={pidDraft[key]}
-                      onChange={(event) => setPidDraft((draft) => ({ ...draft, [key]: Number(event.target.value) }))} />
+                      onChange={(event) => applyPidDraft({ ...pidDraft, [key]: Number(event.target.value) })} />
                   </label>
                 ))}
               </div>
@@ -1233,15 +1429,15 @@ export function WorkspacePage({
               <div className="workspace-form-grid workspace-form-grid-cycle">
                 <label className="workspace-field"><span>低阈值</span>
                   <input type="number" step={0.1} value={cycleLowThreshold}
-                    onChange={(event) => setCycleLowThreshold(Number(event.target.value))} />
+                    onChange={(event) => editCycleParams({ low: Number(event.target.value) })} />
                 </label>
                 <label className="workspace-field"><span>高阈值</span>
                   <input type="number" step={0.1} value={cycleHighThreshold}
-                    onChange={(event) => setCycleHighThreshold(Number(event.target.value))} />
+                    onChange={(event) => editCycleParams({ high: Number(event.target.value) })} />
                 </label>
                 <label className="workspace-field"><span>伸出位移</span>
                   <input type="number" step={0.1} value={cycleTargetPosition}
-                    onChange={(event) => setCycleTargetPosition(Number(event.target.value))} />
+                    onChange={(event) => editCycleParams({ target: Number(event.target.value) })} />
                 </label>
               </div>
               <div className="automatic-status-grid">

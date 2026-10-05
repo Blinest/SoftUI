@@ -176,6 +176,45 @@ function proxyRpc(req, res) {
   });
 }
 
+/* ── 桩脚本标签由服务端注入 ──────────────────────────────────────────
+ * 为什么不在源码 index.html 里写死：`vite build` 会用源码里的 index.html
+ * 覆盖 dist/，手写的标签会被抹掉（实际踩过两次，表现为"改了桩但页面还是旧的"）。
+ * 放在服务端注入就与构建解耦，重新构建也不会丢。
+ * 不带版本号：缓存由下面的 no-store 负责，不需要靠 URL 变化来绕过。
+ * ─────────────────────────────────────────────────────────────────── */
+const SHIM_FILE = path.join(ROOT, "tauri-shim.js");
+let shimStamp = { mtime: -1, tag: '<script src="/tauri-shim.js"></script>' };
+
+/**
+ * 桩脚本的引用标签，查询串是**桩文件内容的短哈希**。
+ *
+ * 去掉手写版本号后暴露的真问题：裸 URL `/tauri-shim.js` 在浏览器里可能还留着
+ * 几年前那份缓存（旧版桩不监听新事件，表现就是"完全不触发同步"）。
+ * 用内容哈希自动变化既不需要人管版本，又保证桩一改 URL 就变、缓存必然打不中。
+ * 只在文件 mtime 变化时重算，不产生额外 IO。
+ */
+function shimTag() {
+  let stat;
+  try {
+    stat = fs.statSync(SHIM_FILE);
+  } catch {
+    return shimStamp.tag;
+  }
+  if (stat.mtimeMs === shimStamp.mtime) return shimStamp.tag;
+  const hash = crypto.createHash("sha1").update(fs.readFileSync(SHIM_FILE)).digest("hex").slice(0, 10);
+  shimStamp = { mtime: stat.mtimeMs, tag: `<script src="/tauri-shim.js?h=${hash}"></script>` };
+  return shimStamp.tag;
+}
+
+function injectShimTag(html) {
+  const tag = shimTag();
+  // 已有标签就替换成当前哈希，避免构建产物里残留旧版本
+  if (/<script src="\/tauri-shim\.js[^"]*"><\/script>/.test(html)) {
+    return html.replace(/<script src="\/tauri-shim\.js[^"]*"><\/script>/, tag);
+  }
+  return html.replace('<script type="module"', tag + '\n    <script type="module"');
+}
+
 const server = http.createServer((req, res) => {
   if (BASIC_AUTH && !authorized(req)) return deny(res);
 
@@ -214,7 +253,11 @@ const server = http.createServer((req, res) => {
   const ext = path.extname(filePath).toLowerCase();
   const type = MIME[ext] || "application/octet-stream";
   const isHashed = /-[A-Za-z0-9_-]{8,}\.(js|css)$/.test(path.basename(filePath));
-  const cache = isHashed ? "public, max-age=31536000, immutable" : "no-cache";
+  // no-store 而不是 no-cache：桩脚本必须每次重新下载。
+  // 手机上 no-cache 仍可能命中内存缓存（切标签页不重载时尤其明显），
+  // 结果就是"改了代码但手机端没生效"——这是实际踩过的坑。
+  const isShim = path.basename(filePath) === "tauri-shim.js";
+  const cache = isShim ? "no-store, must-revalidate" : isHashed ? "public, max-age=31536000, immutable" : "no-cache";
 
   const acceptGzip = /\bgzip\b/.test(req.headers["accept-encoding"] || "");
   const gzPath = filePath + ".gz";
@@ -228,6 +271,10 @@ const server = http.createServer((req, res) => {
   }
 
   let body = fs.readFileSync(filePath);
+  // 入口 HTML 出站前注入桩标签，与前端构建解耦
+  if (path.basename(filePath) === "index.html") {
+    body = Buffer.from(injectShimTag(body.toString("utf8")), "utf8");
+  }
   const headers = { "content-type": type, "cache-control": cache, vary: "Accept-Encoding" };
   if (acceptGzip && body.length > 1024 && /^(text|application\/(json|javascript))/.test(type)) {
     body = zlib.gzipSync(body);

@@ -449,13 +449,25 @@ export function CardGrid({
             {header ? (
               <header
                 className={`feature-card-header${draggableFor(card.id) ? " is-draggable" : ""}`}
-                onPointerDown={draggableFor(card.id) ? (event) => beginDrag(event, card.id) : undefined}
-                onPointerMove={draggableFor(card.id) ? moveDrag : undefined}
-                onPointerUp={draggableFor(card.id) ? () => endDrag() : undefined}
-                onPointerCancel={draggableFor(card.id) ? () => endDrag(true) : undefined}
               >
+                {/* 拖拽热区只挂在下面的九点手柄上。原来挂在整条标题栏，
+                    标题文字和操作按钮都会误触发拖动。 */}
                 <div>
-                  {draggableFor(card.id) ? <GripVertical className="feature-card-grip" aria-hidden="true" size={14} /> : null}
+                  {draggableFor(card.id) ? (
+                    <span
+                      className="feature-card-grip-handle"
+                      role="button"
+                      tabIndex={0}
+                      aria-label="拖动以移动卡片"
+                      title="拖动以移动卡片"
+                      onPointerDown={(event) => beginDrag(event, card.id)}
+                      onPointerMove={moveDrag}
+                      onPointerUp={() => endDrag()}
+                      onPointerCancel={() => endDrag(true)}
+                    >
+                      <GripVertical className="feature-card-grip" aria-hidden="true" size={14} />
+                    </span>
+                  ) : null}
                   {header.icon}
                   <h2>{header.title}</h2>
                 </div>

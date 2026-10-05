@@ -275,3 +275,57 @@
   font-size: 12px;
   white-space: nowrap;
 }
+
+
+/* ---- 窄屏（手机）适配 ----------------------------------------------------
+ * 这个文件原来一条 @media 都没有，所以手机上状态栏会硬挤：
+ * 「浅色」「softui」「紧急停止」三个按钮的文字被截断。
+ * 处理原则：只收按钮文字（图标保留，aria-label 不受影响），
+ * **不隐藏任何状态芯片** —— 急停指示是安全信息，再窄也不能丢。
+ * ---------------------------------------------------------------------- */
+
+@media (max-width: 900px) {
+  .global-status-bar {
+    gap: 8px;
+    padding: 0 10px;
+  }
+
+  .global-status-actions {
+    gap: 4px;
+  }
+
+  /* 文字是截断的元凶：窄屏只留图标 */
+  .global-account-control > span,
+  .emergency-stop-button > span {
+    display: none;
+  }
+
+  .global-account-control,
+  .emergency-stop-button {
+    padding: 0 8px;
+  }
+
+  .global-status-items {
+    gap: 6px;
+  }
+
+  .global-status-device {
+    max-width: 34vw;
+  }
+}
+
+@media (max-width: 560px) {
+  .global-status-bar {
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  /* 设备名最先让位：它是可推断信息，状态芯片不是 */
+  .global-status-device {
+    display: none;
+  }
+
+  .global-status-items {
+    gap: 4px;
+  }
+}

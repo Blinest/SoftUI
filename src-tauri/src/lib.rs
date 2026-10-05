@@ -2375,12 +2375,312 @@ fn ws_buffers(
     WS_BUFFERS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/* ── 多端同步 ────────────────────────────────────────────────────────
+ * 数据和设备状态本来就集中在 Rust 进程里（环形缓冲、设备表、录制、动力学），
+ * 所以"多端看到同一份数据"是天然成立的。这一层补的是另外两件事：
+ *   1. 有哪些端在线、各自停在哪一页
+ *   2. 把 UI 动作（切页）广播给其它端，实现"一端操作、多端跟随"
+ *
+ * 只做轮询，不引入长连接：现有前端本来就是轮询模型，1 秒一次足够。
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── 拖动实时同步 ────────────────────────────────────────────────────
+ * 三维拖动编辑的目标形状只存在于**发起端的 React 状态**里，从来没进过后端，
+ * 所以别的端看不到（实测：手机端拖动，电脑端毫无反应）。
+ *
+ * 为什么不用 sync_emit 的事件队列：拖动是 20~50 Hz 的连续流，
+ * 走事件队列会把 100 条缓冲瞬间冲满，而且每个端都要回放几十条旧值。
+ * 这里只需要"最新值"：单槽存储 + 带序号，谁需要谁高频来取。
+ * ─────────────────────────────────────────────────────────────────── */
+
+/* ── 通用 UI 状态同步通道 ────────────────────────────────────────────
+ * 前端状态（拖动目标、末端位姿草稿、电机草稿…）原来各自只活在安装它的
+ * 浏览器里，别的端无从得知。每加一个功能就接一根线不可维护，
+ * 所以这里做**按键单槽**：
+ *   - key 决定是哪个状态（"drag" / "tip" / "motor"…）
+ *   - 每个 key 只保留最新值 + 序号，不需要事件队列（拖动是 20~50Hz 连续流）
+ *   - 客户端按 key 的序号判断"有没有新值"，且跳过自己写的那份，天然防回环
+ * 新增一个同步状态只需换一个 key，后端不用改。
+ * ─────────────────────────────────────────────────────────────────── */
+
+#[cfg(not(feature = "desktop"))]
+#[derive(Default, Clone)]
+struct UiEntry {
+    payload: serde_json::Value,
+    from: String,
+    seq: u64,
+    at_ms: u64,
+}
+
+#[cfg(not(feature = "desktop"))]
+#[derive(Default)]
+struct UiSyncState {
+    seq: u64,
+    entries: std::collections::HashMap<String, UiEntry>,
+}
+
+#[cfg(not(feature = "desktop"))]
+static UI_SYNC: std::sync::OnceLock<Mutex<UiSyncState>> = std::sync::OnceLock::new();
+
+#[cfg(not(feature = "desktop"))]
+fn ui_sync_lock() -> &'static Mutex<UiSyncState> {
+    UI_SYNC.get_or_init(|| Mutex::new(UiSyncState::default()))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn ui_cv() -> &'static (Mutex<()>, std::sync::Condvar) {
+    static CV: std::sync::OnceLock<(Mutex<()>, std::sync::Condvar)> = std::sync::OnceLock::new();
+    CV.get_or_init(|| (Mutex::new(()), std::sync::Condvar::new()))
+}
+
+/// 长轮询：有新值立刻返回，没有就挂到超时（默认 20 秒）。
+///
+/// 这一条替代了原来 1 秒一次的 `ui_state` 轮询 —— 接收侧的延迟从
+/// "最多等一个轮询周期 + 一次往返"降到"一次单程"。
+/// 为什么不直接上 WebSocket：本场景的瓶颈是"接收要等轮询"和"发送排队"，
+/// 长轮询 + 有限并发发送就能拿到绝大部分收益，而 WS 要自己实现握手
+/// （SHA-1 / base64）、帧编解码和广播，且一旦写错会直接打断现有推送。
+#[cfg(not(feature = "desktop"))]
+fn ui_wait(since: u64, timeout_ms: u64) -> Result<serde_json::Value, String> {
+    let (lock, cv) = ui_cv();
+    let mut guard = lock.lock().map_err(|_| "ui wait poisoned".to_string())?;
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms.clamp(1_000, 30_000));
+    loop {
+        let current = ui_sync_lock()
+            .lock()
+            .map_err(|_| "ui sync poisoned".to_string())?
+            .seq;
+        if current > since {
+            break;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let (next_guard, _timed_out) = cv
+            .wait_timeout(guard, deadline - now)
+            .map_err(|_| "ui wait poisoned".to_string())?;
+        guard = next_guard;
+    }
+    drop(guard);
+    ui_snapshot()
+}
+
+#[cfg(not(feature = "desktop"))]
+fn ui_publish(client_id: String, key: String, payload: serde_json::Value) -> Result<u64, String> {
+    let mut state = ui_sync_lock().lock().map_err(|_| "ui sync poisoned".to_string())?;
+    state.seq = state.seq.saturating_add(1);
+    let seq = state.seq;
+    state.entries.insert(
+        key,
+        UiEntry { payload, from: client_id, seq, at_ms: now_ms() },
+    );
+    drop(state);
+    // 唤醒所有挂着的长轮询：新值到了，立刻推出去
+    ui_cv().1.notify_all();
+    Ok(seq)
+}
+
+#[cfg(not(feature = "desktop"))]
+fn ui_snapshot() -> Result<serde_json::Value, String> {
+    let state = ui_sync_lock().lock().map_err(|_| "ui sync poisoned".to_string())?;
+    let now = now_ms();
+    let mut entries = serde_json::Map::new();
+    for (key, entry) in state.entries.iter() {
+        // 超过 30 秒没更新的槽位不再下发：否则别的端会一直卡在某个旧值上，
+        // 而发起端那边其实早就清空了。
+        if now.saturating_sub(entry.at_ms) > 30_000 {
+            continue;
+        }
+        entries.insert(
+            key.clone(),
+            serde_json::json!({
+                "payload": entry.payload,
+                "from": entry.from,
+                "seq": entry.seq,
+                "ageMs": now.saturating_sub(entry.at_ms),
+            }),
+        );
+    }
+    Ok(serde_json::json!({ "seq": state.seq, "entries": entries }))
+}
+
+#[cfg(not(feature = "desktop"))]
+#[derive(Default)]
+struct DragState {
+    seq: u64,
+    from: Option<String>,
+    payload: serde_json::Value,
+    at_ms: u64,
+}
+
+#[cfg(not(feature = "desktop"))]
+static DRAG: std::sync::OnceLock<Mutex<DragState>> = std::sync::OnceLock::new();
+
+#[cfg(not(feature = "desktop"))]
+fn drag_state() -> &'static Mutex<DragState> {
+    DRAG.get_or_init(|| Mutex::new(DragState::default()))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn drag_publish(client_id: String, payload: serde_json::Value) -> Result<u64, String> {
+    let mut state = drag_state().lock().map_err(|_| "drag poisoned".to_string())?;
+    state.seq = state.seq.saturating_add(1);
+    state.from = Some(client_id);
+    state.payload = payload;
+    state.at_ms = now_ms();
+    Ok(state.seq)
+}
+
+#[cfg(not(feature = "desktop"))]
+fn drag_latest() -> Result<serde_json::Value, String> {
+    let state = drag_state().lock().map_err(|_| "drag poisoned".to_string())?;
+    // 超过 5 秒没更新就当作拖动已结束，避免别的端卡在最后一帧预览上
+    let stale = state.at_ms == 0 || now_ms().saturating_sub(state.at_ms) > 5_000;
+    Ok(serde_json::json!({
+        "seq": state.seq,
+        "from": state.from,
+        "ageMs": if state.at_ms == 0 { 0 } else { now_ms().saturating_sub(state.at_ms) },
+        "payload": if stale { serde_json::Value::Null } else { state.payload.clone() },
+    }))
+}
+
+#[cfg(not(feature = "desktop"))]
+#[derive(Default)]
+struct SyncState {
+    /// (client_id, label, page, last_seen_ms)
+    clients: Vec<(String, String, String, u64)>,
+    /// (seq, event)
+    events: Vec<(u64, serde_json::Value)>,
+    seq: u64,
+    /// 当前掌握串口的那一端。手机端据此显示"数据来自谁"。
+    source_id: Option<String>,
+}
+
+#[cfg(not(feature = "desktop"))]
+static SYNC: std::sync::OnceLock<Mutex<SyncState>> = std::sync::OnceLock::new();
+
+#[cfg(not(feature = "desktop"))]
+fn sync_state() -> &'static Mutex<SyncState> {
+    SYNC.get_or_init(|| Mutex::new(SyncState::default()))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn sync_prune(state: &mut SyncState) {
+    let now = now_ms();
+    // 15 秒没心跳就当作下线，避免刷新页面后留下幽灵端
+    state.clients.retain(|client| now.saturating_sub(client.3) < 15_000);
+}
+
+#[cfg(not(feature = "desktop"))]
+fn sync_touch(state: &mut SyncState, client_id: &str, label: &str, page: &str) {
+    let now = now_ms();
+    if let Some(client) = state.clients.iter_mut().find(|c| c.0 == client_id) {
+        client.1 = label.to_string();
+        if !page.is_empty() {
+            client.2 = page.to_string();
+        }
+        client.3 = now;
+    } else {
+        state
+            .clients
+            .push((client_id.to_string(), label.to_string(), page.to_string(), now));
+    }
+}
+
+#[cfg(not(feature = "desktop"))]
+fn sync_set_source(client_id: Option<String>) {
+    if let Ok(mut state) = sync_state().lock() {
+        state.source_id = client_id;
+    }
+}
+
+#[cfg(not(feature = "desktop"))]
+fn sync_hello(client_id: String, label: String) -> Result<u64, String> {
+    let mut state = sync_state().lock().map_err(|_| "sync poisoned".to_string())?;
+    sync_prune(&mut state);
+    sync_touch(&mut state, &client_id, &label, "");
+    Ok(state.seq)
+}
+
+#[cfg(not(feature = "desktop"))]
+fn sync_poll(
+    client_id: String,
+    label: String,
+    page: String,
+    since: u64,
+) -> Result<serde_json::Value, String> {
+    let mut state = sync_state().lock().map_err(|_| "sync poisoned".to_string())?;
+    sync_prune(&mut state);
+    sync_touch(&mut state, &client_id, &label, &page);
+
+    let clients: Vec<serde_json::Value> = state
+        .clients
+        .iter()
+        .map(|(id, label, page, last_seen)| {
+            serde_json::json!({
+                "clientId": id,
+                "label": label,
+                "page": page,
+                "ageMs": now_ms().saturating_sub(*last_seen),
+                "self": *id == client_id,
+            })
+        })
+        .collect();
+    let events: Vec<serde_json::Value> = state
+        .events
+        .iter()
+        .filter(|(seq, _)| *seq > since)
+        .map(|(_, event)| event.clone())
+        .collect();
+
+    let source = match &state.source_id {
+        Some(id) => {
+            let label = state
+                .clients
+                .iter()
+                .find(|client| client.0 == *id)
+                .map(|client| client.1.clone())
+                .unwrap_or_default();
+            serde_json::json!({ "clientId": id, "label": label, "self": *id == client_id })
+        }
+        None => serde_json::Value::Null,
+    };
+
+    Ok(serde_json::json!({
+        "seq": state.seq,
+        "clients": clients,
+        "events": events,
+        "source": source,
+    }))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn sync_emit(client_id: String, mut event: serde_json::Value) -> Result<u64, String> {
+    let mut state = sync_state().lock().map_err(|_| "sync poisoned".to_string())?;
+    sync_prune(&mut state);
+    // 来源由后端盖章，不信前端传的，避免自回环判断被伪造
+    if let serde_json::Value::Object(ref mut map) = event {
+        map.insert("from".to_string(), serde_json::Value::String(client_id));
+    }
+    state.seq = state.seq.saturating_add(1);
+    let seq = state.seq;
+    state.events.push((seq, event));
+    // 只留最近 100 条，防止长期运行内存增长
+    while state.events.len() > 100 {
+        state.events.remove(0);
+    }
+    Ok(seq)
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn webserial_open(
     state: State<'_, AppState>,
     port_name: String,
     baud_rate: Option<u32>,
     device_name: Option<String>,
+    client_id: Option<String>,
 ) -> Result<device::DeviceConnectionRecord, String> {
     let (rx, tx) = {
         let mut map = ws_buffers()
@@ -2396,9 +2696,20 @@ fn webserial_open(
         .devices
         .lock()
         .map_err(|_| "device registry poisoned".to_string())?;
-    devices
+    let record = devices
         .open_webserial(&port_name, baud_rate.unwrap_or(115_200), device_name, rx, tx)
-        .map_err(|error| format!("{error:?}"))
+        .map_err(|error| format!("{error:?}"))?;
+    // 真实设备上来了，把模拟设备摘掉，避免两个数据源同时喂图表
+    devices.remove_simulator();
+    // 关键：还要清掉环形缓冲里残留的模拟帧。否则真实设备万一不发数据
+    // （波特率不对、接线问题），界面会继续显示这些旧模拟帧，
+    // 让人把假数据当成真数据 —— 那比白屏危险得多。
+    if let Ok(mut ring) = state.live_ring.lock() {
+        ring.clear();
+    }
+    // 记下是谁在供数据：手机端据此显示"数据来自电脑端"
+    sync_set_source(client_id);
+    Ok(record)
 }
 
 /// 前端把从串口读到的原始字节推进来。返回本次接受的字节数。
@@ -2444,7 +2755,13 @@ fn webserial_close(state: State<'_, AppState>, port_name: String) -> Result<(), 
         .map_err(|_| "device registry poisoned".to_string())?;
     devices
         .close_webserial(&port_name)
-        .map_err(|error| format!("{error:?}"))
+        .map_err(|error| format!("{error:?}"))?;
+    // 真实设备全断了：清掉数据源标记，并补回模拟设备
+    if !devices.has_real_device() {
+        sync_set_source(None);
+    }
+    devices.ensure_simulator();
+    Ok(())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -4512,7 +4829,8 @@ fn dispatch(
             let port_name: String = arg(args, "port_name")?;
             let baud_rate: Option<u32> = arg_opt(args, "baud_rate")?;
             let device_name: Option<String> = arg_opt(args, "device_name")?;
-            webserial_open(st, port_name, baud_rate, device_name)
+            let client_id: Option<String> = arg_opt(args, "client_id")?;
+            webserial_open(st, port_name, baud_rate, device_name, client_id)
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "webserial_push" => {
@@ -4529,6 +4847,51 @@ fn dispatch(
         "webserial_close" => {
             let port_name: String = arg(args, "port_name")?;
             webserial_close(st, port_name)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "sync_hello" => {
+            let client_id: String = arg(args, "client_id")?;
+            let label: String = arg(args, "label")?;
+            sync_hello(client_id, label)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "sync_poll" => {
+            let client_id: String = arg(args, "client_id")?;
+            let label: String = arg(args, "label")?;
+            let page: String = arg(args, "page")?;
+            let since: u64 = arg(args, "since")?;
+            sync_poll(client_id, label, page, since)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "sync_emit" => {
+            let client_id: String = arg(args, "client_id")?;
+            let event: serde_json::Value = arg(args, "event")?;
+            sync_emit(client_id, event)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "drag_publish" => {
+            let client_id: String = arg(args, "client_id")?;
+            let payload: serde_json::Value = arg(args, "payload")?;
+            drag_publish(client_id, payload)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "drag_latest" => {
+            drag_latest().and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "ui_publish" => {
+            let client_id: String = arg(args, "client_id")?;
+            let key: String = arg(args, "key")?;
+            let payload: serde_json::Value = arg(args, "payload")?;
+            ui_publish(client_id, key, payload)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "ui_state" => {
+            ui_snapshot().and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "ui_wait" => {
+            let since: u64 = arg(args, "since")?;
+            let timeout_ms: Option<u64> = arg_opt(args, "timeout_ms")?;
+            ui_wait(since, timeout_ms.unwrap_or(20_000))
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         other => Err(format!("未知命令：{other}")),

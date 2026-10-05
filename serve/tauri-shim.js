@@ -684,6 +684,12 @@
     return wsPorts.map(wsDescribe);
   }
 
+  /* 角色判定：没有 Web Serial 就是观察端（手机浏览器都没有这个 API）。
+   * 观察端只做显示与指令下发，串口由电脑端提供 —— 这是刻意的架构，
+   * 不该在界面上表现成"功能不可用"的错误。 */
+  var IS_TOUCH = "ontouchstart" in window || (navigator.maxTouchPoints || 0) > 0;
+  var OBSERVER = !navigator.serial;
+
   var DEVICE_NAME = (/[?&]device=([A-Za-z0-9_.-]{1,32})/.exec(location.search) || [])[1] || "TDCR_v1";
   var wsHasGranted = false;
 
@@ -691,7 +697,9 @@
     if (!navigator.serial || typeof navigator.serial.getPorts !== "function") {
       var why = window.isSecureContext === false
         ? "当前不是安全上下文（Web Serial 要求 HTTPS 或 localhost）。"
-        : "当前浏览器不支持 Web Serial —— 请用桌面版 Chrome 或 Edge。";
+        : OBSERVER && IS_TOUCH
+          ? "本端为观察端：串口由电脑端提供。这里可以看实时数据、下发控制指令，不需要在本端接设备。"
+          : "当前浏览器不支持 Web Serial —— 请用桌面版 Chrome 或 Edge。";
       return Promise.reject(new Error(why));
     }
 
@@ -817,6 +825,7 @@
         return doRpc("webserial_open", {
           portName: name,
           baudRate: baud,
+          clientId: SYNC_ID,
           // 设备显示名。Web Serial 拿不到 COM 号，这里给一个业务上有意义的名字，
           // 界面和录制会话里就用它标识设备。
           deviceName: DEVICE_NAME,
@@ -831,8 +840,15 @@
         return record;
       })
       .catch(function (error) {
-        var msg = (error && error.message) ? error.message : String(error);
-        throw new Error("打开本机串口失败：" + msg);
+        // 连到一半失败时后端可能已经注册了设备并摘掉了模拟设备，
+        // 这里必须补一次关闭，否则两边都空着（界面一台设备都没有）。
+        try { port.close(); } catch (ignored) {}
+        return doRpc("webserial_close", { portName: name })
+          .catch(function () {})
+          .then(function () {
+            var msg = (error && error.message) ? error.message : String(error);
+            throw new Error("打开本机串口失败：" + msg);
+          });
       });
   }
 
@@ -862,6 +878,164 @@
         };
       });
   }
+
+  /* ── 多端同步客户端 ────────────────────────────────────────────────
+   * 数据本来就是服务端共享的，这里只补 UI 层的同步：
+   *   - 每秒上报 "我是谁 / 停在哪一页"，换取在线端列表和别人的动作
+   *   - 开了 ?sync=1 时，别人切页会带动本端一起切（"一端操作、多端跟随"）
+   * 默认不开自动跟随：多人同时看不同页是正常需求，强制跟随反而烦人。
+   * ─────────────────────────────────────────────────────────────── */
+  var SYNC_ID = (function () {
+    try {
+      var key = "softui:clientId";
+      var existing = sessionStorage.getItem(key);
+      if (!existing) {
+        existing = "c" + Math.random().toString(36).slice(2, 10);
+        sessionStorage.setItem(key, existing);
+      }
+      return existing;
+    } catch (error) {
+      return "c" + Math.random().toString(36).slice(2, 10);
+    }
+  })();
+  var SYNC_LABEL =
+    window.matchMedia && window.matchMedia("(max-width: 640px)").matches ? "手机" : "桌面";
+  var SYNC_ON = /[?&]sync=1\b/.test(location.search);
+  var SYNC_SEQ = 0;
+  var SYNC_CLIENTS = 0;
+  var SYNC_SOURCE = null;
+  var SYNC_LAST_PAGE = null;
+  var syncBusy = false;
+
+  function syncTick() {
+    if (syncBusy) return;
+    syncBusy = true;
+    var path = location.pathname;
+    doRpc("sync_poll", { clientId: SYNC_ID, label: SYNC_LABEL, page: path, since: SYNC_SEQ })
+      .then(function (res) {
+        if (!res) return;
+        if (typeof res.seq === "number") SYNC_SEQ = res.seq;
+        SYNC_CLIENTS = (res.clients || []).length;
+        SYNC_SOURCE = res.source || null;
+
+        (res.events || []).forEach(function (event) {
+          if (!event || event.from === SYNC_ID) return;
+          if (event.type === "page" && SYNC_ON && typeof event.page === "string") {
+            var link = document.querySelector('a.sidebar-nav-link[href="' + event.page + '"]');
+            if (link) link.click();
+          }
+        });
+
+        if (SYNC_LAST_PAGE === null) {
+          SYNC_LAST_PAGE = path; // 首帧只记录，不广播
+        } else if (SYNC_ON && path !== SYNC_LAST_PAGE) {
+          SYNC_LAST_PAGE = path;
+          doRpc("sync_emit", { clientId: SYNC_ID, event: { type: "page", page: path } }).catch(
+            function () {},
+          );
+        }
+      })
+      .catch(function () {})
+      .then(function () {
+        syncBusy = false;
+      });
+  }
+
+  setInterval(syncTick, 1000);
+  setTimeout(syncTick, 800);
+
+  /* ── 通用 UI 状态同步 ────────────────────────────────────────────────
+   * 前端状态（拖动目标 / 末端位姿草稿 / 电机草稿…）各自只活在安装它的浏览器里，
+   * 别的端无从得知。这里统一走一条按键单槽通道：
+   *   本端改 → softui:local-ui  → ui_publish(key, 最新值)
+   *   别端改 → ui_state 轮询    → softui:remote-ui(key, 值)
+   * 换一个 key 就能同步一种新状态，不用再改传输层。
+   *
+   * 速率自适应：有人在动时 50ms，空闲 1s —— 拖动是连续流，空闲时不该占带宽。
+   * 自己写的那份按 from 跳过，天然防回环。
+   * ─────────────────────────────────────────────────────────────────── */
+  var UI_SEEN = {};          // key -> 已应用的 seq
+  var UI_PUB = 0;            // 本端发布次数
+  var UI_RECV = 0;           // 收到别端次数
+  var UI_BOOST_UNTIL = 0;
+
+  /* 本端改动的发送策略：**合并 + 限频**。
+   *
+   * 原来每个 pointermove 都发一次完整状态。拖动是 60Hz，而隧道上行只有
+   * 约 250KB/s —— 一份拖动目标是几 KB，请求立刻在队列里堆起来，
+   * 最后一帧要排队好几秒才发出去，对端拿到的自然是旧值（"值不一致"的根因）。
+   *
+   * 现在：按键只保留最新待发值，最多 25Hz 发一次，且同一 key 在途时跳过。
+   * 于是队列永远最多积压一份，**最后一帧一定会被发出去**，
+   * 不会因为"中间那些没人看"而丢掉终点值。 */
+  var UI_PENDING = {};
+  var UI_INFLIGHT = {};
+  var UI_FLUSH_TIMER = null;
+
+  function scheduleFlush() {
+    if (UI_FLUSH_TIMER) return;
+    UI_FLUSH_TIMER = setTimeout(flushUi, 40); // 上限 25Hz
+  }
+
+  function flushUi() {
+    UI_FLUSH_TIMER = null;
+    Object.keys(UI_PENDING).forEach(function (key) {
+      // 允许最多 2 个在途：原来只放 1 个，发送速率被往返时延卡死在 1/RTT。
+      // 放 2 个能把有效速率翻倍，又不会让队列无限堆积（仍然只积压最新值）。
+      if ((UI_INFLIGHT[key] || 0) >= 2) return;
+      var payload = UI_PENDING[key];
+      delete UI_PENDING[key];
+      UI_INFLIGHT[key] = (UI_INFLIGHT[key] || 0) + 1;
+      UI_PUB += 1;
+      doRpc("ui_publish", { clientId: SYNC_ID, key: key, payload: payload })
+        .catch(function () {})
+        .then(function () {
+          UI_INFLIGHT[key] -= 1;
+          if (Object.prototype.hasOwnProperty.call(UI_PENDING, key)) scheduleFlush();
+        });
+    });
+  }
+
+  window.addEventListener("softui:local-ui", function (event) {
+    UI_BOOST_UNTIL = Date.now() + 1500;
+    var detail = (event && event.detail) || {};
+    if (!detail.key) return;
+    UI_PENDING[detail.key] = detail.payload === undefined ? null : detail.payload;
+    scheduleFlush();
+  });
+
+  var UI_GLOBAL_SEQ = 0;
+
+  function uiTick() {
+    // 长轮询：后端有新值会立刻返回，没值最多挂 20 秒再回来。
+    // 接收延迟因此从"最多一个轮询周期 + 往返"降到"一次单程"。
+    doRpc("ui_wait", { since: UI_GLOBAL_SEQ, timeoutMs: 20000 })
+      .then(function (res) {
+        if (res && typeof res.seq === "number") UI_GLOBAL_SEQ = res.seq;
+        var entries = (res && res.entries) || {};
+        Object.keys(entries).forEach(function (key) {
+          var entry = entries[key];
+          if (!entry || entry.from === SYNC_ID) return;
+          if (UI_SEEN[key] === entry.seq) return;
+          UI_SEEN[key] = entry.seq;
+          UI_RECV += 1;
+          UI_BOOST_UNTIL = Date.now() + 1200;
+          window.dispatchEvent(
+            new CustomEvent("softui:remote-ui", { detail: { key: key, payload: entry.payload } }),
+          );
+        });
+      })
+      .catch(function () {})
+      .catch(function () {
+        // 长轮询失败（后端重启等）：退避 1 秒再试，不要打爆服务
+        return new Promise(function (resolve) { setTimeout(resolve, 1000); });
+      })
+      .then(function () {
+        uiTick();
+      });
+  }
+
+  setTimeout(uiTick, 900);
 
   var windowInFlight = null;
   var windowLast = null;
@@ -932,7 +1106,7 @@
   };
 
   window.__SOFTUI_SHIM__ = {
-    version: 5.3,
+    version: 9.0,
     calls: function () { return lastCalls.slice(); },
     snapshot: function () { return clone(snapshot); },
   };
@@ -956,11 +1130,14 @@
     (document.body || document.documentElement).appendChild(el);
 
     setInterval(function () {
-      var ws = !navigator.serial
-        ? "不可用"
-        : (window.isSecureContext === false ? "需HTTPS" : "可用/" + wsPorts.length + "口");
+      var role = OBSERVER ? "观察端" : "数据源端";
+      var src = SYNC_SOURCE
+        ? (SYNC_SOURCE.self ? " · 本端供数" : " · 源:" + (SYNC_SOURCE.label || SYNC_SOURCE.clientId))
+        : " · 无串口";
+      var multi = SYNC_CLIENTS > 0 ? " · 多端" + SYNC_CLIENTS + (SYNC_ON ? "(跟随)" : "") : "";
       if (backend.mode === "rust") {
-        el.textContent = "后端 Rust · " + backend.rust + " 次 · Web Serial " + ws;
+        el.textContent =
+          "Rust · " + role + src + multi + " · 同步↑" + UI_PUB + "↓" + UI_RECV;
         el.style.borderColor = "rgba(80,200,120,.55)";
       } else if (backend.mode === "sim") {
         el.textContent = "后端 浏览器仿真（Rust 不可达）· 仿真 " + backend.sim + " 次";
@@ -977,5 +1154,5 @@
     mountBadge();
   }
 
-  console.warn("[tauri-shim v5.3] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
+  console.warn("[tauri-shim v9.0] 网页预览模式：内置 6 腱连续体机械臂仿真（100 Hz），录制与回放可用。");
 })();

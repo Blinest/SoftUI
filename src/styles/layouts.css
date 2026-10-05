@@ -280,16 +280,35 @@ body.card-dragging .card-grid .feature-card.is-dragging,
   opacity: 0.55;
 }
 
-.feature-card-header.is-draggable {
+/* 拖拽热区只保留九点手柄本身，不再覆盖整条标题栏：
+   标题栏上还有标题文字和操作按钮，整条可拖会误触。 */
+.feature-card-grip-handle {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px;
+  margin: 0 1px 0 -3px;
+  border-radius: 4px;
   cursor: grab;
   touch-action: none;
+  transition: background-color 120ms ease;
 }
 
-.feature-card-header.is-draggable:hover .feature-card-grip {
+.feature-card-grip-handle:hover {
+  background: rgba(127, 127, 127, 0.16);
+}
+
+.feature-card-grip-handle:hover .feature-card-grip {
   opacity: 1;
 }
 
-body.card-dragging .feature-card-header.is-draggable {
+.feature-card-grip-handle:focus-visible {
+  outline: 2px solid var(--accent, #4c8dff);
+  outline-offset: 1px;
+}
+
+body.card-dragging .feature-card-grip-handle {
   cursor: grabbing;
 }
 

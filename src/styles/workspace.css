@@ -548,6 +548,10 @@
 .tip-pose-result strong {
   font-size: 13px;
   font-variant-numeric: tabular-nums;
+  /* 窄屏下"命中表点（12）""1.23 1/m"这类文本会超出格子，
+     允许在任意处换行，宁可两行也不要被裁掉。 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .tip-pose-result strong.is-warn {
@@ -720,10 +724,19 @@
 }
 
 /* 「目标末端位姿」三格输入：位置 xyz / 姿态 rpy 各一行三格。 */
+/* 末端位姿的 6 个输入格（位置 xyz / 姿态 rpy）。
+ *
+ * 原来用 `minmax(0, 1fr)` + 输入框 `min-width: 0`，格子可以被压到比内容还窄 ——
+ * 数字和 number 输入框的调节箭头直接被裁掉（手机上实测显示不全）。
+ * 现在给格子一个 72px 下限：放得下就均分，放不下就整行横向滚动，
+ * 保证每个数字至少能完整看到。 */
 .curvature-summary-fields {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(72px, 1fr));
   gap: 4px;
+  overflow-x: auto;
+  padding-bottom: 2px; /* 给横向滚动条留位置，免得盖住输入框 */
+  scrollbar-width: thin;
 }
 
 .curvature-summary-fields input {
@@ -943,4 +956,42 @@
 .primary-btn.is-blocked:hover,
 .ghost-btn.is-blocked:hover {
   background: color-mix(in srgb, var(--status-warning) 24%, var(--button-default-bg));
+}
+
+/* ---- 窄屏（手机）兜底：末端位姿与查表结果 --------------------------------
+ * 上面已有的容器查询只处理了 .tip-pose-grid，漏掉了实际渲染输入框的
+ * .curvature-summary-fields 和结果区 .tip-pose-result。
+ * 这里用媒体查询兜底，不依赖容器查询是否被支持。
+ * -------------------------------------------------------------------- */
+/* 窄屏改为**单列**：既然一列就装得下，就不该再出现横向滚动条 ——
+ * 横向滚动在手机上很难用（要精确拖很容易误触），而且单列时输入框是满宽的，
+ * 数字、单位、调节箭头全都能完整显示，不需要靠滚动去够。
+ * 横向滚动只保留在多列布局中当最后一道兜底（见上面的基础规则）。 */
+@media (max-width: 620px) {
+  .curvature-summary-fields {
+    grid-template-columns: minmax(0, 1fr);
+    overflow-x: visible;
+    padding-bottom: 0;
+  }
+
+  .tip-pose-result {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tip-pose-result span,
+  .tip-pose-result strong {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+}
+
+@media (max-width: 400px) {
+  .curvature-summary-fields {
+    gap: 3px;
+  }
+
+  .curvature-summary-fields input {
+    padding: 0 6px;
+    font-size: 12px;
+  }
 }
