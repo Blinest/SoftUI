@@ -40,8 +40,6 @@ import type {
   LogEntry,
   LoginResult,
   RegistrationMode,
-  LegacyMigrationPreview,
-  LegacyMigrationReport,
   LiveLatest,
   PlaybackStatus,
   RecorderStatus,
@@ -487,9 +485,6 @@ function AppShell() {
   }, [publishUi, lastSystemControl]);
   /** 回放控件是否被收起（回放本身继续，只把界面藏起来）。 */
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
-  const [migrationSource, setMigrationSource] = useState("");
-  const [migrationPreview, setMigrationPreview] = useState<LegacyMigrationPreview | null>(null);
-  const [migrationReport, setMigrationReport] = useState<LegacyMigrationReport | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authBusy, setAuthBusy] = useState(false);
   // 启动即折叠：导航占了横向空间，默认收起让主内容区更宽，需要时点左上角展开。
@@ -802,56 +797,6 @@ function AppShell() {
       setDiagnosticsPath(invokeError instanceof Error ? invokeError.message : String(invokeError));
     }
   }, [snapshot.authSession.username]);
-
-  const previewMigration = useCallback(async () => {
-    if (!migrationSource.trim()) return;
-    try {
-      const preview = await invoke<LegacyMigrationPreview>("preview_legacy_migration", {
-        sourceDir: migrationSource.trim(),
-        targetDir: null,
-      });
-      setMigrationPreview(preview);
-      setMigrationReport(null);
-    } catch (invokeError) {
-      setMigrationPreview({
-        sourceDir: migrationSource.trim(),
-        targetDir: "",
-        exists: false,
-        userFiles: 0,
-        configFiles: 0,
-        csvFiles: 0,
-        logFiles: 0,
-        skippedFiles: 0,
-        warnings: [invokeError instanceof Error ? invokeError.message : String(invokeError)],
-      });
-    }
-  }, [migrationSource]);
-
-  const runMigration = useCallback(async () => {
-    if (!migrationSource.trim()) return;
-    try {
-      const report = await invoke<LegacyMigrationReport>("run_legacy_migration", {
-        sourceDir: migrationSource.trim(),
-        targetDir: null,
-      });
-      setMigrationReport(report);
-      setMigrationPreview(report.preview);
-      await fetchSnapshot("tick_snapshot");
-    } catch (invokeError) {
-      setMigrationReport(null);
-      setMigrationPreview({
-        sourceDir: migrationSource.trim(),
-        targetDir: "",
-        exists: false,
-        userFiles: 0,
-        configFiles: 0,
-        csvFiles: 0,
-        logFiles: 0,
-        skippedFiles: 0,
-        warnings: [invokeError instanceof Error ? invokeError.message : String(invokeError)],
-      });
-    }
-  }, [fetchSnapshot, migrationSource]);
 
   const toggleRecording = useCallback(async () => {
     if (recorderStatus.active) {
@@ -1292,14 +1237,8 @@ function AppShell() {
                   snapshot={snapshot}
                   recorderStatus={recorderStatus}
                   diagnosticsPath={diagnosticsPath}
-                  migrationSource={migrationSource}
-                  migrationPreview={migrationPreview}
-                  migrationReport={migrationReport}
                   onToggleTheme={toggleTheme}
                   onExportDiagnostics={exportDiagnostics}
-                  onMigrationSourceChange={setMigrationSource}
-                  onPreviewMigration={previewMigration}
-                  onRunMigration={runMigration}
                   onResetLayouts={resetLayouts}
                 />
               }

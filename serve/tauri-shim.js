@@ -528,7 +528,6 @@
 
     /* ── 其它 ── */
     model_status: function () { return clone(snapshot.model); },
-    preview_legacy_migration: function () { return null; },
     set_theme: function (args) {
       var t = args && args.theme;
       if (t === "light" || t === "dark" || t === "system") {

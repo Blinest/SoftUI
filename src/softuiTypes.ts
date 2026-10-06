@@ -467,24 +467,6 @@ export interface LoginResult {
   activeDevices: number;
 }
 
-export interface LegacyMigrationPreview {
-  sourceDir: string;
-  targetDir: string;
-  exists: boolean;
-  userFiles: number;
-  configFiles: number;
-  csvFiles: number;
-  logFiles: number;
-  skippedFiles: number;
-  warnings: string[];
-}
-
-export interface LegacyMigrationReport {
-  preview: LegacyMigrationPreview;
-  copiedFiles: number;
-  reportPath: string;
-}
-
 export interface RecorderStatus {
   active: boolean;
   sessionId: string;

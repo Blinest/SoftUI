@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CheckCircle2, Cpu, Database, Eye, RefreshCw, ShieldX, SunMedium, Users } from "lucide-react";
+import { CheckCircle2, Cpu, RefreshCw, ShieldX, SunMedium, Users } from "lucide-react";
 
 import Badge from "../components/Badge";
 import { SettingsNavigation } from "../components/SettingsNavigation";
@@ -9,8 +9,6 @@ import { settingsSections, type SettingsSection } from "./settingsSections";
 import { hasPermission, CAPABILITY_MATRIX, PERMISSION_REASON, ROLE_DUTY } from "../state/permissions";
 import type {
   ClientSessionView,
-  LegacyMigrationPreview,
-  LegacyMigrationReport,
   RecorderStatus,
   RuntimeSnapshot,
 } from "../softuiTypes";
@@ -31,14 +29,8 @@ export interface SettingsPageProps {
   snapshot: RuntimeSnapshot;
   recorderStatus: RecorderStatus;
   diagnosticsPath: string;
-  migrationSource: string;
-  migrationPreview: LegacyMigrationPreview | null;
-  migrationReport: LegacyMigrationReport | null;
   onToggleTheme: () => void;
   onExportDiagnostics: () => void;
-  onMigrationSourceChange: (value: string) => void;
-  onPreviewMigration: () => void;
-  onRunMigration: () => void;
   onResetLayouts: () => void;
 }
 
@@ -47,14 +39,8 @@ export function SettingsPage({
   snapshot,
   recorderStatus,
   diagnosticsPath,
-  migrationSource,
-  migrationPreview,
-  migrationReport,
   onToggleTheme,
   onExportDiagnostics,
-  onMigrationSourceChange,
-  onPreviewMigration,
-  onRunMigration,
   onResetLayouts,
 }: SettingsPageProps) {
   const [activeSection, setActiveSection] = useState<SettingsSection>("application");
@@ -63,13 +49,10 @@ export function SettingsPage({
   const [mySessions, setMySessions] = useState<ClientSessionView[]>([]);
   const [ownOldPassword, setOwnOldPassword] = useState("");
   const [ownNewPassword, setOwnNewPassword] = useState("");
+  /** 本账号各设备的 IP 属地（由网关代查并缓存）。查不到就显示"—"。 */
+  const [geoByIp, setGeoByIp] = useState<Record<string, string>>({});
 
   const canDiagnostics = hasPermission(snapshot, "viewDiagnostics");
-  const canManageSettings = hasPermission(snapshot, "manageSettings");
-
-  const migrationTotal = migrationPreview
-    ? migrationPreview.userFiles + migrationPreview.configFiles + migrationPreview.csvFiles + migrationPreview.logFiles
-    : 0;
 
   /* 注意这里查的是 `list_my_sessions`（自助接口），不是管理员的 `list_clients`。
    * 前台只该看到自己的设备 —— 全站在线设备、别人在哪个 IP、账号列表这些都归
@@ -87,6 +70,35 @@ export function SettingsPage({
   useEffect(() => {
     void loadMySessions();
   }, [loadMySessions]);
+
+  /* 查自己设备的 IP 属地。和后台用的是同一个网关接口。
+   * 查不到（离线 / 被限流 / 桌面版没有网关）就保持空，界面显示"—"。 */
+  useEffect(() => {
+    const ips = Array.from(
+      new Set(
+        mySessions
+          .map((item) => (item.ip ?? "").trim())
+          .filter((ip) => ip.length > 0),
+      ),
+    );
+    if (ips.length === 0) {
+      setGeoByIp({});
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const resp = await fetch(`/geo?ips=${encodeURIComponent(ips.join(","))}`);
+        const payload = (await resp.json()) as { data?: Record<string, string> };
+        if (!cancelled) setGeoByIp(payload?.data ?? {});
+      } catch {
+        if (!cancelled) setGeoByIp({});
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mySessions]);
 
   const runAccountAction = async (action: () => Promise<void>, successMessage: string) => {
     setAccountMessage("");
@@ -126,15 +138,38 @@ export function SettingsPage({
       case "application":
         return (
           <section className="settings-panel">
-            <header><div><span className="panel-kicker">settings</span><h2>应用与路径</h2></div></header>
+            <header><div><span className="panel-kicker">settings</span><h2>应用信息</h2></div></header>
             <div className="settings-stack">
+              <div className="settings-row"><span>后端</span><strong>{snapshot.appInfo.backend}</strong></div>
+              <div className="settings-row"><span>版本</span><strong>{snapshot.appInfo.version}</strong></div>
               <div className="settings-row"><span>数据目录</span><strong title={snapshot.settings.dataDirectory}>{snapshot.settings.dataDirectory}</strong></div>
               <div className="settings-row"><span>模型目录</span><strong title={snapshot.settings.modelDirectory}>{snapshot.settings.modelDirectory}</strong></div>
               <div className="settings-row"><span>当前会话</span><strong>{snapshot.dashboard.currentSession || "—"}</strong></div>
-              <div className="settings-row"><span>激活配置</span><strong>{snapshot.connection.activeProfileName || "—"}</strong></div>
-              <div className="settings-row"><span>后端</span><strong>{snapshot.appInfo.backend}</strong></div>
-              <div className="settings-row"><span>版本</span><strong>{snapshot.appInfo.version}</strong></div>
             </div>
+
+            <div className="settings-subheader">
+              <h3>连接</h3>
+              <span>串口与连接配置。要新增配置，可在设备工作台里连接后勾选「保存为配置」。</span>
+            </div>
+            <div className="settings-stack">
+              <div className="settings-row"><span>连接状态</span><strong>{snapshot.connection.state}</strong></div>
+              <div className="settings-row"><span>握手步骤</span><strong>{snapshot.connection.handshakeStep || "—"}</strong></div>
+              <div className="settings-row"><span>订阅串口</span><strong>{snapshot.connection.ports.length}</strong></div>
+              <div className="settings-row"><span>激活配置</span><strong>{snapshot.connection.activeProfileName || "—"}</strong></div>
+              <div className="settings-row"><span>自动重连</span><strong>{snapshot.settings.autoReconnect ? "启用" : "关闭"}</strong></div>
+            </div>
+            {snapshot.connection.profiles.length === 0 ? (
+              <div className="settings-result">还没有保存的连接配置。</div>
+            ) : (
+              <div className="settings-profile-list">
+                {snapshot.connection.profiles.map((profile) => (
+                  <div className="settings-row" key={profile.id}>
+                    <span>{profile.name}</span>
+                    <strong>{profile.port} @ {profile.baudRate.toLocaleString()}</strong>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
         );
 
@@ -155,31 +190,6 @@ export function SettingsPage({
                 <span>重置卡片布局</span>
               </button>
             </div>
-          </section>
-        );
-
-      case "connection":
-        return (
-          <section className="settings-panel">
-            <header><div><span className="panel-kicker">settings</span><h2>连接配置</h2></div></header>
-            <div className="settings-stack">
-              <div className="settings-row"><span>连接状态</span><strong>{snapshot.connection.state}</strong></div>
-              <div className="settings-row"><span>握手步骤</span><strong>{snapshot.connection.handshakeStep || "—"}</strong></div>
-              <div className="settings-row"><span>订阅串口</span><strong>{snapshot.connection.ports.length}</strong></div>
-              <div className="settings-row"><span>自动重连</span><strong>{snapshot.settings.autoReconnect ? "启用" : "关闭"}</strong></div>
-            </div>
-            {snapshot.connection.profiles.length === 0 ? (
-              <div className="settings-result">还没有保存的连接配置。可在设备工作台里连接后保存。</div>
-            ) : (
-              <div className="settings-profile-list">
-                {snapshot.connection.profiles.map((profile) => (
-                  <div className="settings-row" key={profile.id}>
-                    <span>{profile.name}</span>
-                    <strong>{profile.port} @ {profile.baudRate.toLocaleString()}</strong>
-                  </div>
-                ))}
-              </div>
-            )}
           </section>
         );
 
@@ -240,7 +250,9 @@ export function SettingsPage({
                         <span className="settings-client-tag">{item.role}</span>
                       </strong>
                       <span>
-                        {item.ip || "地址未知"} · 最近活动 {formatRelative(item.lastSeenMs)}
+                        {item.ip || "地址未知"}
+                        {geoByIp[item.ip] ? ` · ${geoByIp[item.ip]}` : ""} · 最近活动{" "}
+                        {formatRelative(item.lastSeenMs)}
                       </span>
                       <span className="settings-client-agent" title={item.userAgent}>
                         {item.userAgent || "—"}
@@ -323,60 +335,6 @@ export function SettingsPage({
           </section>
         );
 
-      case "migration":
-        return (
-          <section className="settings-panel">
-            <header><div><span className="panel-kicker">migration</span><h2>数据迁移</h2></div></header>
-            <div className="migration-form">
-              <label>
-                <span>旧版目录</span>
-                <input
-                  type="text"
-                  value={migrationSource}
-                  onChange={(event) => onMigrationSourceChange(event.target.value)}
-                  placeholder="例如 D:\\...\\SoftUI"
-                />
-              </label>
-              <button
-                type="button"
-                className="ghost-btn"
-                disabled={!canManageSettings}
-                title={canManageSettings ? undefined : PERMISSION_REASON.manageSettings}
-                onClick={onPreviewMigration}
-              >
-                <Eye size={16} /><span>预览</span>
-              </button>
-              <button
-                type="button"
-                className="primary-btn"
-                onClick={onRunMigration}
-                disabled={!canManageSettings || !migrationPreview?.exists}
-                title={canManageSettings ? undefined : PERMISSION_REASON.manageSettings}
-              >
-                <Database size={16} /><span>执行迁移</span>
-              </button>
-            </div>
-
-            {migrationPreview ? (
-              <div className="migration-summary">
-                <div><span>用户</span><strong>{migrationPreview.userFiles}</strong></div>
-                <div><span>配置</span><strong>{migrationPreview.configFiles}</strong></div>
-                <div><span>CSV</span><strong>{migrationPreview.csvFiles}</strong></div>
-                <div><span>日志</span><strong>{migrationPreview.logFiles}</strong></div>
-                <div><span>可迁移</span><strong>{migrationTotal}</strong></div>
-                <div><span>跳过</span><strong>{migrationPreview.skippedFiles}</strong></div>
-              </div>
-            ) : null}
-
-            {migrationPreview?.warnings.length ? (
-              <div className="settings-warning">
-                {migrationPreview.warnings.slice(0, 3).map((warning) => <span key={warning}>{warning}</span>)}
-              </div>
-            ) : null}
-
-            {migrationReport ? <div className="settings-result" title={migrationReport.reportPath}>报告：{migrationReport.reportPath}</div> : null}
-          </section>
-        );
     }
   };
 

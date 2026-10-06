@@ -4,7 +4,6 @@ pub mod device;
 pub mod dynamics;
 pub mod kappatable;
 pub mod live;
-pub mod migration;
 pub mod model;
 pub mod playback;
 pub mod posetable;
@@ -2453,57 +2452,6 @@ fn diagnostics_bundle(state: State<'_, AppState>) -> Result<serde_json::Value, S
     Ok(state.diagnostics_bundle())
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-fn preview_legacy_migration(
-    state: State<'_, AppState>,
-    source_dir: String,
-    target_dir: Option<String>,
-) -> Result<migration::LegacyMigrationPreview, String> {
-    guard_permission(&state, auth::Permission::ManageSettings)?;
-    let target = target_dir.map(PathBuf::from).unwrap_or_else(|| {
-        state
-            .store
-            .path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("legacy-migrations")
-    });
-    Ok(migration::preview_legacy_migration(
-        PathBuf::from(source_dir),
-        target,
-    ))
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-fn run_legacy_migration(
-    state: State<'_, AppState>,
-    source_dir: String,
-    target_dir: Option<String>,
-) -> Result<migration::LegacyMigrationReport, String> {
-    guard_permission(&state, auth::Permission::ManageSettings)?;
-    let target = target_dir.map(PathBuf::from).unwrap_or_else(|| {
-        state
-            .store
-            .path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("legacy-migrations")
-    });
-    let report = migration::run_legacy_migration(PathBuf::from(source_dir), target)?;
-    let report_path = report.report_path.clone();
-    state.store.mutate(|data| {
-        data.sequence = data.sequence.saturating_add(1);
-        data.logs.push(log_entry(
-            data.sequence,
-            LogLevel::Info,
-            "migration",
-            "Legacy data migration completed",
-            Some(&report_path),
-            None,
-        ));
-    });
-    Ok(report)
-}
 
 /* ── Web Serial 桥接命令 ─────────────────────────────────────────────
  * 前端用浏览器的 Web Serial 打开**用户本机**串口，把原始字节推给后端；
@@ -4709,8 +4657,6 @@ pub fn run() {
             send_multi_motor_command,
             send_tip_pose_command,
             save_connection_profile,
-            preview_legacy_migration,
-            run_legacy_migration,
             set_user_disabled,
             set_user_device_limit,
             set_user_role,
@@ -4940,16 +4886,6 @@ fn dispatch(
         }
         "diagnostics_bundle" => {
             diagnostics_bundle(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
-        }
-        "preview_legacy_migration" => {
-            let source_dir: String = arg(args, "source_dir")?;
-            let target_dir: Option<String> = arg_opt(args, "target_dir")?;
-            preview_legacy_migration(st, source_dir, target_dir).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
-        }
-        "run_legacy_migration" => {
-            let source_dir: String = arg(args, "source_dir")?;
-            let target_dir: Option<String> = arg_opt(args, "target_dir")?;
-            run_legacy_migration(st, source_dir, target_dir).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "list_serial_ports" => {
             list_serial_ports().and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))

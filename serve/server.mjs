@@ -401,14 +401,9 @@ const server = http.createServer((req, res) => {
   /* 协议模块是 ESM（测试要 import），但浏览器脚本需要全局。
    * 这里按需转译而不是另存一份：只去掉行首的 `export `、包一层 IIFE 挂到 window，
    * 于是永远只有一个真源，不会出现两份文件各自漂移。 */
-  // 属地查询只在后台域名下提供：前台不需要它，开放了就等于给公网一个
-  // 免费的 IP 查询代理，还会白白烧掉 ip-api 的配额。
-  if (req.method === "GET" && urlPath === "/geo") {
-    if (!adminHost) {
-      return send(res, 404, { "content-type": "text/plain; charset=utf-8" }, "not found");
-    }
-    return sendGeo(req, res);
-  }
+  // 属地查询：前台「我的设备」与后台「设备访问」都要用，两个域名都提供。
+  // 数据本身不敏感（就是 IP 归属地），调用量由网关侧 24h 缓存兜住。
+  if (req.method === "GET" && urlPath === "/geo") return sendGeo(req, res);
 
   /* 桥接桩：与 dist 解耦，直接从 serve/ 提供（见 SHIM_FILE 处的说明）。
    * 必须 no-store：手机上 no-cache 仍可能命中内存缓存，出现"改了桩却不生效"。 */
