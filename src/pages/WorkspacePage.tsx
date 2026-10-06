@@ -16,6 +16,7 @@ import { useSearchParams } from "react-router-dom";
 
 import Badge from "../components/Badge";
 import { CardGrid } from "../components/cards/CardGrid";
+import { hasPermission, PERMISSION_REASON } from "../state/permissions";
 import { DeviceContextPanel } from "../components/DeviceContextPanel";
 import { WorkbenchLayout } from "../layouts/WorkbenchLayout";
 import { monitorCardRegistry } from "./monitorCards";
@@ -164,6 +165,10 @@ export function WorkspacePage({
   onNotice,
   systemControlAction,
 }: WorkspacePageProps) {
+  /* 权限门控只解决"看得见 / 点得动"，安全边界仍在后端。
+   * 校准会改写传感器基线，属维护员（maintainer）职责，操作员不该有可用按钮。 */
+  const canCalibrate = hasPermission(snapshot, "runCalibration");
+
   const [searchParams, setSearchParams] = useSearchParams();
   const tabParam = searchParams.get("tab");
   const activeTab: WorkspaceTab = isWorkspaceTab(tabParam) ? tabParam : "monitor";
@@ -1375,7 +1380,13 @@ export function WorkspacePage({
                 </label>
               </div>
               <div className="workspace-action-row">
-                <button type="button" className="ghost-btn" onClick={() => runWorkspaceCommand("calibrateSensor", sensorDraft, "已发送传感器校准命令")}>
+                <button
+                  type="button"
+                  className="ghost-btn"
+                  disabled={!canCalibrate}
+                  title={canCalibrate ? undefined : PERMISSION_REASON.runCalibration}
+                  onClick={() => runWorkspaceCommand("calibrateSensor", sensorDraft, "已发送传感器校准命令")}
+                >
                   <CheckCircle2 size={15} /><span>校准传感器</span>
                 </button>
               </div>

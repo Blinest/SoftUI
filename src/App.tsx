@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Fingerprint, CheckCircle2 } from "lucide-react";
+import { Fingerprint, CheckCircle2, UserPlus } from "lucide-react";
 import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import "./App.css";
@@ -22,7 +22,9 @@ import {
 } from "./pages/WorkspacePage";
 import { resetLayout } from "./state/layoutStore";
 import { applyTheme, writeThemePreference } from "./state/themeStore";
+import { hasPermission } from "./state/permissions";
 import { errorText } from "./utils";
+import { downloadText, exportStamp, framesToCsv } from "./utils/download";
 import { angleDegToCurvaturePerM, curvaturePerMToAngleDeg, DEFAULT_DYNAMICS_CONFIG } from "./dynamics/svcModel";
 
 // 懒加载重型页面组件，避免启动时加载 Three.js / uPlot / tanstack-table
@@ -34,18 +36,19 @@ import type {
   ConnectionProfile,
   DeviceConnectionRecord,
   DeviceRuntimeStatusView,
+  DeviceSnapshot,
   LogEntry,
+  LoginResult,
+  RegistrationMode,
   LegacyMigrationPreview,
   LegacyMigrationReport,
   LiveLatest,
   PlaybackStatus,
   RecorderStatus,
-  Role,
   RuntimeSnapshot,
   SerialPortDescriptor,
   SessionInfo,
   ThemeMode,
-  UserAccount,
 } from "./softuiTypes";
 
 function makeDefaultLogs(): LogEntry[] {
@@ -208,6 +211,60 @@ function LoginPage({
   const [password, setPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
 
+  /* ── 自助注册 ──
+   * 注册策略由后端决定（关闭 / 待审批 / 直接通过）。拿不到策略时按"关闭"
+   * 处理，宁可少显示一个入口，也不要露出点了没反应的按钮。 */
+  const [registrationMode, setRegistrationMode] = useState<RegistrationMode>("closed");
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [registerForm, setRegisterForm] = useState({ username: "", password: "", confirm: "" });
+  const [registerBusy, setRegisterBusy] = useState(false);
+  const [registerMessage, setRegisterMessage] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const current = await invoke<RegistrationMode>("registration_mode");
+        if (!cancelled) setRegistrationMode(current);
+      } catch {
+        /* 保持关闭 */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const submitRegister = async (event: FormEvent) => {
+    event.preventDefault();
+    setRegisterMessage(null);
+    if (registerForm.password !== registerForm.confirm) {
+      setRegisterMessage({ tone: "error", text: "两次输入的密码不一致" });
+      return;
+    }
+    setRegisterBusy(true);
+    try {
+      await invoke("register", {
+        request: { username: registerForm.username.trim(), password: registerForm.password },
+      });
+      setRegisterMessage({
+        tone: "ok",
+        text:
+          registrationMode === "approval"
+            ? "注册已提交。等管理员在后台审批通过后即可登录。"
+            : "注册成功，现在可以直接登录。",
+      });
+      setRegisterForm({ username: "", password: "", confirm: "" });
+    } catch (registerError) {
+      setRegisterMessage({
+        tone: "error",
+        text: registerError instanceof Error ? registerError.message : String(registerError),
+      });
+    } finally {
+      setRegisterBusy(false);
+    }
+  };
+
   const submitLogin = async (event: FormEvent) => {
     event.preventDefault();
     await onLogin(username, password);
@@ -232,7 +289,77 @@ function LoginPage({
           <p>请先完成本地认证，再进入设备控制工作区。</p>
         </div>
 
-        {!mustChangePassword ? (
+        {!mustChangePassword && registrationMode !== "closed" ? (
+          <div className="auth-tabs">
+            <button
+              type="button"
+              className={mode === "login" ? "active" : ""}
+              onClick={() => setMode("login")}
+            >
+              登录
+            </button>
+            <button
+              type="button"
+              className={mode === "register" ? "active" : ""}
+              onClick={() => setMode("register")}
+            >
+              注册账号
+            </button>
+          </div>
+        ) : null}
+
+        {!mustChangePassword && mode === "register" ? (
+          <form className="auth-form" onSubmit={submitRegister}>
+            <label>
+              <span>用户名</span>
+              <input
+                value={registerForm.username}
+                onChange={(event) => setRegisterForm((prev) => ({ ...prev, username: event.target.value }))}
+                placeholder="字母、数字、_ 或 -"
+                autoComplete="username"
+              />
+            </label>
+            <label>
+              <span>密码（至少 4 位）</span>
+              <input
+                type="password"
+                value={registerForm.password}
+                onChange={(event) => setRegisterForm((prev) => ({ ...prev, password: event.target.value }))}
+                autoComplete="new-password"
+              />
+            </label>
+            <label>
+              <span>确认密码</span>
+              <input
+                type="password"
+                value={registerForm.confirm}
+                onChange={(event) => setRegisterForm((prev) => ({ ...prev, confirm: event.target.value }))}
+                autoComplete="new-password"
+              />
+            </label>
+            {registerMessage ? (
+              <div className={registerMessage.tone === "ok" ? "auth-ok" : "auth-error"}>
+                {registerMessage.text}
+              </div>
+            ) : null}
+            <button
+              type="submit"
+              className="primary-btn full"
+              disabled={
+                registerBusy ||
+                !registerForm.username.trim() ||
+                registerForm.password.length < 4 ||
+                !registerForm.confirm
+              }
+            >
+              <UserPlus size={16} />
+              <span>{registerBusy ? "提交中" : "提交注册"}</span>
+            </button>
+            {registrationMode === "approval" ? (
+              <p className="auth-hint">注册后需管理员审批通过才能登录。</p>
+            ) : null}
+          </form>
+        ) : !mustChangePassword ? (
           <form className="auth-form" onSubmit={submitLogin}>
             <label>
               <span>用户名</span>
@@ -359,7 +486,6 @@ function AppShell() {
     return () => window.removeEventListener("softui:ui-republish", onRepublish);
   }, [publishUi, lastSystemControl]);
   /** 回放控件是否被收起（回放本身继续，只把界面藏起来）。 */
-  const [users, setUsers] = useState<UserAccount[]>([]);
   const [diagnosticsPath, setDiagnosticsPath] = useState("");
   const [migrationSource, setMigrationSource] = useState("");
   const [migrationPreview, setMigrationPreview] = useState<LegacyMigrationPreview | null>(null);
@@ -369,6 +495,8 @@ function AppShell() {
   // 启动即折叠：导航占了横向空间，默认收起让主内容区更宽，需要时点左上角展开。
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const authenticated = snapshot.authSession.authenticated && !snapshot.authSession.mustChangePassword;
+  /** 录制 / 回放 / 会话导出：维护员及以上。 */
+  const canManageSessions = hasPermission(snapshot, "manageSessions");
 
   // 全局急停锁存：任一已连接设备锁存即视为全局锁存。
   const latchedDeviceIds = useMemo(
@@ -532,33 +660,46 @@ function AppShell() {
     void refreshConnectionProfiles();
   }, [refreshConnectionProfiles, authenticated]);
 
-  const refreshUsers = useCallback(async () => {
-    try {
-      const list = await invoke<UserAccount[]>("list_users");
-      setUsers(list);
-    } catch {
-      setUsers([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!authenticated) return;
-    void refreshUsers();
-  }, [refreshUsers, snapshot.authSession.username, snapshot.authSession.role, authenticated]);
-
   const applyAuthSession = useCallback((session: AuthSession) => {
     setSnapshot((prev) => ({ ...prev, authSession: session }));
   }, []);
+
+  /* 会话心跳：管理员在后台把某台设备踢下线（或停用账号）之后，本端要在
+   * 几秒内回到登录页 —— 否则被踢的端会一直停在界面里，看起来像没踢掉。
+   *
+   * 为什么不复用 `tick_snapshot`：那条轮询只在回放时开，平时不跑。
+   * 这里只查会话、不带业务数据，10s 一次，流量可忽略。 */
+  useEffect(() => {
+    if (!authenticated) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const session = await invoke<AuthSession>("current_auth_session");
+          if (cancelled) return;
+          if (!session.authenticated) applyAuthSession(session);
+        } catch {
+          /* 网络抖动不管：下一个周期再试 */
+        }
+      })();
+    }, 10_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [authenticated, applyAuthSession]);
 
   const loginUser = useCallback(async (username: string, password: string) => {
     setAuthBusy(true);
     setAuthError(null);
     try {
-      const session = await invoke<AuthSession>("login", {
+      const result = await invoke<LoginResult>("login", {
         request: { username: username.trim(), password },
       });
       localStorage.setItem("softui:lastUsername", username.trim());
-      applyAuthSession(session);
+      // token 由桥接桩存进本机 localStorage（每台设备各自一份），
+      // 页面这里只接管会话本身，不必碰凭据。
+      applyAuthSession(result.session);
     } catch (invokeError) {
       setAuthError(invokeError instanceof Error ? invokeError.message : String(invokeError));
     } finally {
@@ -576,13 +717,12 @@ function AppShell() {
       const session = await invoke<AuthSession>("current_auth_session");
       applyAuthSession(session);
       await fetchSnapshot("tick_snapshot");
-      await refreshUsers();
     } catch (invokeError) {
       setAuthError(invokeError instanceof Error ? invokeError.message : String(invokeError));
     } finally {
       setAuthBusy(false);
     }
-  }, [applyAuthSession, fetchSnapshot, refreshUsers]);
+  }, [applyAuthSession, fetchSnapshot]);
 
   // 清掉持久化的卡片布局，下次进入页面会回落到默认布局。
   const resetLayouts = useCallback(() => {
@@ -595,30 +735,10 @@ function AppShell() {
     try {
       const session = await invoke<AuthSession>("logout");
       applyAuthSession(session);
-      setUsers([]);
     } catch (invokeError) {
       console.error(invokeError);
     }
   }, [applyAuthSession]);
-
-  const createUserAccount = useCallback(async (username: string, password: string, role: Role) => {
-    await invoke<UserAccount>("create_user", {
-      request: { username: username.trim(), password, role },
-    });
-    await refreshUsers();
-  }, [refreshUsers]);
-
-  const resetUserPassword = useCallback(async (username: string, newPassword: string) => {
-    await invoke("change_password", {
-      request: { username, oldPassword: null, newPassword },
-    });
-    await refreshUsers();
-  }, [refreshUsers]);
-
-  const setUserDisabled = useCallback(async (username: string, disabled: boolean) => {
-    await invoke<UserAccount>("set_user_disabled", { username, disabled });
-    await refreshUsers();
-  }, [refreshUsers]);
 
   const handleConnectDevice = useCallback(async (request: ConnectDeviceRequest) => {
     await invoke("connect_device", { request });
@@ -665,14 +785,23 @@ function AppShell() {
     }
   }, [snapshot.authSession.username, snapshot.theme]);
 
+  /**
+   * 导出诊断包 —— 改成前端下载，服务端不再落盘。
+   *
+   * 后端只把**内容**（appInfo / logs / settings / 诊断计数 / 完整快照）返回，
+   * 浏览器直接存成 JSON，服务器上不会再有 diagnostics 目录残留。
+   * 注意权限校验仍在后端（`ViewDiagnostics`），不是只靠界面禁用按钮。
+   */
   const exportDiagnostics = useCallback(async () => {
     try {
-      const path = await invoke<string>("export_diagnostics_bundle");
-      setDiagnosticsPath(path);
+      const bundle = await invoke<Record<string, unknown>>("diagnostics_bundle");
+      const filename = `softui-diagnostics-${snapshot.authSession.username || "anonymous"}-${exportStamp()}.json`;
+      downloadText(filename, JSON.stringify(bundle, null, 2), "application/json");
+      setDiagnosticsPath(filename);
     } catch (invokeError) {
       setDiagnosticsPath(invokeError instanceof Error ? invokeError.message : String(invokeError));
     }
-  }, []);
+  }, [snapshot.authSession.username]);
 
   const previewMigration = useCallback(async () => {
     if (!migrationSource.trim()) return;
@@ -768,12 +897,22 @@ function AppShell() {
     } catch { /* ignore */ }
   }, []);
 
+  /**
+   * 导出会话 CSV —— **在前端生成，不落服务器磁盘**。
+   *
+   * 以前是让 Rust 把文件写到网关那台机器上（容器磁盘本来就紧张），导出几次
+   * 就攒一堆没人清理的 CSV，还得再进服务器把文件拷出来。现在只把帧数据取回来，
+   * 在浏览器里拼 CSV 并直接触发下载。
+   */
   const exportCsv = useCallback(async (id: string) => {
     try {
-      const path = await invoke<string>("export_session_csv", { id, outputPath: null });
-      console.log("CSV exported to:", path);
-    } catch (e) { console.error(e); }
-  }, []);
+      const frames = await invoke<DeviceSnapshot[]>("read_session_frames", { id, maxCount: 20000 });
+      const name = sessions.find((session) => session.id === id)?.name ?? id;
+      downloadText(`${name}-${exportStamp()}.csv`, framesToCsv(frames));
+    } catch (e) {
+      console.error(e);
+    }
+  }, [sessions]);
 
   /**
    * 挂载时与后端**同步一次**回放状态。
@@ -1039,6 +1178,7 @@ function AppShell() {
       <SidebarNav
         collapsed={sidebarCollapsed}
         onToggleCollapsed={() => setSidebarCollapsed((collapsed) => !collapsed)}
+        permissions={snapshot.authSession.permissions}
       />
       <GlobalStatusBar
         currentDeviceLabel={snapshot.live.selectedDeviceId || "未选择设备"}
@@ -1072,7 +1212,7 @@ function AppShell() {
               </button>
             </div>
           ) : null}
-          {playbackStatus?.active ? (
+          {playbackStatus?.active && canManageSessions ? (
             <PlaybackBar
               status={playbackStatus}
               onPlayPause={() => void playbackPlayPause()}
@@ -1122,17 +1262,24 @@ function AppShell() {
             <Route path="/live-table" element={<Navigate to="/workspace" replace />} />
             <Route path="/charts" element={<ChartsPage snapshot={snapshot} />} />
             <Route path="/sessions" element={
-              <SessionsPage
-                sessions={sessions}
-                recorderStatus={recorderStatus}
-                onToggleRecording={toggleRecording}
-                onPauseRecording={pauseRecording}
-                onResumeRecording={resumeRecording}
-                onDeleteSession={deleteSession}
-                onRenameSession={renameSession}
-                onExportCsv={exportCsv}
-                onLoadPlayback={loadPlayback}
-              />
+              canManageSessions ? (
+                <SessionsPage
+                  sessions={sessions}
+                  recorderStatus={recorderStatus}
+                  onToggleRecording={toggleRecording}
+                  onPauseRecording={pauseRecording}
+                  onResumeRecording={resumeRecording}
+                  onDeleteSession={deleteSession}
+                  onRenameSession={renameSession}
+                  onExportCsv={exportCsv}
+                  onLoadPlayback={loadPlayback}
+                />
+              ) : (
+                /* 导航入口已按权限隐藏，这里兜住"直接敲 URL"的情况 */
+                <div className="page-loading">
+                  录制、回放与会话导出需要维护员（maintainer）及以上权限。
+                </div>
+              )
             } />
             <Route path="/model" element={<Navigate to="/workspace" replace />} />
             <Route path="/calibration" element={<Navigate to="/workspace" replace />} />
@@ -1143,7 +1290,6 @@ function AppShell() {
               element={
                 <SettingsPage
                   snapshot={snapshot}
-                  users={users}
                   recorderStatus={recorderStatus}
                   diagnosticsPath={diagnosticsPath}
                   migrationSource={migrationSource}
@@ -1154,9 +1300,6 @@ function AppShell() {
                   onMigrationSourceChange={setMigrationSource}
                   onPreviewMigration={previewMigration}
                   onRunMigration={runMigration}
-                  onCreateUser={createUserAccount}
-                  onResetUserPassword={resetUserPassword}
-                  onSetUserDisabled={setUserDisabled}
                   onResetLayouts={resetLayouts}
                 />
               }
@@ -1172,6 +1315,7 @@ function AppShell() {
             onConnect={handleConnectDevice}
             onSaveProfile={handleSaveProfile}
             onDeleteProfile={handleDeleteProfile}
+            canSaveProfiles={hasPermission(snapshot, "manageSettings")}
             onRefreshPorts={refreshSerialPorts}
             onClose={() => setConnectDialogOpen(false)}
           />

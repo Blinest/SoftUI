@@ -1,0 +1,437 @@
+/* ── 后台管理站点样式 ───────────────────────────────────────────────────
+ * 只依赖 tokens.css 里的设计变量，与前台共享一套配色，但版式更"表格化"：
+ * 后台是密集操作界面，不需要前台那种卡片式观感。
+ * ──────────────────────────────────────────────────────────────────── */
+
+.admin-loading {
+  padding: 48px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* ── 登录 ── */
+.admin-login-shell {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 24px;
+  background: var(--surface-page);
+}
+
+.admin-login-card {
+  display: grid;
+  gap: 14px;
+  width: min(380px, 100%);
+  padding: 22px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--surface-panel);
+}
+
+.admin-login-card label,
+.admin-form label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.admin-login-card input,
+.admin-form input,
+.admin-form select,
+.admin-limit input {
+  height: var(--control-height, 30px);
+  padding: 0 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}
+
+.admin-login-card input:focus,
+.admin-form input:focus,
+.admin-form select:focus,
+.admin-limit input:focus {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+/* ── 品牌 ── */
+.admin-brand {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.admin-brand div {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.admin-brand strong {
+  font-size: 14px;
+}
+
+.admin-brand span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+/* ── 主体 ── */
+.admin-shell {
+  min-height: 100vh;
+  background: var(--surface-page);
+}
+
+.admin-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-panel);
+}
+
+.admin-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.admin-who {
+  padding-right: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.admin-body {
+  display: grid;
+  gap: 14px;
+  padding: 16px 18px 32px;
+  max-width: 1180px;
+  margin: 0 auto;
+}
+
+/* ── 概览 ── */
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--border-subtle);
+}
+
+.admin-stat {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--surface-panel);
+}
+
+.admin-stat span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.admin-stat strong {
+  font-size: 16px;
+}
+
+.admin-stat.attention strong {
+  color: var(--status-warning);
+}
+
+/* ── 面板 ── */
+.admin-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--surface-panel);
+}
+
+.admin-panel-head {
+  display: grid;
+  gap: 2px;
+}
+
+.admin-panel-head h2 {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin: 0;
+  font-size: 13px;
+}
+
+.admin-panel-head span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.admin-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+/* ── 行 ── */
+.admin-rows {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  background: var(--border-subtle);
+}
+
+.admin-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--surface-page);
+}
+
+.admin-row-main {
+  display: grid;
+  flex: 1 1 200px;
+  gap: 2px;
+  min-width: 0;
+}
+
+.admin-row-main strong {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 13px;
+}
+
+.admin-row-main > span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-agent {
+  font-size: 11px !important;
+  opacity: 0.65;
+}
+
+.admin-tag {
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+.admin-tag.warn {
+  border-color: var(--status-warning);
+  color: var(--status-warning);
+}
+
+.admin-badge {
+  padding: 1px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.admin-badge.ok {
+  border-color: var(--status-ok);
+  color: var(--status-ok);
+}
+
+.admin-empty {
+  padding: 10px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+/* ── 控件 ── */
+.admin-btn {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  height: var(--control-height, 30px);
+  padding: 0 10px;
+  border: 1px solid var(--button-default-border, var(--border-default));
+  border-radius: 6px;
+  background: var(--button-default-bg, var(--surface-panel));
+  color: var(--button-default-text, var(--text-primary));
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.admin-btn:hover:not(:disabled) {
+  border-color: var(--focus-ring);
+}
+
+.admin-btn:disabled {
+  background: var(--button-disabled-bg, var(--action-disabled));
+  color: var(--button-disabled-text, var(--action-disabled-text));
+  cursor: not-allowed;
+}
+
+.admin-btn.primary {
+  border-color: var(--button-primary-bg, var(--action-primary));
+  background: var(--button-primary-bg, var(--action-primary));
+  color: var(--button-primary-text, var(--action-primary-text));
+}
+
+.admin-btn.ok {
+  border-color: var(--status-ok);
+  color: var(--status-ok);
+}
+
+.admin-btn.danger {
+  border-color: var(--button-danger-bg, var(--action-danger));
+  color: var(--button-danger-text, var(--action-danger-text));
+}
+
+.admin-btn.full {
+  justify-content: center;
+  width: 100%;
+}
+
+.admin-form {
+  display: grid;
+  gap: 10px;
+}
+
+.admin-limit {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.admin-limit input {
+  width: 64px;
+}
+
+.admin-mode-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-mode {
+  padding: 6px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: var(--surface-page);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.admin-mode.active {
+  border-color: var(--action-primary);
+  background: var(--action-primary);
+  color: var(--action-primary-text);
+}
+
+/* ── 提示 ── */
+.admin-alert {
+  padding: 8px 10px;
+  border: 1px solid var(--status-info);
+  border-radius: 6px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.admin-alert.error {
+  border-color: var(--status-error);
+  color: var(--status-error);
+}
+
+.admin-hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* 「最新访问 xx / 访问 N 次」这类只读单元格 */
+.admin-cell {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.admin-cell strong {
+  color: var(--text-primary);
+}
+
+/* ── 访问来源（IP）+ 可展开的设备明细 ────────────────────────────────
+ * `.admin-rows` 用 1px 背景色做行分隔，所以每个来源要包一层
+ * `.admin-group` 作为整体，否则展开的明细会把这个分隔效果冲掉。
+ * ──────────────────────────────────────────────────────────────────── */
+.admin-group {
+  background: var(--surface-page);
+}
+
+/* 展开/收起按钮：同时当"这台设备数"的标签用 */
+.admin-expand {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.admin-expand:hover {
+  border-color: var(--focus-ring);
+  color: var(--text-primary);
+}
+
+/* 明细整体缩进 + 左侧竖线，一眼看出是上面那一行的下级 */
+.admin-device-list {
+  display: grid;
+  padding: 0 10px 8px 24px;
+}
+
+.admin-device-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  border-left: 2px solid var(--border-default);
+  background: var(--surface-panel);
+}
+
+.admin-device-row + .admin-device-row {
+  border-top: 1px solid var(--border-subtle);
+}

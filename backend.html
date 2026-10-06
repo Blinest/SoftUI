@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>SoftUI 后台管理</title>
+    <script>
+      // 主题预水合，与前台同源策略（后台默认偏深色，更适合长时间管理操作）
+      (() => {
+        try {
+          const stored = localStorage.getItem("softui:adminTheme");
+          const theme = stored === "light" || stored === "dark" ? stored : "dark";
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+        } catch {
+          /* 保持兜底 */
+        }
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/backend/main.tsx"></script>
+  </body>
+</html>

@@ -6,6 +6,7 @@ import { LogDetailDrawer } from "../components/LogDetailDrawer";
 import { LogFilterBar, type VisibleLogLevel } from "../components/LogFilterBar";
 import { TableLayout } from "../layouts/TableLayout";
 import type { LogEntry, RuntimeSnapshot } from "../softuiTypes";
+import { hasPermission } from "../state/permissions";
 import { isoShort, toneForLevel } from "../utils";
 import "../styles/logs.css";
 
@@ -54,6 +55,7 @@ export function LogsPage({ snapshot, onExportDiagnostics }: LogsPageProps) {
           onQueryChange={setQuery}
           onScopeChange={setScope}
           onExportDiagnostics={onExportDiagnostics}
+          canExportDiagnostics={hasPermission(snapshot, "viewDiagnostics")}
         />
       }
       detail={selectedEntry ? <LogDetailDrawer entry={selectedEntry} onClose={() => setSelectedId(null)} /> : undefined}

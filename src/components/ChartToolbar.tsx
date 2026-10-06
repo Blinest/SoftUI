@@ -2,6 +2,8 @@ import { Database, Download, PauseCircle, Play, RefreshCw } from "lucide-react";
 
 import type { SessionInfo } from "../softuiTypes";
 
+import { PERMISSION_REASON } from "../state/permissions";
+
 export interface ChartToolbarProps {
   sessions: SessionInfo[];
   selectedSessionId: string;
@@ -12,6 +14,8 @@ export interface ChartToolbarProps {
   onPauseChange: (paused: boolean) => void;
   onRefresh: () => void;
   onExportCsv: () => void;
+  /** 会话选择与导出都属会话管理（维护员及以上）。 */
+  canManageSessions: boolean;
 }
 
 /** 曲线页工具栏：会话选择、暂停/刷新、导出与状态。 */
@@ -25,6 +29,7 @@ export function ChartToolbar({
   onPauseChange,
   onRefresh,
   onExportCsv,
+  canManageSessions,
 }: ChartToolbarProps) {
   return (
     <div className="charts-toolbar">
@@ -33,6 +38,8 @@ export function ChartToolbar({
           aria-label="选择数据源"
           className="charts-session-select"
           value={selectedSessionId}
+          disabled={!canManageSessions}
+          title={canManageSessions ? undefined : PERMISSION_REASON.manageSessions}
           onChange={(event) => onSessionChange(event.target.value)}
         >
           <option value="live">实时数据</option>
@@ -46,7 +53,13 @@ export function ChartToolbar({
           <RefreshCw size={14} />
           <span>刷新</span>
         </button>
-        <button type="button" className="ghost-btn-sm" onClick={onExportCsv}>
+        <button
+          type="button"
+          className="ghost-btn-sm"
+          disabled={!canManageSessions}
+          title={canManageSessions ? undefined : PERMISSION_REASON.manageSessions}
+          onClick={onExportCsv}
+        >
           <Download size={14} />
           <span>导出 CSV</span>
         </button>

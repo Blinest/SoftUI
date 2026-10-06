@@ -147,13 +147,19 @@
 }
 
 .settings-user-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
   padding: 8px 10px;
   background: var(--surface-panel);
+}
+
+/* 主信息吃掉剩余宽度，右侧按钮组按内容宽度排列并允许换行 ——
+   加了「设备上限 / 保存上限 / 全部踢下线」之后固定列数会挤成一团。 */
+.settings-user-row .settings-user-main {
+  flex: 1 1 140px;
 }
 
 .settings-user-main {
@@ -251,4 +257,95 @@
   .migration-form {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* ── 后台管理：设备访问 ────────────────────────────────────────────────
+ * 「账户与权限」升级成后台管理后多了两类控件：设备列表、按账号的设备上限。
+ * 这里只补新增的类，不动既有样式。
+ * ──────────────────────────────────────────────────────────────────── */
+
+.settings-subheader {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding-top: 4px;
+}
+
+.settings-subheader h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.settings-subheader span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.settings-client-list {
+  display: grid;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--border-subtle);
+}
+
+.settings-client-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  background: var(--surface-panel);
+}
+
+.settings-client-main {
+  display: grid;
+  flex: 1 1 200px;
+  gap: 2px;
+  min-width: 0;
+}
+
+.settings-client-main strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.settings-client-main > span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-client-tag {
+  padding: 1px 6px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* UA 串很长：只占一行，完整内容靠 title 查看 */
+.settings-client-agent {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
+.settings-user-limit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.settings-user-limit input {
+  width: 64px;
 }

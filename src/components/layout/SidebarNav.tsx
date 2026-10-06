@@ -2,16 +2,20 @@ import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 import { memo } from "react";
 import { NavLink } from "react-router-dom";
 
-import { navigationGroups } from "../../app/navigation";
+import { visibleNavigationGroups } from "../../app/navigation";
+import type { Permission } from "../../softuiTypes";
 
 interface SidebarNavProps {
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  /** 当前会话权限：用它把无权进入的入口藏掉。 */
+  permissions: Permission[];
 }
 
 /** 主导航：唯一导航入口，顶部状态栏不再重复导航。 */
-export const SidebarNav = memo(function SidebarNav({ collapsed, onToggleCollapsed }: SidebarNavProps) {
+export const SidebarNav = memo(function SidebarNav({ collapsed, onToggleCollapsed, permissions }: SidebarNavProps) {
   const ToggleIcon = collapsed ? PanelLeftOpen : PanelLeftClose;
+  const groups = visibleNavigationGroups(permissions);
 
   return (
     <aside className={`app-sidebar${collapsed ? " is-collapsed" : ""}`} aria-label="主导航">
@@ -28,7 +32,7 @@ export const SidebarNav = memo(function SidebarNav({ collapsed, onToggleCollapse
         </button>
       </div>
       <nav className="sidebar-nav">
-        {navigationGroups.map((group) => (
+        {groups.map((group) => (
           <section className="sidebar-nav-group" key={group.label} aria-label={group.label}>
             <h2>{group.label}</h2>
             {group.items.map((item) => {

@@ -1,6 +1,7 @@
 import { Search, X, Download } from "lucide-react";
 
 import type { LogLevel } from "../softuiTypes";
+import { PERMISSION_REASON } from "../state/permissions";
 
 /** 用户可见的日志级别。内部 warn/error/info/debug 直接对应。 */
 export type VisibleLogLevel = LogLevel;
@@ -23,6 +24,8 @@ export interface LogFilterBarProps {
   onQueryChange: (value: string) => void;
   onScopeChange: (value: string) => void;
   onExportDiagnostics: () => void;
+  /** 导出诊断包需要 viewDiagnostics（维护员及以上）。 */
+  canExportDiagnostics: boolean;
 }
 
 /** 日志页筛选条：级别多选 + 模块 + 文本检索 + 诊断导出。 */
@@ -37,6 +40,7 @@ export function LogFilterBar({
   onQueryChange,
   onScopeChange,
   onExportDiagnostics,
+  canExportDiagnostics,
 }: LogFilterBarProps) {
   const toggleLevel = (level: VisibleLogLevel) => {
     onLevelsChange(
@@ -84,7 +88,13 @@ export function LogFilterBar({
         ) : null}
       </div>
 
-      <button type="button" className="ghost-btn-sm" onClick={onExportDiagnostics}>
+      <button
+        type="button"
+        className="ghost-btn-sm"
+        disabled={!canExportDiagnostics}
+        title={canExportDiagnostics ? undefined : PERMISSION_REASON.viewDiagnostics}
+        onClick={onExportDiagnostics}
+      >
         <Download size={14} />
         <span>导出诊断</span>
       </button>

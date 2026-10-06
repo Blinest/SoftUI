@@ -430,6 +430,41 @@ export interface UserAccount {
   role: Role;
   disabled: boolean;
   mustChangePassword: boolean;
+  /** 自助注册后等待管理员审批。为 true 时不能登录。 */
+  pending: boolean;
+  /** 允许同时在线的设备台数，0 = 不限。后台可按账号收紧。 */
+  maxDevices: number;
+}
+
+/** 自助注册开关。默认 `approval`：注册后需管理员审批。 */
+export type RegistrationMode = "closed" | "approval" | "open";
+
+/** 后台「设备访问」列表的一行：一台已登录的设备。 */
+export interface ClientSessionView {
+  /** token 前缀。踢下线用它定位，后端不下发完整 token。 */
+  sessionId: string;
+  username: string;
+  role: Role;
+  label: string;
+  clientId: string;
+  ip: string;
+  userAgent: string;
+  createdAtMs: number;
+  lastSeenMs: number;
+  online: boolean;
+}
+
+/**
+ * `login` 的返回值。
+ *
+ * token 由桥接桩写进 localStorage 并随每次请求带回，页面只接管 `session` ——
+ * 页面不需要知道传输层凭据的存在。
+ */
+export interface LoginResult {
+  token: string;
+  session: AuthSession;
+  deviceLimit: number;
+  activeDevices: number;
 }
 
 export interface LegacyMigrationPreview {

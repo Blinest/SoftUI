@@ -8,7 +8,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
-import type { PageKey } from "../softuiTypes";
+import type { PageKey, Permission } from "../softuiTypes";
 
 export interface NavigationItem {
   key: PageKey;
@@ -16,6 +16,8 @@ export interface NavigationItem {
   title: string;
   subtitle: string;
   icon: LucideIcon;
+  /** 进入该页所需的权限。不填 = 所有人可见。 */
+  requires?: Permission;
 }
 
 /** 侧边栏分组。分组只是视觉分层，不影响路由。 */
@@ -31,7 +33,7 @@ export const navigationGroups: Array<{ label: string; items: NavigationItem[] }>
   {
     label: "数据",
     items: [
-      { key: "Sessions", path: "/sessions", title: "会话与记录", subtitle: "录制与导出", icon: Database },
+      { key: "Sessions", path: "/sessions", title: "会话与记录", subtitle: "录制与导出", icon: Database, requires: "manageSessions" },
       { key: "Logs", path: "/logs", title: "日志与诊断", subtitle: "诊断与审计", icon: Logs },
     ],
   },
@@ -42,6 +44,24 @@ export const navigationGroups: Array<{ label: string; items: NavigationItem[] }>
     ],
   },
 ];
+
+/**
+ * 按当前会话的权限过滤导航。
+ *
+ * 为什么要真的把入口藏掉：留着入口但点进去什么都做不了（只有一句"权限不足"），
+ * 用户会以为是故障；而 operator 本来就不该看到"录制 / 导出"这类入口。
+ * 后端仍会独立校验，这里只是别让人对着做不到的事发愁。
+ */
+export function visibleNavigationGroups(
+  permissions: Permission[],
+): Array<{ label: string; items: NavigationItem[] }> {
+  return navigationGroups
+    .map((group) => ({
+      label: group.label,
+      items: group.items.filter((item) => !item.requires || permissions.includes(item.requires)),
+    }))
+    .filter((group) => group.items.length > 0);
+}
 
 export const pageTitles: Record<PageKey, string> = {
   Dashboard: "总览",

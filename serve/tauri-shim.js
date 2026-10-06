@@ -338,7 +338,7 @@
     return out;
   }
 
-  var EMPTY_LISTS = ["list_users", "list_serial_ports", "list_connection_profiles", "read_session_frames", "playback_get_window", "playback_commands"];
+  var EMPTY_LISTS = ["list_users", "list_clients", "list_serial_ports", "list_connection_profiles", "read_session_frames", "playback_get_window", "playback_commands"];
 
   var HANDLERS = {
     bootstrap_state: function () { return clone(snapshot); },
@@ -346,7 +346,13 @@
 
     login: function () {
       snapshot.authSession = { authenticated: true, username: "web-preview", role: "admin", permissions: [], mustChangePassword: false };
-      return clone(snapshot.authSession);
+      // 形状必须与后端 `auth::LoginResult` 一致，否则仿真模式下页面取不到 session
+      return {
+        token: "sim-" + nowMs(),
+        session: clone(snapshot.authSession),
+        deviceLimit: 0,
+        activeDevices: 1,
+      };
     },
     logout: function () {
       snapshot.authSession = { authenticated: false, username: "", role: "operator", permissions: [], mustChangePassword: false };
@@ -578,13 +584,35 @@
     simulator_start: 1, simulator_stop: 1,
   };
 
+  /* ── 会话 token：每台设备一份 ──────────────────────────────────────
+   * 后端按 token 区分设备，所以必须存**在本机** localStorage 里 ——
+   * 存服务端就又变回"全局一份会话"了。同一台设备刷新页面保持登录，
+   * 换一台设备各自独立登录：这就是"多设备访问权限"的落点。
+   * ───────────────────────────────────────────────────────────────── */
+  var TOKEN_KEY = "softui:sessionToken";
+
+  function getToken() {
+    try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (error) { return ""; }
+  }
+
+  function setToken(value) {
+    try {
+      if (value) localStorage.setItem(TOKEN_KEY, value);
+      else localStorage.removeItem(TOKEN_KEY);
+    } catch (error) { /* 隐私模式下写不了：退化为"每次打开都要重新登录" */ }
+  }
+
   function doRpc(cmd, args, noFallback) {
     lastCalls.push({ cmd: cmd, args: args, at: nowMs() });
     if (lastCalls.length > 200) lastCalls.shift();
 
+    var headers = { "content-type": "application/json" };
+    var token = getToken();
+    if (token) headers["x-softui-token"] = token;
+
     return fetch("/rpc", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: headers,
       body: JSON.stringify({ cmd: cmd, args: args || {} }),
     })
       .then(function (resp) {
@@ -1330,6 +1358,29 @@
   }
 
   function rpcInvoke(cmd, args) {
+    /* 登录：把设备身份补进请求，并把后端签发的 token 存到本机。
+     * 为什么放在桩里而不是页面里：token 的读写只应有一个地方（这里），
+     * 页面只管调用命令，不必知道传输层凭据的存在。 */
+    if (cmd === "login") {
+      var req = (args && args.request) || {};
+      if (!req.clientId) req.clientId = SYNC_ID;
+      if (!req.label) req.label = SYNC_LABEL;
+      args = Object.assign({}, args, { request: req });
+      return doRpc(cmd, args).then(function (result) {
+        if (result && result.token) setToken(result.token);
+        return result;
+      });
+    }
+
+    /* 登出：无论后端成功与否，本机凭证都必须清掉 ——
+     * 否则会出现"点了登出、状态是未登录，可下次请求又带着旧 token 进去了"。 */
+    if (cmd === "logout") {
+      return doRpc(cmd, args).then(
+        function (result) { setToken(""); return result; },
+        function (error) { setToken(""); throw error; },
+      );
+    }
+
     // 串口枚举走本机，且必须同步发起以保留"用户手势"（requestPort 的硬性要求）
     if (cmd === "list_serial_ports") return listLocalSerialPorts();
 

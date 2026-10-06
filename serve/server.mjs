@@ -134,6 +134,28 @@ function deny(res) {
 const RPC_HOST = process.env.SOFTUI_RPC_HOST || "127.0.0.1";
 const RPC_PORT = Number(process.env.SOFTUI_RPC_PORT || 8787);
 
+/* 转发哪些头到 Rust。
+ *
+ * ⚠ 必须**显式**逐个转发：Node 不会自动带上客户端请求头，漏一个就变成
+ * "登录明明成功了，可每个请求都是未登录"。这里要的就是三样：
+ *   - x-softui-token     认设备（多设备会话隔离的凭据）
+ *   - user-agent         后台列表里显示设备类型
+ *   - x-softui-client-ip 真实来源 IP（经隧道时在 CF-Connecting-IP 里）
+ */
+function upstreamHeaders(req, body) {
+  const headers = {
+    "content-type": "application/json",
+    "content-length": body.length,
+  };
+  const token = req.headers["x-softui-token"];
+  if (token) headers["x-softui-token"] = token;
+  const agent = req.headers["user-agent"];
+  if (agent) headers["user-agent"] = agent;
+  const ip = req.headers["cf-connecting-ip"] || req.socket.remoteAddress || "";
+  if (ip) headers["x-softui-client-ip"] = ip;
+  return headers;
+}
+
 function proxyRpc(req, res) {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
@@ -145,7 +167,7 @@ function proxyRpc(req, res) {
         port: RPC_PORT,
         path: "/rpc",
         method: "POST",
-        headers: { "content-type": "application/json", "content-length": body.length },
+        headers: upstreamHeaders(req, body),
         timeout: 30000,
       },
       (up) => {
@@ -182,7 +204,13 @@ function proxyRpc(req, res) {
  * 放在服务端注入就与构建解耦，重新构建也不会丢。
  * 不带版本号：缓存由下面的 no-store 负责，不需要靠 URL 变化来绕过。
  * ─────────────────────────────────────────────────────────────────── */
-const SHIM_FILE = path.join(ROOT, "tauri-shim.js");
+/* 桩脚本从 `serve/` 直接读，**不**从 dist 读。
+ *
+ * 原因（部署实录里记过这个坑）：`vite build` 会清空 dist/，手工放进 dist 的
+ * 桩脚本会被一起删掉 —— 表现是页面里的标签还在、但 /tauri-shim.js 返回 404，
+ * 浏览器因此没有 __TAURI_INTERNALS__，整站桥接失效（白屏 / invoke 全部失败）。
+ * 与 dist 解耦之后，重新构建再也不会碰坏它。 */
+const SHIM_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "tauri-shim.js");
 const PROTOCOL_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "protocol.js");
 // 协议模块必须先于桩：桩要用它把串口字节在本地解析成帧
 const PROTOCOL_TAG = '<script src="/protocol.global.js"></script>';
@@ -221,8 +249,140 @@ function injectShimTag(html) {
   return html.replace('<script type="module"', tag + '\n    <script type="module"');
 }
 
+/* ── 后台站点：按 Host 分流 ───────────────────────────────────────────
+ * 后台与前台共用同一套静态资源与 /rpc，只有「页面入口」不同：
+ * 后台的请求一律落到 backend.html。
+ *
+ * 为什么按 Host 而不是路径前缀（/admin）：
+ *   两条入口不同源 → localStorage 天然隔离。后台的登录凭证不会和前台的
+ *   混在一起，管理员在后台登录也不会顺手把前台的会话带进去。
+ *
+ * 域名必须是**精确匹配**：写成前缀/包含判断的话，一个 `softui_frontend`
+ * 之类的域名会被误判成后台，直接把管理界面暴露出去。
+ * 需要多个入口时用 SOFTUI_ADMIN_HOSTS=host1,host2 显式列出。
+ * ─────────────────────────────────────────────────────────────────── */
+const ADMIN_ENTRY = "backend.html";
+const ADMIN_HOSTS = (process.env.SOFTUI_ADMIN_HOSTS || "softui-backend.blinest.icu")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+
+function isAdminHost(req) {
+  const host = String(req.headers.host || "").split(":")[0].toLowerCase();
+  if (!host) return false;
+  return ADMIN_HOSTS.includes(host);
+}
+
+/* ── IP 属地查询 ─────────────────────────────────────────────────────
+ * 后台要显示访问来源的属地（国家/省/市）。
+ *
+ * 为什么由网关代查而不是浏览器直连：
+ *   1. 免费 geo 接口（ip-api.com）只有 HTTP，HTTPS 页面里直连会被浏览器
+ *      按"混合内容"拦掉；服务端到服务端调用没这个限制
+ *   2. 还能在这里做缓存 —— 免费版限 45 次/分钟，面板每次刷新都查会被限流
+ *   3. 不把管理员的浏览器 IP 暴露给第三方
+ *
+ * 失败一律降级为"查不到"，绝不能让后台面板因为查属地而报错。
+ * 关闭：SOFTUI_GEO_API=0
+ * ──────────────────────────────────────────────────────────────────── */
+const GEO_ENABLED = process.env.SOFTUI_GEO_API !== "0";
+const GEO_TTL_MS = 24 * 60 * 60 * 1000;
+const GEO_ENDPOINT =
+  "http://ip-api.com/batch?lang=zh-CN&fields=status,country,regionName,city,isp,query";
+/** ip → { at, value }。IP 归属很少变，缓存一天足够，又能压住调用量。 */
+const geoCache = new Map();
+
+/** 内网 / 回环地址没有属地可言，直接给个确定的说法，别白跑一趟。 */
+function isPrivateIp(ip) {
+  const value = String(ip || "").trim();
+  if (!value) return true;
+  if (value === "::1" || value.startsWith("127.")) return true;
+  if (value.startsWith("10.") || value.startsWith("192.168.")) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(value)) return true;
+  if (/^f[cd]/i.test(value)) return true; // IPv6 唯一本地地址
+  if (/^fe80:/i.test(value)) return true; // IPv6 链路本地
+  return false;
+}
+
+/** 「中国 上海 上海」这种重复要去掉（直辖市 country/region/city 常常同名）。 */
+function geoLabel(entry) {
+  const parts = [entry.country, entry.regionName, entry.city].filter(Boolean);
+  return [...new Set(parts)].join(" ");
+}
+
+async function resolveGeo(ips) {
+  const out = {};
+  const pending = [];
+  const now = Date.now();
+
+  for (const ip of ips) {
+    if (isPrivateIp(ip)) {
+      out[ip] = "内网";
+      continue;
+    }
+    const hit = geoCache.get(ip);
+    if (hit && now - hit.at < GEO_TTL_MS) {
+      out[ip] = hit.value;
+      continue;
+    }
+    pending.push(ip);
+  }
+
+  if (!GEO_ENABLED || pending.length === 0) return out;
+
+  try {
+    const resp = await fetch(GEO_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(pending.slice(0, 100)),
+      signal: AbortSignal.timeout(6000),
+    });
+    const rows = await resp.json();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const ip = row && row.query;
+      if (!ip) continue;
+      const value = row.status === "success" ? geoLabel(row) : "";
+      geoCache.set(ip, { at: Date.now(), value });
+      out[ip] = value;
+    }
+  } catch (error) {
+    // 查不到就查不到：面板显示"—"，不影响任何功能
+    console.warn(`[softui] 属地查询失败（忽略）: ${error.message}`);
+  }
+  return out;
+}
+
+function sendGeo(req, res) {
+  let ips = [];
+  try {
+    const raw = new URL(req.url, "http://localhost").searchParams.get("ips") || "";
+    ips = raw.split(",").map((value) => value.trim()).filter(Boolean).slice(0, 50);
+  } catch {
+    ips = [];
+  }
+  resolveGeo(ips).then(
+    (map) =>
+      send(
+        res,
+        200,
+        { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+        JSON.stringify({ ok: true, data: map }),
+      ),
+    () =>
+      send(
+        res,
+        200,
+        { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+        JSON.stringify({ ok: true, data: {} }),
+      ),
+  );
+}
+
 const server = http.createServer((req, res) => {
   if (BASIC_AUTH && !authorized(req)) return deny(res);
+
+  const adminHost = isAdminHost(req);
+  const entryFile = adminHost ? ADMIN_ENTRY : "index.html";
 
   // API 走代理，其余走静态文件
   if (req.method === "POST" && req.url === "/rpc") return proxyRpc(req, res);
@@ -241,6 +401,35 @@ const server = http.createServer((req, res) => {
   /* 协议模块是 ESM（测试要 import），但浏览器脚本需要全局。
    * 这里按需转译而不是另存一份：只去掉行首的 `export `、包一层 IIFE 挂到 window，
    * 于是永远只有一个真源，不会出现两份文件各自漂移。 */
+  // 属地查询只在后台域名下提供：前台不需要它，开放了就等于给公网一个
+  // 免费的 IP 查询代理，还会白白烧掉 ip-api 的配额。
+  if (req.method === "GET" && urlPath === "/geo") {
+    if (!adminHost) {
+      return send(res, 404, { "content-type": "text/plain; charset=utf-8" }, "not found");
+    }
+    return sendGeo(req, res);
+  }
+
+  /* 桥接桩：与 dist 解耦，直接从 serve/ 提供（见 SHIM_FILE 处的说明）。
+   * 必须 no-store：手机上 no-cache 仍可能命中内存缓存，出现"改了桩却不生效"。 */
+  if (urlPath === "/tauri-shim.js") {
+    let source;
+    try {
+      source = fs.readFileSync(SHIM_FILE, "utf8");
+    } catch {
+      return send(res, 404, { "content-type": "text/plain" }, "tauri-shim.js not found");
+    }
+    return send(
+      res,
+      200,
+      {
+        "content-type": "text/javascript; charset=utf-8",
+        "cache-control": "no-store, must-revalidate",
+      },
+      source,
+    );
+  }
+
   if (urlPath === "/protocol.global.js") {
     let source;
     try {
@@ -267,7 +456,7 @@ const server = http.createServer((req, res) => {
 
   let filePath = candidate;
   try {
-    if (fs.statSync(filePath).isDirectory()) filePath = path.join(filePath, "index.html");
+    if (fs.statSync(filePath).isDirectory()) filePath = path.join(filePath, entryFile);
     fs.statSync(filePath);
   } catch {
     // 带扩展名的请求（.js/.css/.png…）找不到就老实 404。
@@ -276,13 +465,18 @@ const server = http.createServer((req, res) => {
     if (path.extname(urlPath)) {
       return send(res, 404, { "content-type": "text/plain; charset=utf-8" }, `not found: ${urlPath}`);
     }
-    // 只有无扩展名的前端路由才回退到首页
-    filePath = path.join(ROOT, "index.html");
+    // 只有无扩展名的前端路由才回退到入口页
+    filePath = path.join(ROOT, entryFile);
     try {
       fs.statSync(filePath);
     } catch {
       return send(res, 404, { "content-type": "text/plain" }, "not found");
     }
+  }
+
+  // 根路径 "/" 会解析到 index.html，后台站点要换成自己的入口页
+  if (adminHost && path.basename(filePath) === "index.html") {
+    filePath = path.join(ROOT, ADMIN_ENTRY);
   }
 
   const ext = path.extname(filePath).toLowerCase();
@@ -306,8 +500,9 @@ const server = http.createServer((req, res) => {
   }
 
   let body = fs.readFileSync(filePath);
-  // 入口 HTML 出站前注入桩标签，与前端构建解耦
-  if (path.basename(filePath) === "index.html") {
+  // 入口 HTML 出站前注入桩标签，与前端构建解耦（前台/后台两个入口都要注入）
+  const base = path.basename(filePath);
+  if (base === "index.html" || base === ADMIN_ENTRY) {
     body = Buffer.from(injectShimTag(body.toString("utf8")), "utf8");
   }
   const headers = { "content-type": type, "cache-control": cache, vary: "Accept-Encoding" };

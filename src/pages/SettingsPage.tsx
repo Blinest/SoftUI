@@ -1,23 +1,34 @@
-import { useState, type FormEvent } from "react";
-import { CheckCircle2, Cpu, Database, Eye, Save, SunMedium, Users } from "lucide-react";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { CheckCircle2, Cpu, Database, Eye, RefreshCw, ShieldX, SunMedium, Users } from "lucide-react";
 
 import Badge from "../components/Badge";
 import { SettingsNavigation } from "../components/SettingsNavigation";
 import { SettingsLayout } from "../layouts/SettingsLayout";
 import { settingsSections, type SettingsSection } from "./settingsSections";
+import { hasPermission, CAPABILITY_MATRIX, PERMISSION_REASON, ROLE_DUTY } from "../state/permissions";
 import type {
+  ClientSessionView,
   LegacyMigrationPreview,
   LegacyMigrationReport,
   RecorderStatus,
-  Role,
   RuntimeSnapshot,
-  UserAccount,
 } from "../softuiTypes";
 import "../styles/settings.css";
 
+/** 把时间戳说成"刚刚 / N 分钟前"，后台列表里比一串 ISO 时间好读得多。 */
+function formatRelative(timestampMs: number): string {
+  if (!timestampMs) return "—";
+  const delta = Date.now() - timestampMs;
+  if (delta < 5_000) return "刚刚";
+  if (delta < 60_000) return `${Math.round(delta / 1000)} 秒前`;
+  if (delta < 3_600_000) return `${Math.round(delta / 60_000)} 分钟前`;
+  if (delta < 86_400_000) return `${Math.round(delta / 3_600_000)} 小时前`;
+  return new Date(timestampMs).toLocaleString("zh-CN", { hour12: false });
+}
+
 export interface SettingsPageProps {
   snapshot: RuntimeSnapshot;
-  users: UserAccount[];
   recorderStatus: RecorderStatus;
   diagnosticsPath: string;
   migrationSource: string;
@@ -28,16 +39,12 @@ export interface SettingsPageProps {
   onMigrationSourceChange: (value: string) => void;
   onPreviewMigration: () => void;
   onRunMigration: () => void;
-  onCreateUser: (username: string, password: string, role: Role) => Promise<void>;
-  onResetUserPassword: (username: string, newPassword: string) => Promise<void>;
-  onSetUserDisabled: (username: string, disabled: boolean) => Promise<void>;
   onResetLayouts: () => void;
 }
 
 /** 设置页：左侧分类导航 + 右侧单分类内容。 */
 export function SettingsPage({
   snapshot,
-  users,
   recorderStatus,
   diagnosticsPath,
   migrationSource,
@@ -48,23 +55,38 @@ export function SettingsPage({
   onMigrationSourceChange,
   onPreviewMigration,
   onRunMigration,
-  onCreateUser,
-  onResetUserPassword,
-  onSetUserDisabled,
   onResetLayouts,
 }: SettingsPageProps) {
   const [activeSection, setActiveSection] = useState<SettingsSection>("application");
-  const [newUsername, setNewUsername] = useState("");
-  const [newUserPassword, setNewUserPassword] = useState("");
-  const [newUserRole, setNewUserRole] = useState<Role>("operator");
-  const [resetUsername, setResetUsername] = useState("");
-  const [resetPassword, setResetPassword] = useState("");
   const [accountMessage, setAccountMessage] = useState("");
+  /** 本账号已登录的设备 —— 自助查询，只包含自己。 */
+  const [mySessions, setMySessions] = useState<ClientSessionView[]>([]);
+  const [ownOldPassword, setOwnOldPassword] = useState("");
+  const [ownNewPassword, setOwnNewPassword] = useState("");
+
+  const canDiagnostics = hasPermission(snapshot, "viewDiagnostics");
+  const canManageSettings = hasPermission(snapshot, "manageSettings");
 
   const migrationTotal = migrationPreview
     ? migrationPreview.userFiles + migrationPreview.configFiles + migrationPreview.csvFiles + migrationPreview.logFiles
     : 0;
-  const canManageUsers = snapshot.authSession.permissions.includes("manageUsers");
+
+  /* 注意这里查的是 `list_my_sessions`（自助接口），不是管理员的 `list_clients`。
+   * 前台只该看到自己的设备 —— 全站在线设备、别人在哪个 IP、账号列表这些都归
+   * 后台管，不该出现在操作员日常用的界面上。 */
+  const loadMySessions = useCallback(async () => {
+    try {
+      const list = await invoke<ClientSessionView[]>("list_my_sessions");
+      setMySessions(list);
+    } catch {
+      // 未登录或网络问题：静默为空，不影响本页其它设置项
+      setMySessions([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadMySessions();
+  }, [loadMySessions]);
 
   const runAccountAction = async (action: () => Promise<void>, successMessage: string) => {
     setAccountMessage("");
@@ -76,22 +98,25 @@ export function SettingsPage({
     }
   };
 
-  const submitCreateUser = async (event: FormEvent) => {
-    event.preventDefault();
+  /** 退掉本账号的某台设备。不要求管理员权限：后端只允许操作自己的会话。 */
+  const revokeMySession = async (sessionId: string) => {
     await runAccountAction(async () => {
-      await onCreateUser(newUsername, newUserPassword, newUserRole);
-      setNewUsername("");
-      setNewUserPassword("");
-      setNewUserRole("operator");
-    }, "用户已创建");
+      await invoke("revoke_my_session", { sessionId });
+      await loadMySessions();
+    }, "已退掉那台设备");
   };
 
-  const submitResetPassword = async (event: FormEvent) => {
+  const submitOwnPassword = async (event: FormEvent) => {
     event.preventDefault();
     await runAccountAction(async () => {
-      await onResetUserPassword(resetUsername, resetPassword);
-      setResetPassword("");
-    }, "密码已重置");
+      // username 传 null = 改**自己**的密码；后端要求同时提供旧密码
+      await invoke("change_password", {
+        request: { username: null, oldPassword: ownOldPassword, newPassword: ownNewPassword },
+      });
+      setOwnOldPassword("");
+      setOwnNewPassword("");
+      await loadMySessions();
+    }, "密码已修改");
   };
 
   const activeLabel = settingsSections.find((section) => section.id === activeSection)?.label ?? "";
@@ -161,75 +186,112 @@ export function SettingsPage({
       case "accounts":
         return (
           <section className="settings-panel">
-            <header><div><span className="panel-kicker">auth</span><h2>账户与权限</h2></div></header>
+            <header>
+              <div><span className="panel-kicker">auth</span><h2>我的账号</h2></div>
+              <button type="button" className="ghost-btn" onClick={() => void loadMySessions()}>
+                <RefreshCw size={16} /><span>刷新设备</span>
+              </button>
+            </header>
             <div className="settings-stack">
               <div className="settings-row"><span>当前用户</span><strong>{snapshot.authSession.authenticated ? snapshot.authSession.username : "未登录"}</strong></div>
               <div className="settings-row"><span>角色</span><strong>{snapshot.authSession.role}</strong></div>
-              <div className="settings-row"><span>用户数量</span><strong>{users.length || "无权限查看"}</strong></div>
+              <div className="settings-row"><span>角色职责</span><strong>{ROLE_DUTY[snapshot.authSession.role] ?? "—"}</strong></div>
+              <div className="settings-row">
+                <span>我的设备</span>
+                <strong>
+                  {mySessions.length
+                    ? `${mySessions.filter((item) => item.online).length} 在线 / ${mySessions.length} 台`
+                    : "—"}
+                </strong>
+              </div>
             </div>
 
-            {canManageUsers ? (
-              <>
-                <div className="settings-user-list">
-                  {users.map((user) => (
-                    <div className="settings-user-row" key={user.username}>
-                      <div className="settings-user-main">
-                        <strong>{user.username}</strong>
-                        <span>{user.role}{user.mustChangePassword ? " / 需改密" : ""}</span>
-                      </div>
-                      <Badge tone={user.disabled ? "error" : "ok"}>{user.disabled ? "停用" : "启用"}</Badge>
-                      <button
-                        type="button"
-                        className="ghost-btn"
-                        onClick={() => void runAccountAction(
-                          () => onSetUserDisabled(user.username, !user.disabled),
-                          user.disabled ? "用户已启用" : "用户已停用",
-                        )}
-                        disabled={user.username === snapshot.authSession.username}
-                      >
-                        <span>{user.disabled ? "启用" : "停用"}</span>
-                      </button>
-                    </div>
-                  ))}
-                </div>
+            <div className="settings-subheader">
+              <h3>我的权限</h3>
+              <span>界面会按角色禁用无权使用的操作，后端对每条命令也会再校验一次。</span>
+            </div>
+            <div className="settings-stack">
+              {CAPABILITY_MATRIX.map((item) => {
+                const allowed = hasPermission(snapshot, item.permission);
+                return (
+                  <div className="settings-row" key={item.permission}>
+                    <span>{item.label}</span>
+                    <Badge tone={allowed ? "ok" : "warn"}>
+                      {allowed ? "可用" : `需 ${item.since}`}
+                    </Badge>
+                  </div>
+                );
+              })}
+            </div>
 
-                <form className="account-form" onSubmit={submitCreateUser}>
-                  <label><span>新用户</span>
-                    <input value={newUsername} onChange={(event) => setNewUsername(event.target.value)} placeholder="operator_1" />
-                  </label>
-                  <label><span>初始密码</span>
-                    <input type="password" value={newUserPassword} onChange={(event) => setNewUserPassword(event.target.value)} />
-                  </label>
-                  <label><span>角色</span>
-                    <select value={newUserRole} onChange={(event) => setNewUserRole(event.target.value as Role)}>
-                      <option value="operator">operator</option>
-                      <option value="maintainer">maintainer</option>
-                      <option value="admin">admin</option>
-                    </select>
-                  </label>
-                  <button type="submit" className="primary-btn full" disabled={!newUsername.trim() || newUserPassword.length < 8}>
-                    <CheckCircle2 size={16} /><span>创建用户</span>
-                  </button>
-                </form>
-
-                <form className="account-form" onSubmit={submitResetPassword}>
-                  <label><span>重置用户</span>
-                    <select value={resetUsername} onChange={(event) => setResetUsername(event.target.value)}>
-                      <option value="">选择用户</option>
-                      {users.map((user) => <option value={user.username} key={user.username}>{user.username}</option>)}
-                    </select>
-                  </label>
-                  <label><span>新密码</span>
-                    <input type="password" value={resetPassword} onChange={(event) => setResetPassword(event.target.value)} />
-                  </label>
-                  <button type="submit" className="ghost-btn full" disabled={!resetUsername || resetPassword.length < 8}>
-                    <Save size={16} /><span>重置密码</span>
-                  </button>
-                </form>
-              </>
+            <div className="settings-subheader">
+              <h3>我的设备</h3>
+              <span>本账号登录过的设备。看到不认识的设备就退掉它，然后改密码。</span>
+            </div>
+            {mySessions.length === 0 ? (
+              <div className="settings-result">暂无记录。</div>
             ) : (
-              <div className="settings-result">当前角色没有用户管理权限。</div>
+              <div className="settings-client-list">
+                {mySessions.map((item) => (
+                  <div className="settings-client-row" key={item.sessionId}>
+                    <div className="settings-client-main">
+                      <strong>
+                        {item.label}
+                        <span className="settings-client-tag">{item.role}</span>
+                      </strong>
+                      <span>
+                        {item.ip || "地址未知"} · 最近活动 {formatRelative(item.lastSeenMs)}
+                      </span>
+                      <span className="settings-client-agent" title={item.userAgent}>
+                        {item.userAgent || "—"}
+                      </span>
+                    </div>
+                    <Badge tone={item.online ? "ok" : "warn"}>{item.online ? "在线" : "离线"}</Badge>
+                    <button
+                      type="button"
+                      className="ghost-btn"
+                      onClick={() => void revokeMySession(item.sessionId)}
+                    >
+                      <ShieldX size={16} /><span>退掉这台设备</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
             )}
+
+            <div className="settings-subheader">
+              <h3>修改我的密码</h3>
+              <span>改完其它设备需要用新密码重新登录。忘了旧密码请联系管理员在后台重置。</span>
+            </div>
+            <form className="account-form" onSubmit={submitOwnPassword}>
+              <label><span>当前密码</span>
+                <input
+                  type="password"
+                  value={ownOldPassword}
+                  onChange={(event) => setOwnOldPassword(event.target.value)}
+                  autoComplete="current-password"
+                />
+              </label>
+              <label><span>新密码</span>
+                <input
+                  type="password"
+                  value={ownNewPassword}
+                  onChange={(event) => setOwnNewPassword(event.target.value)}
+                  autoComplete="new-password"
+                />
+              </label>
+              <button
+                type="submit"
+                className="primary-btn full"
+                disabled={!ownOldPassword || ownNewPassword.length < 4}
+              >
+                <CheckCircle2 size={16} /><span>修改密码</span>
+              </button>
+            </form>
+
+            <div className="settings-result">
+              需要管理**其它**账号（新建 / 停用 / 重置密码 / 踢下线 / 设备上限 / 注册审批）请到后台管理站点操作。
+            </div>
             {accountMessage ? <div className="settings-result">{accountMessage}</div> : null}
           </section>
         );
@@ -247,7 +309,13 @@ export function SettingsPage({
               <div className="settings-row"><span>录制状态</span><strong>{recorderStatus.active ? (recorderStatus.paused ? "已暂停" : "录制中") : "空闲"}</strong></div>
             </div>
             <div className="settings-actions-row">
-              <button type="button" className="ghost-btn" onClick={onExportDiagnostics}>
+              <button
+                type="button"
+                className="ghost-btn"
+                disabled={!canDiagnostics}
+                title={canDiagnostics ? undefined : PERMISSION_REASON.viewDiagnostics}
+                onClick={onExportDiagnostics}
+              >
                 <Cpu size={16} /><span>导出诊断包</span>
               </button>
             </div>
@@ -269,10 +337,22 @@ export function SettingsPage({
                   placeholder="例如 D:\\...\\SoftUI"
                 />
               </label>
-              <button type="button" className="ghost-btn" onClick={onPreviewMigration}>
+              <button
+                type="button"
+                className="ghost-btn"
+                disabled={!canManageSettings}
+                title={canManageSettings ? undefined : PERMISSION_REASON.manageSettings}
+                onClick={onPreviewMigration}
+              >
                 <Eye size={16} /><span>预览</span>
               </button>
-              <button type="button" className="primary-btn" onClick={onRunMigration} disabled={!migrationPreview?.exists}>
+              <button
+                type="button"
+                className="primary-btn"
+                onClick={onRunMigration}
+                disabled={!canManageSettings || !migrationPreview?.exists}
+                title={canManageSettings ? undefined : PERMISSION_REASON.manageSettings}
+              >
                 <Database size={16} /><span>执行迁移</span>
               </button>
             </div>

@@ -5306,3 +5306,47 @@ button {
   min-width: 96px;
   font-weight: 600;
 }
+
+/* ── 登录页：登录 / 注册切换 ──────────────────────────────────────────
+ * 注册入口按后端的注册策略显示（关闭时不出现），这里只管样式。
+ * ──────────────────────────────────────────────────────────────────── */
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+  background: var(--border-subtle);
+}
+
+.auth-tabs button {
+  padding: 7px 10px;
+  border: 0;
+  background: var(--surface-panel);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.auth-tabs button.active {
+  background: var(--action-primary);
+  color: var(--action-primary-text);
+}
+
+.auth-ok {
+  padding: 7px 9px;
+  border: 1px solid var(--status-ok);
+  border-radius: 6px;
+  color: var(--status-ok);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.auth-hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}

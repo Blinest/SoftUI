@@ -261,18 +261,6 @@ struct SettingsState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ChartChannel {
-    name: String,
-    unit: String,
-    #[serde(rename = "channelType")]
-    channel_type: String,
-    #[serde(rename = "channelIndex")]
-    channel_index: u32,
-    points: Vec<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct DiagnosticsSummary {
     stored_frames: usize,
     live_capacity: usize,
@@ -327,14 +315,6 @@ struct ConnectionSection {
 struct LiveSection {
     selected_device_id: String,
     latest: Option<DeviceSnapshot>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ChartSection {
-    window_size: usize,
-    timestamps: Vec<f64>,
-    channels: Vec<ChartChannel>,
 }
 
 /// 轻量实时响应：最新一帧 + 环形缓冲统计，供非曲线页高频轮询。
@@ -764,187 +744,7 @@ fn overlay_live_frames(snapshot: &mut RuntimeSnapshot, live_frames: &[DeviceSnap
     snapshot.connection.last_message = "Serial stream active".to_string();
 }
 
-fn make_charts(seq: u64) -> ChartSection {
-    let motor_channels = vec![
-        ("Motor 1", "mm", "motor", 1, 0.0, 0.32),
-        ("Motor 2", "mm", "motor", 2, 0.5, 0.29),
-        ("Motor 3", "mm", "motor", 3, 1.0, 0.26),
-        ("Motor 4", "mm", "motor", 4, 1.5, 0.23),
-        ("Motor 5", "mm", "motor", 5, 2.0, 0.2),
-        ("Motor 6", "mm", "motor", 6, 2.5, 0.17),
-    ];
-    let mut channels: Vec<ChartChannel> = motor_channels
-        .into_iter()
-        .map(|(name, unit, ctype, idx, offset, scale)| ChartChannel {
-            name: name.to_string(),
-            unit: unit.to_string(),
-            channel_type: ctype.to_string(),
-            channel_index: idx,
-            points: (0..120)
-                .map(|i| {
-                    let x = i as f64 / 8.0 + seq as f64 / 18.0 + offset;
-                    0.5 + (x.sin() * scale + x.cos() * scale * 0.5)
-                })
-                .collect(),
-        })
-        .collect();
 
-    // Add bend channels
-    channels.push(ChartChannel {
-        name: "Bend S1".to_string(),
-        unit: "deg".to_string(),
-        channel_type: "bend".to_string(),
-        channel_index: 1,
-        points: (0..120)
-            .map(|i| 15.0 + ((i as f64 + seq as f64) / 20.0).sin() * 10.0)
-            .collect(),
-    });
-    channels.push(ChartChannel {
-        name: "Bend S2".to_string(),
-        unit: "deg".to_string(),
-        channel_type: "bend".to_string(),
-        channel_index: 2,
-        points: (0..120)
-            .map(|i| 10.0 + ((i as f64 + seq as f64) / 15.0).cos() * 8.0)
-            .collect(),
-    });
-
-    ChartSection {
-        window_size: 120,
-        timestamps: (0..120).map(|i| (i as f64 - 119.0) * 0.05).collect(),
-        channels,
-    }
-}
-
-fn make_charts_from_motors(frames: &[DeviceSnapshot]) -> ChartSection {
-    if frames.is_empty() {
-        return make_charts(0);
-    }
-    let motor_count = frames[0].motors.len();
-    let sensor_count = frames[0].sensors.len();
-    let timestamps: Vec<f64> = frames
-        .iter()
-        .map(|frame| frame.received_at_ms as f64 / 1000.0)
-        .collect();
-    let mut channels: Vec<ChartChannel> = Vec::new();
-
-    // Motor position channels
-    for motor_idx in 0..motor_count {
-        let points: Vec<f64> = frames
-            .iter()
-            .map(|frame| {
-                frame
-                    .motors
-                    .get(motor_idx)
-                    .map(|m| m.position_mm)
-                    .unwrap_or(0.0)
-            })
-            .collect();
-        channels.push(ChartChannel {
-            name: format!("Motor {} pos", motor_idx + 1),
-            unit: "mm".to_string(),
-            channel_type: "motor".to_string(),
-            channel_index: motor_idx as u32,
-            points,
-        });
-    }
-
-    // Motor velocity channels
-    for motor_idx in 0..motor_count {
-        let points: Vec<f64> = frames
-            .iter()
-            .map(|frame| {
-                frame
-                    .motors
-                    .get(motor_idx)
-                    .map(|m| m.velocity_mm_per_sec)
-                    .unwrap_or(0.0)
-            })
-            .collect();
-        channels.push(ChartChannel {
-            name: format!("Motor {} vel", motor_idx + 1),
-            unit: "mm/s".to_string(),
-            channel_type: "motor".to_string(),
-            channel_index: motor_idx as u32,
-            points,
-        });
-    }
-
-    // Motor acceleration channels
-    for motor_idx in 0..motor_count {
-        let points: Vec<f64> = frames
-            .iter()
-            .map(|frame| {
-                frame
-                    .motors
-                    .get(motor_idx)
-                    .map(|m| m.acceleration_mm_per_sec2)
-                    .unwrap_or(0.0)
-            })
-            .collect();
-        channels.push(ChartChannel {
-            name: format!("Motor {} acc", motor_idx + 1),
-            unit: "mm/s²".to_string(),
-            channel_type: "motor".to_string(),
-            channel_index: motor_idx as u32,
-            points,
-        });
-    }
-
-    // Bend angle channels
-    let bend_points1: Vec<f64> = frames
-        .iter()
-        .map(|frame| frame.bend.section1.angle_deg)
-        .collect();
-    channels.push(ChartChannel {
-        name: "Bend S1".to_string(),
-        unit: "deg".to_string(),
-        channel_type: "bend".to_string(),
-        channel_index: 1,
-        points: bend_points1,
-    });
-    let bend_points2: Vec<f64> = frames
-        .iter()
-        .map(|frame| frame.bend.section2.angle_deg)
-        .collect();
-    channels.push(ChartChannel {
-        name: "Bend S2".to_string(),
-        unit: "deg".to_string(),
-        channel_type: "bend".to_string(),
-        channel_index: 2,
-        points: bend_points2,
-    });
-
-    // Sensor channels
-    for sensor_idx in 0..sensor_count {
-        for ch in 0..3 {
-            let axis = ["X", "Y", "Z"][ch];
-            let points: Vec<f64> = frames
-                .iter()
-                .map(|frame| {
-                    frame
-                        .sensors
-                        .get(sensor_idx)
-                        .map(|s| s.filtered[ch])
-                        .unwrap_or(0.0)
-                })
-                .collect();
-            channels.push(ChartChannel {
-                name: format!("Sensor {} {}", sensor_idx + 1, axis),
-                unit: "N".to_string(),
-                channel_type: "sensor".to_string(),
-                channel_index: sensor_idx as u32,
-                points,
-            });
-        }
-    }
-
-    ChartSection {
-        window_size: channels.first().map(|c| c.points.len()).unwrap_or(0),
-        timestamps,
-        channels,
-    }
-}
 
 fn empty_live_stats() -> live::FrameStats {
     live::FrameStats {
@@ -1228,6 +1028,88 @@ fn build_snapshot(data: &PersistedState) -> RuntimeSnapshot {
     }
 }
 
+/* ── 请求上下文：把「这次请求属于哪台设备」从传输层带到命令层 ────────────
+ * 为什么用线程局部：`run_server` 是**一个连接一个线程**，且一个请求的全部
+ * 处理（含 `ui_wait` / `webserial_wait_tx` 这类挂起式长轮询）都在该线程内
+ * 同步完成，所以"当前请求的 token"天然是线程私有的，不会串台。
+ *
+ * 这么做换来的好处很大：74 个命令函数的签名**一个字都不用改** ——
+ * 它们照旧拿 `State<'_, AppState>`，而 `AppState::session()` 能解析出
+ * 本设备自己的会话。若改成给每个命令加 token 参数，改动面会覆盖 74 处
+ * 调用与 dispatch 分发，既啰嗦又容易漏。
+ * ──────────────────────────────────────────────────────────────────── */
+#[cfg(not(feature = "desktop"))]
+mod request_ctx {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static TOKEN: RefCell<Option<String>> = const { RefCell::new(None) };
+        static CLIENT_IP: RefCell<String> = const { RefCell::new(String::new()) };
+        static USER_AGENT: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    pub fn set(token: Option<String>, client_ip: String, user_agent: String) {
+        TOKEN.with(|slot| *slot.borrow_mut() = token);
+        CLIENT_IP.with(|slot| *slot.borrow_mut() = client_ip);
+        USER_AGENT.with(|slot| *slot.borrow_mut() = user_agent);
+    }
+
+    pub fn token() -> Option<String> {
+        TOKEN.with(|slot| slot.borrow().clone())
+    }
+
+    pub fn client_ip() -> String {
+        CLIENT_IP.with(|slot| slot.borrow().clone())
+    }
+
+    pub fn user_agent() -> String {
+        USER_AGENT.with(|slot| slot.borrow().clone())
+    }
+}
+
+/// 当前请求的设备信息（IP / UA），用于后台的「设备访问」列表。
+fn request_meta() -> (String, String) {
+    #[cfg(not(feature = "desktop"))]
+    {
+        (request_ctx::client_ip(), request_ctx::user_agent())
+    }
+    #[cfg(feature = "desktop")]
+    {
+        ("local".to_string(), "tauri-desktop".to_string())
+    }
+}
+
+impl AppState {
+    /// 解析「本次请求」所属的会话。
+    ///
+    /// - **server 模式**：按请求头里的 token 查会话；**没有 token 就是未登录**。
+    ///   这里绝不能退回那份全局单会话，否则"一人登录、全体放行"会原样复现。
+    /// - **桌面模式**：没有 token 概念，仍用那份进程内单会话（单机语义不变）。
+    ///
+    /// 注意 `resolve()` 会顺带刷新 `last_seen_ms`，而后台列表的「最近活动」
+    /// 就来自它 —— 前端每 500ms 一次的 `bootstrap_state` 天然就是心跳，
+    /// 不需要再开一条独立通道。
+    fn session(&self) -> auth::AuthSession {
+        #[cfg(not(feature = "desktop"))]
+        {
+            match request_ctx::token() {
+                Some(token) => self
+                    .sessions
+                    .resolve(&token)
+                    .unwrap_or_else(auth::AuthSession::signed_out),
+                None => auth::AuthSession::signed_out(),
+            }
+        }
+        #[cfg(feature = "desktop")]
+        {
+            self.local_session
+                .lock()
+                .map(|session| session.clone())
+                .unwrap_or_else(|_| auth::AuthSession::signed_out())
+        }
+    }
+}
+
 struct AppState {
     store: RuntimeStore,
     profile_store: profiles::ProfileStore,
@@ -1237,7 +1119,12 @@ struct AppState {
     playback: Arc<Mutex<playback::PlaybackEngine>>,
     control_runtime: Arc<Mutex<control::ControlRuntime>>,
     dynamics_runtime: Arc<Mutex<dynamics::DynamicsRuntime>>,
-    auth_session: Arc<Mutex<auth::AuthSession>>,
+    /// 桌面单机模式的那份进程内会话。server 模式下**不使用**（改为按 token 的
+    /// `sessions`），保留它只为让桌面版行为与改造前完全一致。
+    #[cfg(feature = "desktop")]
+    local_session: Arc<Mutex<auth::AuthSession>>,
+    /// 按设备隔离的会话注册表：server 模式的主路径。
+    sessions: auth::SessionStore,
     auth_store: auth::AuthStore,
     sqlite: storage::SqliteStore,
     worker_stop: Arc<AtomicBool>,
@@ -1267,6 +1154,11 @@ impl AppState {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("softui.sqlite3");
+        // 会话落盘：网关每次部署都要重启，不持久化的话所有端都得重新登录。
+        let sessions_path = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("sessions.json");
         Self {
             store: RuntimeStore::load(path),
             profile_store: profiles::ProfileStore::load(profile_path),
@@ -1276,7 +1168,9 @@ impl AppState {
             playback: Arc::new(Mutex::new(playback::PlaybackEngine::new())),
             control_runtime: Arc::new(Mutex::new(control::ControlRuntime::default())),
             dynamics_runtime: Arc::new(Mutex::new(dynamics::DynamicsRuntime::default())),
-            auth_session: Arc::new(Mutex::new(auth::AuthSession::default())),
+            #[cfg(feature = "desktop")]
+            local_session: Arc::new(Mutex::new(auth::AuthSession::default())),
+            sessions: auth::SessionStore::load(sessions_path),
             auth_store: auth::AuthStore::load(auth_path),
             sqlite: storage::SqliteStore::new(sqlite_path),
             worker_stop: Arc::new(AtomicBool::new(false)),
@@ -1307,9 +1201,8 @@ impl AppState {
         if let Ok(control) = self.control_runtime.lock() {
             snapshot.control_runtime = control.status();
         }
-        if let Ok(auth) = self.auth_session.lock() {
-            snapshot.auth_session = auth.clone();
-        }
+        // 会话必须按「本次请求的设备」解析，不能再用那份全局单会话。
+        snapshot.auth_session = self.session();
 
         // 回放激活：用**回放帧**灌满快照，并跳过实时环。
         if let Ok(pb) = self.playback.lock() {
@@ -1424,49 +1317,21 @@ impl AppState {
         self.snapshot()
     }
 
-    fn export_diagnostics_bundle(&self) -> Result<String, String> {
+    /// 诊断包**内容**。只读、不落盘。
+    ///
+    /// 原来这里会往 `data/diagnostics/softui-diagnostics-*/` 写 5 个 JSON 文件并
+    /// 返回目录路径 —— 于是每次导出都在服务器上留一份（容器磁盘本来就紧张），
+    /// 用户还得进服务器把文件拷出来。现在只把内容返回给前端，由浏览器直接存文件。
+    fn diagnostics_bundle(&self) -> serde_json::Value {
         let snapshot = self.snapshot();
-        let base_dir = self
-            .store
-            .path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join("diagnostics");
-        let bundle_dir = base_dir.join(format!(
-            "softui-diagnostics-{}",
-            snapshot.dashboard.current_session.replace('-', "")
-        ));
-        fs::create_dir_all(&bundle_dir).map_err(|err| err.to_string())?;
-
-        let files = [
-            (
-                "app-info.json",
-                serde_json::to_string_pretty(&snapshot.app_info).map_err(|err| err.to_string())?,
-            ),
-            (
-                "snapshot.json",
-                serde_json::to_string_pretty(&snapshot).map_err(|err| err.to_string())?,
-            ),
-            (
-                "logs.json",
-                serde_json::to_string_pretty(&snapshot.logs).map_err(|err| err.to_string())?,
-            ),
-            (
-                "settings.json",
-                serde_json::to_string_pretty(&snapshot.settings).map_err(|err| err.to_string())?,
-            ),
-            (
-                "runtime-diagnostics.json",
-                serde_json::to_string_pretty(&snapshot.runtime_diagnostics)
-                    .map_err(|err| err.to_string())?,
-            ),
-        ];
-
-        for (name, content) in files {
-            fs::write(bundle_dir.join(name), content).map_err(|err| err.to_string())?;
-        }
-
-        Ok(bundle_dir.to_string_lossy().to_string())
+        // 注意顺序：前四个是 clone，最后整体 move，避免 owner 被提前移走
+        serde_json::json!({
+            "appInfo": snapshot.app_info,
+            "logs": snapshot.logs,
+            "settings": snapshot.settings,
+            "runtimeDiagnostics": snapshot.runtime_diagnostics,
+            "snapshot": snapshot,
+        })
     }
 
     /// 增量同步新增日志到 SQLite，避免每次全量重放（热路径下开销大）。
@@ -1976,10 +1841,7 @@ fn guard_command_allowed(
         CommandSafety::Enabled => auth::Permission::SendMotionCommand,
     };
     {
-        let auth_session = state
-            .auth_session
-            .lock()
-            .map_err(|_| "auth session poisoned".to_string())?;
+        let auth_session = state.session();
         auth::require_permission(&auth_session, required_permission)?;
     }
 
@@ -2016,20 +1878,17 @@ fn guard_permission(
     state: &State<'_, AppState>,
     permission: auth::Permission,
 ) -> Result<(), String> {
-    let auth_session = state
-        .auth_session
-        .lock()
-        .map_err(|_| "auth session poisoned".to_string())?;
+    let auth_session = state.session();
     auth::require_permission(&auth_session, permission)
 }
 
 fn current_username(state: &State<'_, AppState>) -> Option<String> {
-    state
-        .auth_session
-        .lock()
-        .ok()
-        .filter(|session| session.authenticated)
-        .map(|session| session.username.clone())
+    let session = state.session();
+    if session.authenticated {
+        Some(session.username)
+    } else {
+        None
+    }
 }
 
 /// 记录一次**被拒绝/失败**的控制指令。
@@ -2123,26 +1982,57 @@ fn app_info() -> AppInfo {
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn current_auth_session(state: State<'_, AppState>) -> Result<auth::AuthSession, String> {
-    state
-        .auth_session
-        .lock()
-        .map_err(|_| "auth session poisoned".to_string())
-        .map(|session| session.clone())
+    // 按 token 解析：每台设备拿到的是**自己**的会话，不再共用同一份。
+    Ok(state.session())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn login(
     state: State<'_, AppState>,
     request: auth::LoginRequest,
-) -> Result<auth::AuthSession, String> {
-    let session = state.auth_store.login(request)?;
-    {
-        let mut auth_session = state
-            .auth_session
-            .lock()
-            .map_err(|_| "auth session poisoned".to_string())?;
-        *auth_session = session.clone();
+) -> Result<auth::LoginResult, String> {
+    let username = request.username.trim().to_string();
+    let client_id = request
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown-device")
+        .to_string();
+    let label = request
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未命名设备")
+        .to_string();
+
+    // 设备数上限：这就是后台「管理设备的访问」可调的那一档。
+    // 达到上限时**直接拒绝**，而不是悄悄顶掉别人的会话 —— 否则现场就会
+    // "用着用着突然被踢下线"，却不知道是谁干的。
+    let limit = state.auth_store.max_devices(&username);
+    if limit > 0 {
+        let active = state.sessions.active_count_for_user(&username) as u32;
+        if active >= limit {
+            return Err(format!(
+                "该账号已达到 {limit} 台设备在线上限（当前 {active} 台）。\
+                 请在其它设备上退出，或让管理员在「后台管理 → 设备访问」里踢下线。"
+            ));
+        }
     }
+
+    let session = state.auth_store.login(request)?;
+    let (ip, user_agent) = request_meta();
+    let token = state.sessions.create(&session, client_id, label, ip, user_agent)?;
+
+    // 桌面模式同步刷新那份单会话，保持单机语义不变
+    #[cfg(feature = "desktop")]
+    {
+        if let Ok(mut local) = state.local_session.lock() {
+            *local = session.clone();
+        }
+    }
+
     state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
         data.logs.push(log_entry(
@@ -2154,20 +2044,33 @@ fn login(
             None,
         ));
     });
-    Ok(session)
+
+    let active_devices = state.sessions.active_count_for_user(&session.username) as u32;
+    Ok(auth::LoginResult {
+        token,
+        session,
+        device_limit: limit,
+        active_devices,
+    })
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn logout(state: State<'_, AppState>) -> Result<auth::AuthSession, String> {
-    let previous = {
-        let mut auth_session = state
-            .auth_session
-            .lock()
-            .map_err(|_| "auth session poisoned".to_string())?;
-        let previous = auth_session.username.clone();
-        *auth_session = auth::AuthSession::signed_out();
-        previous
-    };
+    let previous = state.session().username.clone();
+    // server：只踢掉**本设备**这一条会话，其它设备照常使用
+    #[cfg(not(feature = "desktop"))]
+    {
+        if let Some(token) = request_ctx::token() {
+            let _ = state.sessions.revoke(&token);
+        }
+    }
+    // 桌面：清空那份单会话
+    #[cfg(feature = "desktop")]
+    {
+        if let Ok(mut local) = state.local_session.lock() {
+            *local = auth::AuthSession::signed_out();
+        }
+    }
     state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
         data.logs.push(log_entry(
@@ -2179,7 +2082,7 @@ fn logout(state: State<'_, AppState>) -> Result<auth::AuthSession, String> {
             None,
         ));
     });
-    current_auth_session(state)
+    Ok(auth::AuthSession::signed_out())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -2215,22 +2118,26 @@ fn change_password(
     state: State<'_, AppState>,
     request: auth::ChangePasswordRequest,
 ) -> Result<(), String> {
-    let auth_session = state
-        .auth_session
-        .lock()
-        .map_err(|_| "auth session poisoned".to_string())?
-        .clone();
+    let auth_session = state.session();
     let target_username = request
         .username
         .clone()
         .unwrap_or_else(|| auth_session.username.clone());
     state.auth_store.change_password(&auth_session, request)?;
+
+    // 会话记录才是 `must_change_password` 的真源，改密成功要同步清掉。
+    state.sessions.mark_password_changed(&target_username);
+    // 管理员重置**别人**密码时，把那个账号的所有设备踢下线：
+    // 否则旧口令签发出去的 token 还能继续用，重置就形同虚设。
+    if target_username != auth_session.username {
+        state.sessions.revoke_user(&target_username);
+    }
+    // 桌面模式那份单会话也要同步，不然界面还停在"必须改密"页
+    #[cfg(feature = "desktop")]
     if target_username == auth_session.username {
-        let mut current_session = state
-            .auth_session
-            .lock()
-            .map_err(|_| "auth session poisoned".to_string())?;
-        current_session.must_change_password = false;
+        if let Ok(mut local) = state.local_session.lock() {
+            local.must_change_password = false;
+        }
     }
     state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
@@ -2254,6 +2161,11 @@ fn set_user_disabled(
 ) -> Result<auth::UserAccount, String> {
     guard_permission(&state, auth::Permission::ManageUsers)?;
     let account = state.auth_store.set_disabled(username, disabled)?;
+    // 禁用账号必须连带踢掉它所有设备上的会话。否则"禁用"只挡住了**下一次**
+    // 登录，已经登录的端会一直用到 token 过期（7 天）为止。
+    if disabled {
+        state.sessions.revoke_user(&account.username);
+    }
     let log_username = account.username.clone();
     state.store.mutate(|data| {
         data.sequence = data.sequence.saturating_add(1);
@@ -2271,6 +2183,239 @@ fn set_user_disabled(
         ));
     });
     Ok(account)
+}
+
+/* ── 后台管理：设备访问控制 ───────────────────────────────────────────
+ * 部署实录「已知问题 1」的根治部分。下面四个命令是**后台管理页唯一的写入面**，
+ * 全部要求 `ManageUsers` 权限（只有 Admin 角色有），所以非管理员连列表都看不到。
+ * ──────────────────────────────────────────────────────────────────── */
+
+/// 当前持有会话的设备列表（在线的排前面，其次按最近活动倒序）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn list_clients(state: State<'_, AppState>) -> Result<Vec<auth::ClientSessionView>, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    Ok(state.sessions.list())
+}
+
+/// 按 `session_id`（token 前缀）踢掉**一台**设备。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn revoke_client(state: State<'_, AppState>, session_id: String) -> Result<usize, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    let removed = state.sessions.revoke(&session_id)?;
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Warn,
+            "auth",
+            "Client session revoked",
+            Some(&session_id),
+            None,
+        ));
+    });
+    Ok(removed)
+}
+
+/// 踢掉某个账号的**全部**设备。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn revoke_user_sessions(state: State<'_, AppState>, username: String) -> Result<usize, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    let removed = state.sessions.revoke_user(&username);
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Warn,
+            "auth",
+            "All sessions of user revoked",
+            Some(&username),
+            None,
+        ));
+    });
+    Ok(removed)
+}
+
+/// 设置账号允许同时在线的设备台数（0 = 不限）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn set_user_device_limit(
+    state: State<'_, AppState>,
+    username: String,
+    max_devices: u32,
+) -> Result<auth::UserAccount, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    state.auth_store.set_max_devices(&username, max_devices)
+}
+
+/* ── 自助注册 ─────────────────────────────────────────────────────────
+ * 注册是**匿名**入口（要求登录就没法注册了），所以这里不加权限校验。
+ * 安全性由三件事保证：
+ *   1) 注册开关（关闭 / 待审批 / 直接通过）
+ *   2) 匿名限流 —— 按**客户端 IP**，按用户名限流换名就绕过了
+ *   3) 默认"待管理员审批"，审批前连登录都过不了
+ * ──────────────────────────────────────────────────────────────────── */
+
+/// 当前注册开关。登录页用它决定是否显示「注册」入口。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn registration_mode(state: State<'_, AppState>) -> auth::RegistrationMode {
+    state.auth_store.registration_mode()
+}
+
+/// 自助注册。成功后账号处于「待审批」，需管理员在后台通过。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn register(
+    state: State<'_, AppState>,
+    request: auth::RegisterRequest,
+) -> Result<auth::UserAccount, String> {
+    let (ip, _) = request_meta();
+    let client_key = if ip.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        ip
+    };
+    let account = state.auth_store.register(request, &client_key)?;
+    let username = account.username.clone();
+    let pending = account.pending;
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Info,
+            "auth",
+            if pending {
+                "Self registration pending approval"
+            } else {
+                "Self registration"
+            },
+            Some(&username),
+            None,
+        ));
+    });
+    Ok(account)
+}
+
+/// 自助：查看**本账号**在哪些设备上登录着（前台「我的账号」用）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn list_my_sessions(state: State<'_, AppState>) -> Result<Vec<auth::ClientSessionView>, String> {
+    let session = state.session();
+    if !session.authenticated {
+        return Err("请先登录".to_string());
+    }
+    Ok(state.sessions.list_for_user(&session.username))
+}
+
+/// 自助：把**本账号**的某台设备踢下线（例如在别人电脑上忘了退出）。
+/// 只要求"已登录"，不要求管理员权限；归属校验在 `revoke_owned` 里。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn revoke_my_session(state: State<'_, AppState>, session_id: String) -> Result<usize, String> {
+    let session = state.session();
+    if !session.authenticated {
+        return Err("请先登录".to_string());
+    }
+    state.sessions.revoke_owned(&session_id, &session.username)
+}
+
+/// 修改账号角色。改动会**立即**同步到该账号已登录的设备上。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn set_user_role(
+    state: State<'_, AppState>,
+    username: String,
+    role: auth::Role,
+) -> Result<auth::UserAccount, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    let account = state.auth_store.set_role(&username, role)?;
+    // 关键：光改用户表不够，还得刷已登录会话里的角色快照，
+    // 否则被降级的人会拿旧角色一直用到会话过期。
+    let updated_sessions = state.sessions.update_role(&account.username, role);
+    let note = format!("{} -> {:?}（同步 {} 条会话）", account.username, role, updated_sessions);
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Warn,
+            "auth",
+            "User role changed",
+            Some(&note),
+            None,
+        ));
+    });
+    Ok(account)
+}
+
+/// 删除账号：连同它所有设备上的会话一起清掉。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn delete_user(state: State<'_, AppState>, username: String) -> Result<(), String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    // 不能删掉自己：会话还活着但账号没了，会留下一个状态诡异的"幽灵登录"
+    if state.session().username == username {
+        return Err("不能删除当前正在登录的账号".to_string());
+    }
+    state.auth_store.delete_user(&username)?;
+    // 账号没了，token 也必须立刻失效，否则旧凭证还能继续用
+    state.sessions.revoke_user(&username);
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Warn,
+            "auth",
+            "User deleted",
+            Some(&username),
+            None,
+        ));
+    });
+    Ok(())
+}
+
+/// 管理员审批通过某个待审批账号。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn approve_user(
+    state: State<'_, AppState>,
+    username: String,
+) -> Result<auth::UserAccount, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    let account = state.auth_store.approve(&username)?;
+    let log_username = account.username.clone();
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Info,
+            "auth",
+            "User approved",
+            Some(&log_username),
+            None,
+        ));
+    });
+    Ok(account)
+}
+
+/// 待审批人数：后台首页要显示，管理员才知道有没有人排队。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn pending_user_count(state: State<'_, AppState>) -> Result<usize, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    Ok(state.auth_store.pending_count())
+}
+
+/// 设置注册开关（关闭 / 待审批 / 直接通过）。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn set_registration_mode(
+    state: State<'_, AppState>,
+    mode: auth::RegistrationMode,
+) -> Result<auth::RegistrationMode, String> {
+    guard_permission(&state, auth::Permission::ManageUsers)?;
+    let applied = state.auth_store.set_registration_mode(mode)?;
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Warn,
+            "auth",
+            "Registration mode changed",
+            Some(&format!("{applied:?}")),
+            None,
+        ));
+    });
+    Ok(applied)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -2303,9 +2448,9 @@ fn update_settings(
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-fn export_diagnostics_bundle(state: State<'_, AppState>) -> Result<String, String> {
+fn diagnostics_bundle(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     guard_permission(&state, auth::Permission::ViewDiagnostics)?;
-    state.export_diagnostics_bundle()
+    Ok(state.diagnostics_bundle())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -3760,11 +3905,7 @@ fn start_recording(
         .lock()
         .map_err(|_| "recorder poisoned".to_string())?
         .start(name)?;
-    let operator = state
-        .auth_session
-        .lock()
-        .map(|session| session.username.clone())
-        .unwrap_or_default();
+    let operator = state.session().username;
     info.operator = Some(operator.clone());
     state
         .sqlite
@@ -4076,28 +4217,8 @@ fn update_session_metadata(
     Ok(())
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-fn export_session_csv(
-    state: State<'_, AppState>,
-    id: String,
-    output_path: Option<String>,
-) -> Result<String, String> {
-    guard_permission(&state, auth::Permission::ManageSessions)?;
-    let rec = state
-        .recorder
-        .lock()
-        .map_err(|_| "recorder poisoned".to_string())?;
-    let csv_path = rec
-        .session_csv_path(&id)
-        .ok_or_else(|| "会话 CSV 文件不存在".to_string())?;
-    match output_path {
-        Some(dest) => {
-            std::fs::copy(&csv_path, &dest).map_err(|e| e.to_string())?;
-            Ok(dest)
-        }
-        None => Ok(csv_path.to_string_lossy().to_string()),
-    }
-}
+
+
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn read_session_frames(
@@ -4134,119 +4255,6 @@ fn read_session_frames(
         frames = frames.into_iter().step_by(step).collect();
     }
     Ok(frames)
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
-fn export_chart_csv(
-    state: State<'_, AppState>,
-    session_id: Option<String>,
-    channel_names: Vec<String>,
-    max_count: Option<u32>,
-) -> Result<String, String> {
-    guard_permission(&state, auth::Permission::ManageSessions)?;
-    let max = max_count.unwrap_or(5_000).clamp(10, 20_000) as usize;
-    let mut frames = if let Some(id) = session_id.clone() {
-        let sqlite_frames = state
-            .sqlite
-            .read_snapshot_json(&id, max)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|raw| serde_json::from_str::<DeviceSnapshot>(&raw).ok())
-            .collect::<Vec<_>>();
-        if sqlite_frames.is_empty() {
-            let rec = state
-                .recorder
-                .lock()
-                .map_err(|_| "recorder poisoned".to_string())?;
-            let csv_path = rec
-                .session_csv_path(&id)
-                .ok_or_else(|| "会话 CSV 文件不存在".to_string())?;
-            drop(rec);
-            session::read_session_csv(&csv_path)?
-        } else {
-            sqlite_frames
-        }
-    } else {
-        state
-            .live_ring
-            .lock()
-            .map(|ring| ring.window(max))
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .collect()
-    };
-
-    downsample_frames(&mut frames, max);
-    let chart = make_charts_from_motors(&frames);
-    let selected = if channel_names.is_empty() {
-        chart
-            .channels
-            .iter()
-            .map(|channel| channel.name.clone())
-            .collect::<Vec<_>>()
-    } else {
-        channel_names
-    };
-
-    let mut csv = String::from("received_at_ms,sequence,device_id");
-    for name in &selected {
-        csv.push(',');
-        csv.push_str(&csv_escape(name));
-    }
-    csv.push('\n');
-
-    for (index, frame) in frames.iter().enumerate() {
-        csv.push_str(&format!(
-            "{},{},{}",
-            frame.received_at_ms,
-            frame.sequence,
-            csv_escape(&frame.device_id)
-        ));
-        for name in &selected {
-            let value = chart
-                .channels
-                .iter()
-                .find(|channel| &channel.name == name)
-                .and_then(|channel| channel.points.get(index))
-                .copied()
-                .unwrap_or(0.0);
-            csv.push_str(&format!(",{value:.6}"));
-        }
-        csv.push('\n');
-    }
-
-    let base_dir = state
-        .store
-        .path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("chart-exports");
-    fs::create_dir_all(&base_dir).map_err(|error| error.to_string())?;
-    let filename = format!(
-        "chart-{}-{}.csv",
-        session_id.unwrap_or_else(|| "live".to_string()),
-        now_ms()
-    );
-    let output = base_dir.join(filename);
-    fs::write(&output, csv).map_err(|error| error.to_string())?;
-    Ok(output.to_string_lossy().to_string())
-}
-
-fn downsample_frames(frames: &mut Vec<DeviceSnapshot>, max: usize) {
-    if frames.len() <= max || max == 0 {
-        return;
-    }
-    let step = (frames.len() as f64 / max as f64).ceil() as usize;
-    *frames = frames.iter().step_by(step.max(1)).cloned().collect();
-}
-
-fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
 }
 
 // ── Connection profile commands ──
@@ -4652,9 +4660,7 @@ pub fn run() {
             delete_connection_profile,
             device_runtime_status,
             disconnect_device,
-            export_diagnostics_bundle,
-            export_chart_csv,
-            export_session_csv,
+            diagnostics_bundle,
             fetch_live_latest,
             fetch_live_window,
             fetch_live_stats,
@@ -4663,6 +4669,8 @@ pub fn run() {
             list_serial_ports,
             list_sessions,
             list_users,
+            list_clients,
+            list_my_sessions,
             login,
             import_model,
             lookup_tip_pose_shape,
@@ -4704,6 +4712,17 @@ pub fn run() {
             preview_legacy_migration,
             run_legacy_migration,
             set_user_disabled,
+            set_user_device_limit,
+            set_user_role,
+            delete_user,
+            set_registration_mode,
+            approve_user,
+            pending_user_count,
+            register,
+            registration_mode,
+            revoke_client,
+            revoke_my_session,
+            revoke_user_sessions,
             start_recording,
             stop_recording,
             start_cycle_life,
@@ -4852,6 +4871,56 @@ fn dispatch(
             let disabled: bool = arg(args, "disabled")?;
             set_user_disabled(st, username, disabled).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
+        "list_clients" => {
+            list_clients(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "revoke_client" => {
+            let session_id: String = arg(args, "session_id")?;
+            revoke_client(st, session_id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "revoke_user_sessions" => {
+            let username: String = arg(args, "username")?;
+            revoke_user_sessions(st, username).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "set_user_device_limit" => {
+            let username: String = arg(args, "username")?;
+            let max_devices: u32 = arg(args, "max_devices")?;
+            set_user_device_limit(st, username, max_devices).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "set_user_role" => {
+            let username: String = arg(args, "username")?;
+            let role: auth::Role = arg(args, "role")?;
+            set_user_role(st, username, role).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "delete_user" => {
+            let username: String = arg(args, "username")?;
+            delete_user(st, username).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "registration_mode" => {
+            serde_json::to_value(registration_mode(st)).map_err(|e| e.to_string())
+        }
+        "list_my_sessions" => {
+            list_my_sessions(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "revoke_my_session" => {
+            let session_id: String = arg(args, "session_id")?;
+            revoke_my_session(st, session_id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "register" => {
+            let request: auth::RegisterRequest = arg(args, "request")?;
+            register(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "approve_user" => {
+            let username: String = arg(args, "username")?;
+            approve_user(st, username).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "pending_user_count" => {
+            pending_user_count(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "set_registration_mode" => {
+            let mode: auth::RegistrationMode = arg(args, "mode")?;
+            set_registration_mode(st, mode).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
         "bootstrap_state" => {
             serde_json::to_value(bootstrap_state(st)).map_err(|e| e.to_string())
         }
@@ -4869,8 +4938,8 @@ fn dispatch(
             let settings: SettingsState = arg(args, "settings")?;
             update_settings(st, settings).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
-        "export_diagnostics_bundle" => {
-            export_diagnostics_bundle(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        "diagnostics_bundle" => {
+            diagnostics_bundle(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "preview_legacy_migration" => {
             let source_dir: String = arg(args, "source_dir")?;
@@ -5056,21 +5125,10 @@ fn dispatch(
             let meta: session::SessionMetadata = arg(args, "meta")?;
             update_session_metadata(st, id, meta).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
-        "export_session_csv" => {
-            let id: String = arg(args, "id")?;
-            let output_path: Option<String> = arg_opt(args, "output_path")?;
-            export_session_csv(st, id, output_path).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
-        }
         "read_session_frames" => {
             let id: String = arg(args, "id")?;
             let max_count: Option<u32> = arg_opt(args, "max_count")?;
             read_session_frames(st, id, max_count).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
-        }
-        "export_chart_csv" => {
-            let session_id: Option<String> = arg_opt(args, "session_id")?;
-            let channel_names: Vec<String> = arg(args, "channel_names")?;
-            let max_count: Option<u32> = arg_opt(args, "max_count")?;
-            export_chart_csv(st, session_id, channel_names, max_count).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "list_connection_profiles" => {
             serde_json::to_value(list_connection_profiles(st)).map_err(|e| e.to_string())
@@ -5220,13 +5278,31 @@ fn handle_rpc(stream: &mut std::net::TcpStream, state: &Arc<AppState>) {
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("");
     let mut content_length = 0usize;
+    let mut token: Option<String> = None;
+    let mut client_ip = String::new();
+    let mut user_agent = String::new();
     for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let value = v.trim();
+        if k.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().unwrap_or(0);
+        } else if k.eq_ignore_ascii_case("x-softui-token") {
+            if !value.is_empty() {
+                token = Some(value.to_string());
             }
+        } else if k.eq_ignore_ascii_case("x-softui-client-ip") {
+            // 真实客户端 IP 由 Node 网关从 CF-Connecting-IP 透传进来：
+            // Rust 只看到 127.0.0.1，拿不到公网来源。
+            client_ip = value.to_string();
+        } else if k.eq_ignore_ascii_case("user-agent") {
+            user_agent = value.to_string();
         }
     }
+    // 把「这次请求属于哪台设备」放进线程局部上下文：命令层不必改签名
+    // 就能解析出本设备自己的会话（见 `AppState::session`）。
+    request_ctx::set(token, client_ip, user_agent);
 
     if method == "GET" && path == "/health" {
         return write_json(

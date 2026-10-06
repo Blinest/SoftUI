@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import type { SerialPortDescriptor, ConnectionProfile, ConnectDeviceRequest } from "../softuiTypes";
+import { PERMISSION_REASON } from "../state/permissions";
 import { Wifi, X, RefreshCw, Trash2, CheckCircle2 } from "lucide-react";
 
 interface ConnectDialogProps {
@@ -9,6 +10,8 @@ interface ConnectDialogProps {
   onConnect: (request: ConnectDeviceRequest) => Promise<void>;
   onSaveProfile: (profile: ConnectionProfile) => Promise<void>;
   onDeleteProfile: (id: string) => Promise<void>;
+  /** 保存 / 删除连接配置需要 manageSettings（维护员及以上）。 */
+  canSaveProfiles: boolean;
   onRefreshPorts: () => void;
   onClose: () => void;
 }
@@ -28,6 +31,7 @@ export default function ConnectDialog({
   onConnect,
   onSaveProfile,
   onDeleteProfile,
+  canSaveProfiles,
   onRefreshPorts,
   onClose,
 }: ConnectDialogProps) {
@@ -251,6 +255,8 @@ export default function ConnectDialog({
               <input
                 type="checkbox"
                 checked={saveAsProfile}
+                disabled={!canSaveProfiles}
+                title={canSaveProfiles ? undefined : PERMISSION_REASON.manageSettings}
                 onChange={(e) => setSaveAsProfile(e.target.checked)}
               />
               <span>保存为配置</span>
@@ -294,8 +300,9 @@ export default function ConnectDialog({
                     <button
                       type="button"
                       className="ghost-btn-sm danger"
+                      disabled={!canSaveProfiles}
                       onClick={() => onDeleteProfile(p.id)}
-                      title="删除配置"
+                      title={canSaveProfiles ? "删除配置" : PERMISSION_REASON.manageSettings}
                     >
                       <Trash2 size={12} />
                     </button>

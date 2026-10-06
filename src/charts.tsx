@@ -5,6 +5,8 @@ import "uplot/dist/uPlot.min.css";
 import { ChartLayout } from "./layouts/ChartLayout";
 import { ChannelSidebar } from "./components/layout/ResponsiveRail";
 import { ChartToolbar } from "./components/ChartToolbar";
+import { hasPermission } from "./state/permissions";
+import { chartsToCsv, downloadText, exportStamp } from "./utils/download";
 import { curvatureDistributionFromSnapshot, summarizeBackbone, buildBackboneFromCurvatureDistribution } from "./dynamics/svcModel";
 import type { ChartSection, DeviceSnapshot, RuntimeSnapshot, SessionInfo } from "./softuiTypes";
 import "./styles/charts.css";
@@ -260,7 +262,10 @@ function ChartPanel({ config, charts, paused, timeOrigin, hidden, onToggleChanne
   );
 }
 
-export default function ChartsPage({ snapshot: _snapshot }: { snapshot: RuntimeSnapshot }) {
+export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) {
+  /* 历史会话帧与导出都属会话管理（维护员及以上）。无权限时只保留实时曲线：
+   * 入口不出现，免得点了才报错。 */
+  const canManageSessions = hasPermission(snapshot, "manageSessions");
   const [paused, setPaused] = useState(false);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("live");
@@ -330,14 +335,12 @@ export default function ChartsPage({ snapshot: _snapshot }: { snapshot: RuntimeS
     if (Number.isFinite(first)) setTimeOrigin(first);
   }, [activeCharts.timestamps, timeOrigin]);
 
-  const exportAllChannels = async () => {
+  /** 曲线导出同样在前端生成：服务端不再写文件。 */
+  const exportAllChannels = () => {
     try {
-      const path = await invoke<string>("export_chart_csv", {
-        sessionId: selectedSessionId === "live" ? null : selectedSessionId,
-        channelNames: activeCharts.channels.map((channel) => channel.name),
-        maxCount: 1200,
-      });
-      setExportPath(path);
+      const suffix = selectedSessionId === "live" ? "实时" : selectedSessionId;
+      downloadText(`曲线-${suffix}-${exportStamp()}.csv`, chartsToCsv(activeCharts));
+      setExportPath(`已导出 ${activeCharts.timestamps.length} 行`);
       setChartError("");
     } catch (error) {
       setChartError(error instanceof Error ? error.message : String(error));
@@ -375,7 +378,8 @@ export default function ChartsPage({ snapshot: _snapshot }: { snapshot: RuntimeS
       }
       toolbar={
         <ChartToolbar
-          sessions={sessions}
+          sessions={canManageSessions ? sessions : []}
+          canManageSessions={canManageSessions}
           selectedSessionId={selectedSessionId}
           paused={paused}
           playbackMode={playbackMode}
