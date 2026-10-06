@@ -482,20 +482,6 @@ export function SettingsPage({
               ))}
             </div>
 
-            <div className="settings-subheader">
-              <h3>导入思源笔记</h3>
-              <span>
-                思源在你的电脑上，而这个页面跑在服务器上：浏览器无法调用本地思源 CLI；
-                直连思源 API 也会被 CORS 与私有网络访问策略挡住（思源默认不返回跨域头，
-                而 token 头又会触发预检）。所以这里不做直连，避免做出一个点了必然失败的功能。
-              </span>
-            </div>
-            <div className="settings-result">
-              可行路径：① 用上面的「导出」拿到文件，再在思源里导入 Markdown / 附件；
-              ② 需要自动化时，在本地跑一个转发小程序（由它调用思源 CLI 或 API），
-              把导出目标指向它 —— 要这条我可以按这个方向实现。
-            </div>
-
             {exportMessage ? <div className="settings-result">{exportMessage}</div> : null}
           </section>
         );
