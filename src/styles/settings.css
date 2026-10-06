@@ -300,3 +300,23 @@
 .settings-user-limit input {
   width: 64px;
 }
+
+/* ── 数据导出 ──────────────────────────────────────────────────────── */
+.settings-export-target {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.settings-export-target select {
+  height: var(--control-height, 30px);
+  padding: 0 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+}

@@ -1600,6 +1600,78 @@ fn import_model(bytes: Vec<u8>, name: Option<String>) -> Result<ModelStatus, Str
     Ok(model_status_of())
 }
 
+/* ── 数据导出：模型包 ─────────────────────────────────────────────────
+ * 模型包是二进制（`.tdcrmodel`，431 KB）。若直接把 `Vec<u8>` 交给 serde，
+ * 会被编成几十万个数字的 JSON 数组（体积膨胀 3 倍以上），所以这里传 base64。
+ * ──────────────────────────────────────────────────────────────────── */
+
+/// 标准 base64 编码（RFC 4648）。项目不引第三方依赖，所以手写一份。
+/// 这里只需要**编码** —— 导出没有回传路径，不需要解码。
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// 当前生效模型包的原始字节：导入过就取落盘那份，否则取编译进的内置包。
+fn current_model_bundle_bytes() -> Vec<u8> {
+    if imported_tables().is_some() {
+        if let Some(path) = persisted_model_path() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if !bytes.is_empty() {
+                    return bytes;
+                }
+            }
+        }
+    }
+    model::DEFAULT_BUNDLE.to_vec()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelBundleExport {
+    file_name: String,
+    /// `builtin` 或 `imported`
+    source: String,
+    byte_len: usize,
+    data_base64: String,
+}
+
+/// 导出当前模型包（供保存到本地，或交给别的系统）。
+/// 权限与诊断包同一档：包里是完整的标定查表数据，不是随便能拿的。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn export_model_bundle(state: State<'_, AppState>) -> Result<ModelBundleExport, String> {
+    guard_permission(&state, auth::Permission::ViewDiagnostics)?;
+    let bytes = current_model_bundle_bytes();
+    let status = model_status_of();
+    Ok(ModelBundleExport {
+        file_name: format!("softui-model-{}.{}", status.source, model::EXTENSION),
+        source: status.source,
+        byte_len: bytes.len(),
+        data_base64: base64_encode(&bytes),
+    })
+}
+
+
 /// 恢复内置默认模型（并删除已持久化的模型文件）。
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn reset_model() -> Result<ModelStatus, String> {
@@ -4229,6 +4301,28 @@ fn delete_connection_profile(state: State<'_, AppState>, id: String) -> Result<(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        // RFC 4648 §10 的标准向量：手写编码器必须逐字节对上
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // 边界：全 0 / 全 0xff，以及长度对 3 取余的三种情况
+        assert_eq!(base64_encode(&[0, 0, 0]), "AAAA");
+        assert_eq!(base64_encode(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(base64_encode(&[0xff]), "/w==");
+        assert_eq!(base64_encode(&[0xff, 0xff]), "//8=");
+        // 长度必须是 4 的倍数 —— 不少客户端按这个校验
+        for len in 0..64usize {
+            assert_eq!(base64_encode(&vec![0xA5u8; len]).len() % 4, 0);
+        }
+    }
+
     use super::*;
 
     fn trunc2(value: f64) -> f64 {
@@ -4624,6 +4718,7 @@ pub fn run() {
             lookup_tip_pose_shape,
             model_status,
             reset_model,
+            export_model_bundle,
             logout,
             calibrate_sensor,
             configure_cycle_life,
@@ -4780,6 +4875,9 @@ fn dispatch(
             let bytes: Vec<u8> = arg(args, "bytes")?;
             let name: Option<String> = arg_opt(args, "name")?;
             import_model(bytes, name).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "export_model_bundle" => {
+            export_model_bundle(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "reset_model" => {
             reset_model().and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))

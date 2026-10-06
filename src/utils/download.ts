@@ -123,3 +123,85 @@ export function exportStamp(): string {
     `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
   );
 }
+
+/* ── 二进制内容 ───────────────────────────────────────────────────────
+ * 模型包是二进制（431 KB）。后端用 base64 传过来（直接传字节数组会被
+ * serde 编成几十万个数字，体积膨胀 3 倍），这里解回字节。
+ * ──────────────────────────────────────────────────────────────────── */
+
+/** base64 → 字节。手写而不引依赖：只需要这一个方向。 */
+export function base64ToBytes(base64: string): Uint8Array {
+  const table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const clean = base64.replace(/[^A-Za-z0-9+/]/g, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let outIndex = 0;
+  let buffer = 0;
+  let bits = 0;
+  for (const ch of clean) {
+    const value = table.indexOf(ch);
+    if (value < 0) continue;
+    buffer = (buffer << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[outIndex++] = (buffer >> bits) & 0xff;
+    }
+  }
+  return out.subarray(0, outIndex);
+}
+
+/* ── 导出目标：直接下载 / 存进指定文件夹 ──────────────────────────────
+ * 「存到文件夹」用的是 File System Access API（Chrome/Edge 桌面版 + 安全
+ * 上下文）。不支持时自动退回下载 —— 功能不能因为浏览器差异就不可用。
+ * ──────────────────────────────────────────────────────────────────── */
+
+interface DirectoryPickerWindow {
+  showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
+}
+
+export function supportsFolderSave(): boolean {
+  return typeof (window as unknown as DirectoryPickerWindow).showDirectoryPicker === "function";
+}
+
+/** 用户选中的导出文件夹。只在本页生命周期内记住，不落任何存储。 */
+let exportDirectory: FileSystemDirectoryHandle | null = null;
+
+export function currentExportFolder(): string {
+  return exportDirectory?.name ?? "";
+}
+
+/** 让用户选一次文件夹；已选过就直接复用，不反复弹窗。 */
+export async function pickExportFolder(): Promise<string> {
+  const picker = (window as unknown as DirectoryPickerWindow).showDirectoryPicker;
+  if (!picker) throw new Error("当前浏览器不支持选择文件夹，请改用「直接下载」");
+  exportDirectory = await picker.call(window);
+  return exportDirectory.name;
+}
+
+/** 统一出口：按目标把内容存下去。返回一句给人看的说明。 */
+export async function saveExport(
+  fileName: string,
+  blob: Blob,
+  target: "download" | "folder",
+): Promise<string> {
+  if (target === "folder" && exportDirectory) {
+    // 用户可能已撤销授权，这里失败就如实抛出，由调用方提示改用下载
+    const handle = await exportDirectory.getFileHandle(fileName, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return `已保存到文件夹「${exportDirectory.name}」：${fileName}`;
+  }
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  // 立刻 revoke 在部分浏览器上会打断下载，延后释放
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  return `已下载：${fileName}`;
+}
+

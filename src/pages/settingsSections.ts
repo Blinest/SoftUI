@@ -1,5 +1,6 @@
 import type { LucideIcon } from "lucide-react";
 import {
+  Download,
   Info,
   Monitor,
   PauseCircle,
@@ -10,7 +11,8 @@ export type SettingsSection =
   | "application"
   | "appearance"
   | "accounts"
-  | "diagnostics";
+  | "diagnostics"
+  | "export";
 
 export interface SettingsSectionMeta {
   id: SettingsSection;
@@ -24,4 +26,5 @@ export const settingsSections: SettingsSectionMeta[] = [
   { id: "appearance", label: "外观与布局", icon: Monitor },
   { id: "accounts", label: "我的账号", icon: Users },
   { id: "diagnostics", label: "日志与诊断", icon: PauseCircle },
+  { id: "export", label: "数据导出", icon: Download },
 ];

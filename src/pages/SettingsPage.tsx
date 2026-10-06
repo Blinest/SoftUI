@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { CheckCircle2, Cpu, RefreshCw, ShieldX, SunMedium, Users } from "lucide-react";
+import { CheckCircle2, Cpu, FolderOpen, RefreshCw, ShieldX, SunMedium, Users } from "lucide-react";
 
 import Badge from "../components/Badge";
 import { SettingsNavigation } from "../components/SettingsNavigation";
@@ -9,9 +9,18 @@ import { settingsSections, type SettingsSection } from "./settingsSections";
 import { hasPermission, CAPABILITY_MATRIX, PERMISSION_REASON, ROLE_DUTY } from "../state/permissions";
 import type {
   ClientSessionView,
+  DeviceSnapshot,
   RecorderStatus,
   RuntimeSnapshot,
 } from "../softuiTypes";
+import {
+  base64ToBytes,
+  exportStamp,
+  framesToCsv,
+  pickExportFolder,
+  saveExport,
+  supportsFolderSave,
+} from "../utils/download";
 import "../styles/settings.css";
 
 /** 把时间戳说成"刚刚 / N 分钟前"，后台列表里比一串 ISO 时间好读得多。 */
@@ -99,6 +108,69 @@ export function SettingsPage({
       cancelled = true;
     };
   }, [mySessions]);
+
+  /* ── 数据导出 ──
+   * 模型包 / 曲线 / 诊断包，全部在前端落地：服务端只提供**内容**，不写文件。
+   * 目标可以是"直接下载"或"存进用户指定的文件夹"（File System Access API）。 */
+  const [exportTarget, setExportTarget] = useState<"download" | "folder">("download");
+  const [exportFolder, setExportFolder] = useState("");
+  const [exportBusy, setExportBusy] = useState("");
+  const [exportMessage, setExportMessage] = useState("");
+
+  /** 选导出文件夹。用户在弹窗里取消不算错误，安静退回下载。 */
+  const chooseExportFolder = async () => {
+    try {
+      const name = await pickExportFolder();
+      setExportFolder(name);
+      setExportTarget("folder");
+      setExportMessage(`导出目标已设为文件夹「${name}」`);
+    } catch {
+      setExportFolder("");
+      setExportTarget("download");
+    }
+  };
+
+  const runExport = async (kind: "model" | "curves" | "diagnostics") => {
+    setExportBusy(kind);
+    setExportMessage("");
+    try {
+      if (kind === "model") {
+        const bundle = await invoke<{
+          fileName: string;
+          source: string;
+          byteLen: number;
+          dataBase64: string;
+        }>("export_model_bundle");
+        const blob = new Blob([base64ToBytes(bundle.dataBase64)], {
+          type: "application/octet-stream",
+        });
+        const note = await saveExport(`${exportStamp()}-${bundle.fileName}`, blob, exportTarget);
+        setExportMessage(
+          `${note}（${bundle.source === "imported" ? "已导入的模型" : "内置模型"}，` +
+            `${Math.round(bundle.byteLen / 1024)} KB）`,
+        );
+      } else if (kind === "curves") {
+        // 曲线取最近窗口的原始帧，逐帧列出来 —— 便于在 Excel / pandas 里自己算
+        const frames = await invoke<DeviceSnapshot[]>("fetch_live_window", { count: 1200 });
+        const blob = new Blob(["\uFEFF", framesToCsv(frames)], {
+          type: "text/csv;charset=utf-8",
+        });
+        setExportMessage(
+          `${await saveExport(`曲线-${exportStamp()}.csv`, blob, exportTarget)}（${frames.length} 帧）`,
+        );
+      } else {
+        const bundle = await invoke<Record<string, unknown>>("diagnostics_bundle");
+        const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+        setExportMessage(
+          await saveExport(`softui-diagnostics-${exportStamp()}.json`, blob, exportTarget),
+        );
+      }
+    } catch (error) {
+      setExportMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setExportBusy("");
+    }
+  };
 
   const runAccountAction = async (action: () => Promise<void>, successMessage: string) => {
     setAccountMessage("");
@@ -335,6 +407,98 @@ export function SettingsPage({
           </section>
         );
 
+      case "export":
+        return (
+          <section className="settings-panel">
+            <header><div><span className="panel-kicker">export</span><h2>数据导出</h2></div></header>
+
+            <div className="settings-subheader">
+              <h3>导出到</h3>
+              <span>
+                {supportsFolderSave()
+                  ? "可直接存进你指定的文件夹，也可以走浏览器下载。"
+                  : "当前浏览器不支持选择文件夹（需要 Chrome / Edge 桌面版），将以下载方式保存。"}
+              </span>
+            </div>
+            <div className="settings-actions-row">
+              <label className="settings-export-target">
+                <span>方式</span>
+                <select
+                  value={exportTarget}
+                  onChange={(event) => setExportTarget(event.target.value as "download" | "folder")}
+                >
+                  <option value="download">直接下载</option>
+                  <option value="folder" disabled={!supportsFolderSave() || !exportFolder}>
+                    保存到文件夹{exportFolder ? `「${exportFolder}」` : "（需先选文件夹）"}
+                  </option>
+                </select>
+              </label>
+              <button
+                type="button"
+                className="ghost-btn"
+                disabled={!supportsFolderSave()}
+                title={supportsFolderSave() ? undefined : "当前浏览器不支持选择文件夹"}
+                onClick={() => void chooseExportFolder()}
+              >
+                <FolderOpen size={16} />
+                <span>{exportFolder ? "更换文件夹" : "选择文件夹"}</span>
+              </button>
+            </div>
+
+            <div className="settings-subheader">
+              <h3>导出内容</h3>
+              <span>三类内容都在浏览器里生成，服务端只提供数据、不落任何文件。</span>
+            </div>
+            <div className="settings-stack">
+              {([
+                {
+                  key: "model",
+                  label: "模型包",
+                  hint: ".tdcrmodel 二进制，含全部 Cosserat 查表数据（当前生效的那个）",
+                },
+                {
+                  key: "curves",
+                  label: "曲线",
+                  hint: "最近实时窗口的逐帧 CSV：电机位置/速度、传感器三轴、两段弯曲角",
+                },
+                {
+                  key: "diagnostics",
+                  label: "诊断包",
+                  hint: "appInfo / 日志 / 设置 / 诊断计数 / 完整快照（JSON）",
+                },
+              ] as const).map((item) => (
+                <div className="settings-row" key={item.key}>
+                  <span title={item.hint}>{item.label}</span>
+                  <button
+                    type="button"
+                    className="ghost-btn"
+                    disabled={exportBusy !== ""}
+                    title={item.hint}
+                    onClick={() => void runExport(item.key)}
+                  >
+                    {exportBusy === item.key ? "导出中…" : "导出"}
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            <div className="settings-subheader">
+              <h3>导入思源笔记</h3>
+              <span>
+                思源在你的电脑上，而这个页面跑在服务器上：浏览器无法调用本地思源 CLI；
+                直连思源 API 也会被 CORS 与私有网络访问策略挡住（思源默认不返回跨域头，
+                而 token 头又会触发预检）。所以这里不做直连，避免做出一个点了必然失败的功能。
+              </span>
+            </div>
+            <div className="settings-result">
+              可行路径：① 用上面的「导出」拿到文件，再在思源里导入 Markdown / 附件；
+              ② 需要自动化时，在本地跑一个转发小程序（由它调用思源 CLI 或 API），
+              把导出目标指向它 —— 要这条我可以按这个方向实现。
+            </div>
+
+            {exportMessage ? <div className="settings-result">{exportMessage}</div> : null}
+          </section>
+        );
     }
   };
 
