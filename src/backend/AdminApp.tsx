@@ -1,10 +1,22 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  approveUiStore,
+  approveUiStoreEntry,
+  listPendingUiStore,
+  loadUiStore,
+  rejectUiStore,
+  type PendingUiChange,
+} from "../robot/uiStore";
+import { createPortal } from "react-dom";
+import { CardGrid } from "../components/cards/CardGrid";
+import { useCardLayout } from "../state/layoutStore";
+import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Fingerprint,
+  LayoutDashboard,
   LogOut,
   MonitorSmartphone,
   RefreshCw,
@@ -12,8 +24,9 @@ import {
   ShieldCheck,
   ShieldX,
   Trash2,
-  UserCheck,
   UserPlus,
+  Ban,
+  Power,
 } from "lucide-react";
 
 import type {
@@ -68,13 +81,36 @@ export default function AdminApp() {
 
   const [clients, setClients] = useState<ClientSessionView[]>([]);
   const [users, setUsers] = useState<UserAccount[]>([]);
+  /** 后台卡片布局（**每个管理员各自一份** ✓ —— 用用户名做 key ✓）。 */
+  const adminLayout = useCardLayout(session?.username ?? "", "admin");
   const [pendingCount, setPendingCount] = useState(0);
+  /** 动作库 / 策略编排的待审批改动 ✓（admin 批准后才生效 ✓）*/
+  const [pendingChanges, setPendingChanges] = useState<PendingUiChange[]>([]);
+  /** 已生效的数据条数 ✓（概览统计用 ✓）*/
+  const [sharedCounts, setSharedCounts] = useState({ actions: 0, policies: 0 });
   const [regMode, setRegMode] = useState<RegistrationMode>("approval");
   const [limitDrafts, setLimitDrafts] = useState<Record<string, string>>({});
   /** 角色下拉草稿（用户名 → 角色）。 */
   const [roleDrafts, setRoleDrafts] = useState<Record<string, Role>>({});
   /** 等待二次确认删除的用户名：删除不可逆，不做确认太危险。 */
   const [confirmDelete, setConfirmDelete] = useState("");
+  /** 重置密码弹窗（null = 关闭）。比 window.prompt 好用：有确认框、样式统一 ✓ */
+  const [resetModal, setResetModal] = useState<{ username: string; password: string; confirm: string } | null>(null);
+  /** 正在查看哪个账号的待审批 ✓（弹窗 ✓）*/
+  const [approvalModalUser, setApprovalModalUser] = useState<string | null>(null);
+
+  /** 点「操作」以外的地方自动收起该下拉 ✓（原生 details 不会自己关 ✗） */
+  useEffect(() => {
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest(".admin-row-menu")) return;
+      document.querySelectorAll<HTMLDetailsElement>(".admin-row-menu[open]").forEach((el) => {
+        el.open = false;
+      });
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, []);
   /** 已展开设备明细的访问来源（IP）。默认全部收起。 */
   const [expandedIps, setExpandedIps] = useState<Record<string, boolean>>({});
   /** IP → 属地文案（由网关代查并缓存）。查不到就是空串，界面显示"—"。 */
@@ -86,8 +122,6 @@ export default function AdminApp() {
     role: "operator" as Role,
     maxDevices: "0",
   });
-  const [resetTarget, setResetTarget] = useState("");
-  const [resetPassword, setResetPassword] = useState("");
 
   const canManage =
     !!session?.authenticated && session.permissions.includes("manageUsers");
@@ -109,16 +143,24 @@ export default function AdminApp() {
   const refresh = useCallback(async () => {
     if (!canManage) return;
     try {
-      const [clientList, userList, pending, mode] = await Promise.all([
+      const [clientList, userList, pending, mode, changes, actions, schemes] = await Promise.all([
         invoke<ClientSessionView[]>("list_clients"),
         invoke<UserAccount[]>("list_users"),
         invoke<number>("pending_user_count"),
         invoke<RegistrationMode>("registration_mode"),
+        listPendingUiStore(),
+        loadUiStore<unknown[]>("motion-actions"),
+        loadUiStore<{ schemes?: unknown[] }>("policy-schemes"),
       ]);
       setClients(clientList);
       setUsers(userList);
       setPendingCount(pending);
       setRegMode(mode);
+      setPendingChanges(changes);
+      setSharedCounts({
+        actions: Array.isArray(actions) ? actions.length : 0,
+        policies: Array.isArray(schemes?.schemes) ? (schemes!.schemes as unknown[]).length : 0,
+      });
       setLimitDrafts((prev) => {
         const next: Record<string, string> = {};
         for (const user of userList) {
@@ -323,495 +365,686 @@ export default function AdminApp() {
         </div>
       </header>
 
-      <div className="admin-body">
-        <div className="admin-stats">
-          <div className="admin-stat">
-            <span>访问来源</span>
-            <strong>{accessGroups.length} 个</strong>
-          </div>
-          <div className="admin-stat">
-            <span>账号总数</span>
-            <strong>{users.length}</strong>
-          </div>
-          <div className={`admin-stat${pendingCount > 0 ? " attention" : ""}`}>
-            <span>待审批</span>
-            <strong>{pendingCount}</strong>
-          </div>
-          <div className="admin-stat">
-            <span>注册策略</span>
-            <strong>{REGISTRATION_LABELS[regMode]}</strong>
-          </div>
-        </div>
-
-        {notice ? <div className="admin-alert">{notice}</div> : null}
-
-        {/* ── 待审批 ── */}
-        {pendingUsers.length > 0 ? (
-          <section className="admin-panel">
-            <div className="admin-panel-head">
-              <h2>
-                <UserCheck size={16} /> 待审批注册
-              </h2>
-              <span>{pendingUsers.length} 个账号等待处理，通过后才能登录。</span>
-            </div>
-            <div className="admin-rows">
-              {pendingUsers.map((user) => (
-                <div className="admin-row" key={user.username}>
-                  <div className="admin-row-main">
-                    <strong>{user.username}</strong>
-                    <span>申请角色 operator · 设备上限 {user.maxDevices || "不限"}</span>
-                  </div>
-                  <button
-                    type="button"
-                    className="admin-btn ok"
-                    onClick={() =>
-                      void runAction(async () => {
-                        await invoke("approve_user", { username: user.username });
-                        await refresh();
-                      }, `已通过：${user.username}`)
-                    }
-                  >
-                    <CheckCircle2 size={15} />
-                    <span>通过</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="admin-btn danger"
-                    onClick={() =>
-                      void runAction(async () => {
-                        await invoke("set_user_disabled", {
-                          username: user.username,
-                          disabled: true,
-                        });
-                        await refresh();
-                      }, `已拒绝并停用：${user.username}`)
-                    }
-                  >
-                    <ShieldX size={15} />
-                    <span>拒绝</span>
-                  </button>
-                </div>
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        {/* ── 设备访问 ── */}
-        <section className="admin-panel">
-          <div className="admin-panel-head">
-            <h2>
-              <MonitorSmartphone size={16} /> 设备访问
-            </h2>
-            <span>按访问来源 IP 汇总。展开可看该来源下的每台设备，并只踢掉其中某一台。</span>
-          </div>
-          {accessGroups.length === 0 ? (
-            <div className="admin-empty">暂无已登录的设备。</div>
-          ) : (
-            <div className="admin-rows">
-              {accessGroups.map((group) => {
-                const expanded = !!expandedIps[group.ip];
-                return (
-                  <div className="admin-group" key={group.ip}>
-                    <div className="admin-row">
-                      <button
-                        type="button"
-                        className="admin-expand"
-                        aria-expanded={expanded}
-                        title={expanded ? "收起设备明细" : "展开设备明细"}
-                        onClick={() =>
-                          setExpandedIps((prev) => ({ ...prev, [group.ip]: !prev[group.ip] }))
-                        }
-                      >
-                        {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-                        <span>{group.devices.length} 台设备</span>
-                      </button>
-                      <div className="admin-row-main">
-                        <strong>
-                          {group.ip}
-                          <span className="admin-tag">{geoByIp[group.ip] || "属地未知"}</span>
-                        </strong>
-                      </div>
-                      <span className="admin-cell">
-                        最新访问 <strong>{formatRelative(group.lastSeenMs)}</strong>
-                      </span>
-                      <span className="admin-cell">
-                        访问 <strong>{group.count}</strong> 次
-                      </span>
-                      <button
-                        type="button"
-                        className="admin-btn danger"
-                        title={`踢掉该来源下的全部 ${group.count} 条会话（含 ${group.devices.length} 台设备）`}
-                        onClick={() =>
-                          void runAction(async () => {
-                            // 同一 IP 下可能有多条会话，逐条撤销
-                            for (const session of group.sessions) {
-                              await invoke("revoke_client", { sessionId: session.sessionId });
-                            }
-                            await refresh();
-                          }, `已踢下线：${group.ip}（${group.count} 条会话）`)
-                        }
-                      >
-                        <ShieldX size={15} />
-                        <span>全部踢下线</span>
-                      </button>
-                    </div>
-
-                    {expanded ? (
-                      <div className="admin-device-list">
-                        {group.devices.map((device) => (
-                          <div className="admin-device-row" key={device.key}>
+      {/* ⚠ 必须给 CardGrid 一个**有界高度**的 viewport 容器 ✗：
+          否则它把父元素（admin-body = 整页）当可用区，行高会被撑到 400px 上限 ✗。
+          前台用的是 <main className="layout-fill-region" data-card-grid-viewport> ✓。 */}
+      <div className="admin-body" data-card-grid-viewport>
+        {/* 概览：一张卡里放 4 个统计数字 ✓ —— 现在它是**可拖动/缩放的卡片** ✓ */}
+        {/* 固定高度 200px ✓ —— CardGrid 量的是这个容器 ✓，不再受整页高度影响 ✗ */}
+        <div data-card-grid-viewport style={{ minHeight: 200 }}>
+        <CardGrid
+          layout={adminLayout.layout}
+          layoutKey="admin"
+          ariaLabel="后台卡片布局"
+          headerForCard={(cardId) => {
+            if (cardId === "deviceAccess") {
+              return { title: "设备访问", icon: <MonitorSmartphone aria-hidden="true" size={17} /> };
+            }
+            if (cardId === "users") {
+              return { title: "账号管理", icon: <ShieldCheck aria-hidden="true" size={17} /> };
+            }
+            if (cardId === "account") {
+              return { title: "新建账号", icon: <UserPlus aria-hidden="true" size={17} /> };
+            }
+            return { title: "概览", icon: <LayoutDashboard aria-hidden="true" size={17} /> };
+          }}
+          bodyClassForCard={() => "admin-card-body"}
+          onLayoutChange={adminLayout.commit}
+          maxRowHeight={200}
+          draggableForCard={() => true}
+          childrenForCard={(cardId) => {
+            if (cardId === "users") {
+              return (
+                <div className="admin-card-content">
+                  {/* 待审批区标题 ✓ —— 原来的 panel-head 在外壳替换时被去掉了 ✗ */}
+                  {pendingUsers.length > 0 ? (
+                    <>
+                      <div className="admin-card-section-title">待审批注册（{pendingUsers.length}）</div>
+                      <div className="admin-rows">
+                        {pendingUsers.map((user) => (
+                          <div className="admin-row" key={user.username}>
                             <div className="admin-row-main">
-                              <strong>
-                                {device.label}
-                                <span className="admin-tag">{device.username}</span>
-                                <span className="admin-tag">{device.role}</span>
-                              </strong>
-                              <span>最近活动 {formatRelative(device.lastSeenMs)}</span>
-                              <span className="admin-agent" title={device.userAgent}>
-                                {device.userAgent || "—"}
-                              </span>
+                              <strong>{user.username}</strong>
+                              <span>申请角色 operator · 设备上限 {user.maxDevices || "不限"}</span>
                             </div>
-                            <span className="admin-cell">
-                              访问 <strong>{device.count}</strong> 次
-                            </span>
+                            <button
+                              type="button"
+                              className="admin-btn ok"
+                              onClick={() =>
+                                void runAction(async () => {
+                                  await invoke("approve_user", { username: user.username });
+                                  await refresh();
+                                }, `已通过：${user.username}`)
+                              }
+                            >
+                              <CheckCircle2 size={15} />
+                              <span>通过</span>
+                            </button>
                             <button
                               type="button"
                               className="admin-btn danger"
-                              title="只踢掉这台设备，同一来源下的其它设备不受影响"
                               onClick={() =>
                                 void runAction(async () => {
-                                  // 同一台设备可能有多条会话（多个标签页），逐条撤销
-                                  for (const session of device.sessions) {
-                                    await invoke("revoke_client", { sessionId: session.sessionId });
-                                  }
+                                  await invoke("set_user_disabled", {
+                                    username: user.username,
+                                    disabled: true,
+                                  });
                                   await refresh();
-                                }, `已踢下线：${device.label}（${device.count} 条会话）`)
+                                }, `已拒绝并停用：${user.username}`)
                               }
                             >
                               <ShieldX size={15} />
-                              <span>踢下线</span>
+                              <span>拒绝</span>
                             </button>
                           </div>
                         ))}
                       </div>
+                    </>
                     ) : null}
+
+                  <div className="admin-rows">
+                    {users.map((user) => (
+                      <div className="admin-row" key={user.username}>
+                        <div className="admin-row-main">
+                          <strong>
+                            {user.username}
+                            <span className="admin-tag">{user.role}</span>
+                            {user.pending ? <span className="admin-tag warn">待审批</span> : null}
+                            {user.mustChangePassword ? (
+                              <span className="admin-tag warn">需改密</span>
+                            ) : null}
+                          </strong>
+                          <span>{user.disabled ? "已停用" : "正常"}</span>
+                        </div>
+                        <label className="admin-limit">
+                          <span>角色</span>
+                          <select
+                            value={roleDrafts[user.username] ?? user.role}
+                            onChange={(event) =>
+                              setRoleDrafts((prev) => ({ ...prev, [user.username]: event.target.value as Role }))
+                            }
+                          >
+                            <option value="operator">operator</option>
+                            <option value="maintainer">maintainer</option>
+                            <option value="admin">admin</option>
+                          </select>
+                        </label>
+                        <label className="admin-limit">
+                          <span>设备上限</span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={99}
+                            value={limitDrafts[user.username] ?? String(user.maxDevices ?? 0)}
+                            onChange={(event) =>
+                              setLimitDrafts((prev) => ({ ...prev, [user.username]: event.target.value }))
+                            }
+                          />
+                        </label>
+                      {/* 待审批 ✓ —— 点了**弹窗** ✓（浮层在卡片里会被裁 ✗）*/}
+                      {(() => {
+                        const mine = pendingChanges.filter(
+                          (change) => change.submittedBy === user.username,
+                        );
+                        if (mine.length === 0) return null;
+                        return (
+                          <button
+                            type="button"
+                            className="admin-approvals-trigger"
+                            onClick={() => setApprovalModalUser(user.username)}
+                            title="查看并审批这个账号的改动"
+                          >
+                            待审批 <em>{mine.length}</em>
+                          </button>
+                        );
+                      })()}
+                        <details className="admin-row-menu">
+                          <summary>操作</summary>
+                          <button
+                            type="button"
+                            className="admin-btn"
+                            disabled={
+                              (roleDrafts[user.username] ?? user.role) === user.role &&
+                              (limitDrafts[user.username] ?? String(user.maxDevices ?? 0)) ===
+                                String(user.maxDevices ?? 0)
+                            }
+                            onClick={() =>
+                              void runAction(async () => {
+                                // 一次提交**角色 + 设备上限** ✓（原来是两个按钮，容易只点一个 ✗）
+                                const nextRole = roleDrafts[user.username] ?? user.role;
+                                const parsed = Number.parseInt(limitDrafts[user.username] ?? "0", 10);
+                                await invoke("set_user_role", { username: user.username, role: nextRole });
+                                await invoke("set_user_device_limit", {
+                                  username: user.username,
+                                  maxDevices: Number.isFinite(parsed) && parsed > 0 ? parsed : 0,
+                                });
+                                await refresh();
+                              }, `${user.username} 的角色与设备上限已更新`)
+                            }
+                          >
+                            <Save size={15} />
+                            <span>保存</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="admin-btn"
+                            onClick={() => setResetModal({ username: user.username, password: "", confirm: "" })}
+                          >
+                            <Fingerprint size={15} />
+                            <span>重置密码</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="admin-btn"
+                            onClick={() =>
+                              void runAction(async () => {
+                                await invoke("revoke_user_sessions", { username: user.username });
+                                await refresh();
+                              }, `已踢下线：${user.username} 的全部设备`)
+                            }
+                          >
+                            <ShieldX size={15} />
+                            <span>全部踢下线</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="admin-btn"
+                            disabled={user.username === session?.username}
+                            onClick={() =>
+                              void runAction(async () => {
+                                await invoke("set_user_disabled", {
+                                  username: user.username,
+                                  disabled: !user.disabled,
+                                });
+                                await refresh();
+                              }, user.disabled ? `${user.username} 已启用` : `${user.username} 已停用`)
+                            }
+                          >
+                            {user.disabled ? <Power size={15} /> : <Ban size={15} />}
+                            <span>{user.disabled ? "启用" : "停用"}</span>
+                          </button>
+                          {confirmDelete === user.username ? (
+                            <button
+                              type="button"
+                              className="admin-btn danger"
+                              onClick={() =>
+                                void runAction(async () => {
+                                  await invoke("delete_user", { username: user.username });
+                                  setConfirmDelete("");
+                                  await refresh();
+                                }, `已删除账号：${user.username}（其所有设备已下线）`)
+                              }
+                            >
+                              <Trash2 size={15} />
+                              <span>确认删除</span>
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              className="admin-btn"
+                              disabled={user.username === session?.username}
+                              title={user.username === session?.username ? "不能删除当前登录的账号" : undefined}
+                              onClick={() => setConfirmDelete(user.username)}
+                            >
+                              <Trash2 size={15} />
+                              <span>删除</span>
+                            </button>
+                          )}
+                        </details>
+                      </div>
+                    ))}
                   </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
 
-        {/* ── 账号 ── */}
-        <section className="admin-panel">
-          <div className="admin-panel-head">
-            <h2>
-              <ShieldCheck size={16} /> 账号
-            </h2>
-            <span>设备上限 0 = 不限；达到上限时新设备会被拒绝登录。</span>
-          </div>
-          <div className="admin-rows">
-            {users.map((user) => (
-              <div className="admin-row" key={user.username}>
-                <div className="admin-row-main">
-                  <strong>
-                    {user.username}
-                    <span className="admin-tag">{user.role}</span>
-                    {user.pending ? <span className="admin-tag warn">待审批</span> : null}
-                    {user.mustChangePassword ? (
-                      <span className="admin-tag warn">需改密</span>
-                    ) : null}
-                  </strong>
-                  <span>{user.disabled ? "已停用" : "正常"}</span>
                 </div>
-                <label className="admin-limit">
-                  <span>角色</span>
-                  <select
-                    value={roleDrafts[user.username] ?? user.role}
-                    onChange={(event) =>
-                      setRoleDrafts((prev) => ({ ...prev, [user.username]: event.target.value as Role }))
-                    }
-                  >
-                    <option value="operator">operator</option>
-                    <option value="maintainer">maintainer</option>
-                    <option value="admin">admin</option>
-                  </select>
-                </label>
-                <button
-                  type="button"
-                  className="admin-btn"
-                  disabled={(roleDrafts[user.username] ?? user.role) === user.role}
-                  onClick={() =>
-                    void runAction(async () => {
-                      const nextRole = roleDrafts[user.username] ?? user.role;
-                      await invoke("set_user_role", { username: user.username, role: nextRole });
-                      await refresh();
-                    }, `${user.username} 的角色已更新（立即生效，无需对方重新登录）`)
-                  }
-                >
-                  <Save size={15} />
-                  <span>保存角色</span>
-                </button>
-                <label className="admin-limit">
-                  <span>设备上限</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={99}
-                    value={limitDrafts[user.username] ?? String(user.maxDevices ?? 0)}
-                    onChange={(event) =>
-                      setLimitDrafts((prev) => ({
-                        ...prev,
-                        [user.username]: event.target.value,
-                      }))
-                    }
-                  />
-                </label>
-                <button
-                  type="button"
-                  className="admin-btn"
-                  onClick={() =>
-                    void runAction(async () => {
-                      const parsed = Number.parseInt(limitDrafts[user.username] ?? "0", 10);
-                      await invoke("set_user_device_limit", {
-                        username: user.username,
-                        maxDevices: Number.isFinite(parsed) && parsed > 0 ? parsed : 0,
-                      });
-                      await refresh();
-                    }, `${user.username} 的设备上限已更新`)
-                  }
-                >
-                  <Save size={15} />
-                  <span>保存</span>
-                </button>
-                <button
-                  type="button"
-                  className="admin-btn danger"
-                  onClick={() =>
-                    void runAction(async () => {
-                      await invoke("revoke_user_sessions", { username: user.username });
-                      await refresh();
-                    }, `已踢下线：${user.username} 的全部设备`)
-                  }
-                >
-                  <ShieldX size={15} />
-                  <span>全部踢下线</span>
-                </button>
-                <button
-                  type="button"
-                  className="admin-btn"
-                  disabled={user.username === session?.username}
-                  onClick={() =>
-                    void runAction(async () => {
-                      await invoke("set_user_disabled", {
-                        username: user.username,
-                        disabled: !user.disabled,
-                      });
-                      await refresh();
-                    }, user.disabled ? `${user.username} 已启用` : `${user.username} 已停用`)
-                  }
-                >
-                  <span>{user.disabled ? "启用" : "停用"}</span>
-                </button>
-                {confirmDelete === user.username ? (
-                  <button
-                    type="button"
-                    className="admin-btn danger"
-                    onClick={() =>
-                      void runAction(async () => {
-                        await invoke("delete_user", { username: user.username });
-                        setConfirmDelete("");
-                        await refresh();
-                      }, `已删除账号：${user.username}（其所有设备已下线）`)
-                    }
-                  >
-                    <Trash2 size={15} />
-                    <span>确认删除</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="admin-btn"
-                    disabled={user.username === session?.username}
-                    title={user.username === session?.username ? "不能删除当前登录的账号" : undefined}
-                    onClick={() => setConfirmDelete(user.username)}
-                  >
-                    <Trash2 size={15} />
-                    <span>删除</span>
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        </section>
+              );
+            }
+            if (cardId === "deviceAccess") {
+              return (
+                <div className="admin-card-content">
+                  {accessGroups.length === 0 ? (
+                    <div className="admin-empty">暂无已登录的设备。</div>
+                  ) : (
+                    <div className="admin-rows">
+                      {accessGroups.map((group) => {
+                        const expanded = !!expandedIps[group.ip];
+                        return (
+                          <div className="admin-group" key={group.ip}>
+                            <div className="admin-row">
+                              <button
+                                type="button"
+                                className="admin-expand"
+                                aria-expanded={expanded}
+                                title={expanded ? "收起设备明细" : "展开设备明细"}
+                                onClick={() =>
+                                  setExpandedIps((prev) => ({ ...prev, [group.ip]: !prev[group.ip] }))
+                                }
+                              >
+                                {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                                <span>{group.devices.length} 台设备</span>
+                              </button>
+                              <div className="admin-row-main">
+                                <strong>
+                                  {group.ip}
+                                  <span className="admin-tag">{geoByIp[group.ip] || "属地未知"}</span>
+                                </strong>
+                              </div>
+                              <span className="admin-cell">
+                                最新访问 <strong>{formatRelative(group.lastSeenMs)}</strong>
+                              </span>
+                              <span className="admin-cell">
+                                访问 <strong>{group.count}</strong> 次
+                              </span>
+                              <button
+                                type="button"
+                                className="admin-btn danger"
+                                title={`踢掉该来源下的全部 ${group.count} 条会话（含 ${group.devices.length} 台设备）`}
+                                onClick={() =>
+                                  void runAction(async () => {
+                                    // 同一 IP 下可能有多条会话，逐条撤销
+                                    for (const session of group.sessions) {
+                                      await invoke("revoke_client", { sessionId: session.sessionId });
+                                    }
+                                    await refresh();
+                                  }, `已踢下线：${group.ip}（${group.count} 条会话）`)
+                                }
+                              >
+                                <ShieldX size={15} />
+                                <span>全部踢下线</span>
+                              </button>
+                            </div>
 
-        {/* ── 注册策略 ── */}
-        <section className="admin-panel">
-          <div className="admin-panel-head">
-            <h2>
-              <UserPlus size={16} /> 自助注册策略
-            </h2>
-            <span>注册入口是公网匿名入口，策略直接决定谁能进这套系统。</span>
-          </div>
-          <div className="admin-mode-row">
-            {(["closed", "approval", "open"] as RegistrationMode[]).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                className={`admin-mode${regMode === mode ? " active" : ""}`}
-                onClick={() =>
-                  void runAction(async () => {
-                    await invoke("set_registration_mode", { mode });
-                    await refresh();
-                  }, `注册策略已改为：${REGISTRATION_LABELS[mode]}`)
+                            {expanded ? (
+                              <div className="admin-device-list">
+                                {group.devices.map((device) => (
+                                  <div className="admin-device-row" key={device.key}>
+                                    <div className="admin-row-main">
+                                      <strong>
+                                        {device.label}
+                                        <span className="admin-tag">{device.username}</span>
+                                        <span className="admin-tag">{device.role}</span>
+                                      </strong>
+                                      <span>最近活动 {formatRelative(device.lastSeenMs)}</span>
+                                      <span className="admin-agent" title={device.userAgent}>
+                                        {device.userAgent || "—"}
+                                      </span>
+                                    </div>
+                                    <span className="admin-cell">
+                                      访问 <strong>{device.count}</strong> 次
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="admin-btn danger"
+                                      title="只踢掉这台设备，同一来源下的其它设备不受影响"
+                                      onClick={() =>
+                                        void runAction(async () => {
+                                          // 同一台设备可能有多条会话（多个标签页），逐条撤销
+                                          for (const session of device.sessions) {
+                                            await invoke("revoke_client", { sessionId: session.sessionId });
+                                          }
+                                          await refresh();
+                                        }, `已踢下线：${device.label}（${device.count} 条会话）`)
+                                      }
+                                    >
+                                      <ShieldX size={15} />
+                                      <span>踢下线</span>
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            }
+            if (cardId === "account") {
+              return (
+                <div className="admin-card-content">
+      <div className="admin-grid-2">
+          <form
+            className="admin-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void runAction(async () => {
+                const parsed = Number.parseInt(newUser.maxDevices, 10);
+                await invoke("create_user", {
+                  request: {
+                    username: newUser.username.trim(),
+                    password: newUser.password,
+                    role: newUser.role,
+                    maxDevices: Number.isFinite(parsed) && parsed > 0 ? parsed : 0,
+                  },
+                });
+                setNewUser({ username: "", password: "", role: "operator", maxDevices: "0" });
+                await refresh();
+              }, "账号已创建（管理员建的号无需审批）");
+            }}
+          >
+            <label>
+              <span>用户名</span>
+              <input
+                value={newUser.username}
+                onChange={(event) =>
+                  setNewUser((prev) => ({ ...prev, username: event.target.value }))
+                }
+                placeholder="operator_1"
+              />
+            </label>
+            <label>
+              <span>初始密码</span>
+              <input
+                type="password"
+                value={newUser.password}
+                onChange={(event) =>
+                  setNewUser((prev) => ({ ...prev, password: event.target.value }))
+                }
+              />
+            </label>
+            <label>
+              <span>角色</span>
+              <select
+                value={newUser.role}
+                onChange={(event) =>
+                  setNewUser((prev) => ({ ...prev, role: event.target.value as Role }))
                 }
               >
-                {REGISTRATION_LABELS[mode]}
-              </button>
-            ))}
-          </div>
-          <p className="admin-hint">
-            「注册即可登录」意味着任何拿到网址的人注册后就能下发控制指令，仅在完全可信的网络里使用。
-          </p>
-        </section>
-
-        {/* ── 新建账号 / 重置密码 ── */}
-        <div className="admin-grid-2">
-          <section className="admin-panel">
-            <div className="admin-panel-head">
-              <h2>
-                <UserPlus size={16} /> 新建账号
-              </h2>
-            </div>
-            <form
-              className="admin-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void runAction(async () => {
-                  const parsed = Number.parseInt(newUser.maxDevices, 10);
-                  await invoke("create_user", {
-                    request: {
-                      username: newUser.username.trim(),
-                      password: newUser.password,
-                      role: newUser.role,
-                      maxDevices: Number.isFinite(parsed) && parsed > 0 ? parsed : 0,
-                    },
-                  });
-                  setNewUser({ username: "", password: "", role: "operator", maxDevices: "0" });
-                  await refresh();
-                }, "账号已创建（管理员建的号无需审批）");
-              }}
+                <option value="operator">operator</option>
+                <option value="maintainer">maintainer</option>
+                <option value="admin">admin</option>
+              </select>
+            </label>
+            <label>
+              <span>设备上限</span>
+              <input
+                type="number"
+                min={0}
+                max={99}
+                value={newUser.maxDevices}
+                onChange={(event) =>
+                  setNewUser((prev) => ({ ...prev, maxDevices: event.target.value }))
+                }
+              />
+            </label>
+            <button
+              type="submit"
+              className="admin-btn primary full"
+              disabled={!newUser.username.trim() || newUser.password.length < 4}
             >
-              <label>
-                <span>用户名</span>
-                <input
-                  value={newUser.username}
-                  onChange={(event) =>
-                    setNewUser((prev) => ({ ...prev, username: event.target.value }))
-                  }
-                  placeholder="operator_1"
-                />
-              </label>
-              <label>
-                <span>初始密码</span>
-                <input
-                  type="password"
-                  value={newUser.password}
-                  onChange={(event) =>
-                    setNewUser((prev) => ({ ...prev, password: event.target.value }))
-                  }
-                />
-              </label>
-              <label>
-                <span>角色</span>
-                <select
-                  value={newUser.role}
-                  onChange={(event) =>
-                    setNewUser((prev) => ({ ...prev, role: event.target.value as Role }))
-                  }
-                >
-                  <option value="operator">operator</option>
-                  <option value="maintainer">maintainer</option>
-                  <option value="admin">admin</option>
-                </select>
-              </label>
-              <label>
-                <span>设备上限</span>
-                <input
-                  type="number"
-                  min={0}
-                  max={99}
-                  value={newUser.maxDevices}
-                  onChange={(event) =>
-                    setNewUser((prev) => ({ ...prev, maxDevices: event.target.value }))
-                  }
-                />
-              </label>
-              <button
-                type="submit"
-                className="admin-btn primary full"
-                disabled={!newUser.username.trim() || newUser.password.length < 4}
-              >
-                <UserPlus size={15} />
-                <span>创建账号</span>
-              </button>
-            </form>
-          </section>
-
-          <section className="admin-panel">
-            <div className="admin-panel-head">
-              <h2>
-                <Save size={16} /> 重置密码
-              </h2>
-              <span>重置后，该账号所有设备会被踢下线。</span>
-            </div>
-            <form
-              className="admin-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void runAction(async () => {
-                  await invoke("change_password", {
-                    request: { username: resetTarget, oldPassword: null, newPassword: resetPassword },
-                  });
-                  setResetPassword("");
-                  await refresh();
-                }, `已重置：${resetTarget} 的密码`);
-              }}
-            >
-              <label>
-                <span>目标账号</span>
-                <select
-                  value={resetTarget}
-                  onChange={(event) => setResetTarget(event.target.value)}
-                >
-                  <option value="">选择账号</option>
-                  {users.map((user) => (
-                    <option value={user.username} key={user.username}>
-                      {user.username}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                <span>新密码</span>
-                <input
-                  type="password"
-                  value={resetPassword}
-                  onChange={(event) => setResetPassword(event.target.value)}
-                />
-              </label>
-              <button
-                type="submit"
-                className="admin-btn full"
-                disabled={!resetTarget || resetPassword.length < 4}
-              >
-                <Save size={15} />
-                <span>重置密码</span>
-              </button>
-            </form>
-          </section>
-        </div>
+              <UserPlus size={15} />
+              <span>创建账号</span>
+            </button>
+          </form>
       </div>
+
+                </div>
+              );
+            }
+            if (cardId !== "overview") return null;
+            return (
+              <>
+              <div className="admin-stats">
+                <div className="admin-stat">
+                  <span>访问来源</span>
+                  <strong>{accessGroups.length} 个</strong>
+                </div>
+                <div className="admin-stat">
+                  <span>账号总数</span>
+                  <strong>{users.length}</strong>
+                </div>
+                <div className={`admin-stat${pendingCount > 0 ? " attention" : ""}`}>
+                  <span>待审账号</span>
+                  <strong>{pendingCount}</strong>
+                </div>
+                <div className={`admin-stat${pendingChanges.length > 0 ? " attention" : ""}`}>
+                  <span>待审改动</span>
+                  <strong>{pendingChanges.length}</strong>
+                  <em className="admin-stat-note">
+                    动作 {pendingChanges.filter((c) => c.namespace === "motion-actions").length} ·
+                    策略 {pendingChanges.filter((c) => c.namespace === "policy-schemes").length}
+                  </em>
+                </div>
+                <div className="admin-stat">
+                  <span>已生效动作</span>
+                  <strong>{sharedCounts.actions}</strong>
+                </div>
+                <div className="admin-stat">
+                  <span>已生效方案</span>
+                  <strong>{sharedCounts.policies}</strong>
+                </div>
+                <div className="admin-stat">
+                  <span>注册策略</span>
+                  <select
+                    className="admin-stat-select"
+                    value={regMode}
+                    onChange={(event) => {
+                      const mode = event.target.value as RegistrationMode;
+                      if (mode === regMode) return;
+                      void runAction(async () => {
+                        await invoke("set_registration_mode", { mode });
+                        await refresh();
+                      }, `注册策略已改为：${REGISTRATION_LABELS[mode]}`);
+                    }}
+                  >
+                    {(["closed", "approval", "open"] as RegistrationMode[]).map((mode) => (
+                      <option key={mode} value={mode}>
+                        {REGISTRATION_LABELS[mode]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              </>
+            );
+          }}
+        />
+        </div>
+
+        {notice ? <div className="admin-alert">{notice}</div> : null}
+
+
+
+
+      </div>
+
+      {approvalModalUser ? createPortal(
+        <div className="admin-modal-backdrop" role="dialog" aria-modal="true" aria-label="待审批改动">
+          <div className="admin-modal admin-modal-wide">
+            <h2>待审批改动 · {approvalModalUser}</h2>
+            {(() => {
+              const mine = pendingChanges.filter(
+                (change) => change.submittedBy === approvalModalUser,
+              );
+              if (mine.length === 0) {
+                return <p className="admin-empty">这个账号没有待审批的改动。</p>;
+              }
+              // 把每条待审批**拆成条目** ✓ —— 一条待审批里通常打包了多个动作 ✓
+              // **只列有变化的条目** ✓ —— 已同步没动的不出现 ✗
+              const rows = mine.flatMap((change) => {
+                // 两种形状 ✓：动作库是数组 ✓，方案库是 `{ schemes: [...] }` ✓
+                const raw = change.data as
+                  | Array<{ id?: string; name?: string; points?: unknown[]; pendingDelete?: boolean }>
+                  | { schemes?: Array<{ id?: string; name?: string; timeline?: unknown[]; interrupts?: unknown[] }> }
+                  | null;
+                const items: Array<{
+                  id?: string;
+                  name?: string;
+                  points?: unknown[];
+                  pendingDelete?: boolean;
+                  timeline?: unknown[];
+                  interrupts?: unknown[];
+                }> = Array.isArray(raw) ? raw : (raw?.schemes ?? []);
+                const isScheme = !Array.isArray(raw);
+                if (items.length === 0) {
+                  // ⚠ **空改动不出一行** ✗ —— 原来会渲染一行只有 `change.summary`
+                  //   （例如"0 项"）✓，点进去看着就是**空白**✗（本 bug ✓）。
+                  return [];
+                }
+                const changed = change.changedIds ?? items.map((item) => item.id ?? "");
+                return items
+                  .filter((item) => changed.includes(item.id ?? ""))
+                  .map((item) => ({
+                    change,
+                    entryId: (item.id ?? null) as string | null,
+                    label: isScheme
+                      ? `${item.name ?? "(未命名方案)"} · ${item.timeline?.length ?? 0} 段 · ${
+                          item.interrupts?.length ?? 0
+                        } 条中断`
+                      : `${item.name ?? "(未命名)"}${item.pendingDelete ? "（删除）" : "（新增/修改）"} · ${
+                          Array.isArray(item.points) ? item.points.length : 0
+                        } 个采样点`,
+                  }));
+              });
+              return (
+                <ul className="admin-approval-modal-list">
+                  {rows.length === 0 ? (
+                    <li className="admin-approval-modal-item">
+                      <div className="admin-approval-modal-main">
+                        <strong>没有可比对的条目</strong>
+                        <span>
+                          这些审批单是**空改动**（0 项，多半是客户端把没变化的数据又提交了一次）。
+                          直接「驳回」即可，不会影响线上数据。
+                        </span>
+                      </div>
+                    </li>
+                  ) : null}
+                  {rows.map(({ change, entryId, label }) => (
+                    <li key={change.id} className="admin-approval-modal-item">
+                      <div className="admin-approval-modal-main">
+                        <strong>
+                          {change.namespace === "motion-actions" ? "动作库" : "策略编排"}
+                        </strong>
+                        <span>{label}</span>
+                        <em>
+                          {new Date(Number(change.submittedAt)).toLocaleString("zh-CN", {
+                            hour12: false,
+                          })}
+                        </em>
+                      </div>
+                      <div className="admin-approval-modal-actions">
+                        <button
+                          type="button"
+                          className="admin-primary-btn"
+                          onClick={() => {
+                            void runAction(async () => {
+                              const next = entryId
+                                ? await approveUiStoreEntry(change.id, entryId)
+                                : await approveUiStore(change.id);
+                              setPendingChanges(next);
+                              if (
+                                next.filter((item) => item.submittedBy === approvalModalUser)
+                                  .length === 0
+                              ) {
+                                setApprovalModalUser(null);
+                              }
+                              await refresh();
+                            }, "已批准，所有设备 5 秒内同步");
+                          }}
+                        >
+                          批准
+                        </button>
+                        <button
+                          type="button"
+                          className="admin-ghost-btn"
+                          onClick={() => {
+                            void runAction(async () => {
+                              const next = await rejectUiStore(change.id);
+                              setPendingChanges(next);
+                              if (
+                                next.filter((item) => item.submittedBy === approvalModalUser)
+                                  .length === 0
+                              ) {
+                                setApprovalModalUser(null);
+                              }
+                              await refresh();
+                            }, "已驳回");
+                          }}
+                        >
+                          驳回
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              );
+            })()}
+            <div className="admin-modal-actions">
+              <button
+                type="button"
+                className="admin-ghost-btn"
+                onClick={() => setApprovalModalUser(null)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+
+      {resetModal ? createPortal(
+        <div className="admin-modal-backdrop" role="dialog" aria-modal="true" aria-label="重置密码">
+          <form
+            className="admin-modal"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (resetModal.password.length < 4) return;
+              if (resetModal.password !== resetModal.confirm) return;
+              const { username, password } = resetModal;
+              setResetModal(null);
+              void runAction(async () => {
+                await invoke("change_password", {
+                  request: { username, oldPassword: null, newPassword: password },
+                });
+                await refresh();
+              }, `${username} 的密码已重置（其所有设备已下线）`);
+            }}
+          >
+            <h2>重置密码 · {resetModal.username}</h2>
+            <label>
+              <span>新密码</span>
+              <input
+                autoFocus
+                type="password"
+                value={resetModal.password}
+                onChange={(event) => setResetModal({ ...resetModal, password: event.target.value })}
+              />
+            </label>
+            <label>
+              <span>确认新密码</span>
+              <input
+                type="password"
+                value={resetModal.confirm}
+                onChange={(event) => setResetModal({ ...resetModal, confirm: event.target.value })}
+              />
+            </label>
+            <p className="admin-hint">
+              {resetModal.password.length > 0 && resetModal.password.length < 4
+                ? "密码至少 4 位"
+                : resetModal.confirm && resetModal.password !== resetModal.confirm
+                  ? "两次输入不一致"
+                  : "重置后该账号的所有设备会被踢下线。"}
+            </p>
+            <div className="admin-modal-actions">
+              <button type="button" className="admin-btn" onClick={() => setResetModal(null)}>
+                取消
+              </button>
+              <button
+                type="submit"
+                className="admin-btn primary"
+                disabled={
+                  resetModal.password.length < 4 || resetModal.password !== resetModal.confirm
+                }
+              >
+                确认重置
+              </button>
+            </div>
+          </form>
+        </div>,
+        document.body,
+      ) : null}
     </div>
   );
 }

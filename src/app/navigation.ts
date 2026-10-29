@@ -33,7 +33,7 @@ export const navigationGroups: Array<{ label: string; items: NavigationItem[] }>
   {
     label: "数据",
     items: [
-      { key: "Sessions", path: "/sessions", title: "会话与记录", subtitle: "录制与导出", icon: Database, requires: "manageSessions" },
+      { key: "Sessions", path: "/sessions", title: "回放录制", subtitle: "录制与导出", icon: Database, requires: "manageSessions" },
       { key: "Logs", path: "/logs", title: "日志与诊断", subtitle: "诊断与审计", icon: Logs },
     ],
   },
@@ -67,7 +67,7 @@ export const pageTitles: Record<PageKey, string> = {
   Dashboard: "总览",
   Workspace: "设备工作台",
   Charts: "曲线分析",
-  Sessions: "会话与记录",
+  Sessions: "回放录制",
   Logs: "日志与诊断",
   Settings: "系统设置",
   Model: "3D 窗口",

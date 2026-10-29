@@ -1,4 +1,4 @@
-import type { ChartSection, DeviceSnapshot, SensorState } from "../softuiTypes";
+import type { ChartSection, DeviceSnapshot } from "../softuiTypes";
 
 /**
  * 在前端直接下载文本文件。
@@ -41,12 +41,9 @@ function stamp(ms: number): string {
   return new Date(ms).toLocaleString("zh-CN", { hour12: false });
 }
 
-/** 传感器是多轴读数，压成一列便于表格查看。 */
-function sensorValue(sensor: SensorState | undefined): string {
-  if (!sensor) return "";
-  return sensor.filtered
-    .map((value) => (Number.isFinite(value) ? value.toFixed(3) : ""))
-    .join(" ");
+/** 数值单元格：缺数据或非有限值留空，别把 "NaN" 写进 CSV。 */
+function numberCell(value: number | undefined): string {
+  return value != null && Number.isFinite(value) ? value.toFixed(3) : "";
 }
 
 /**
@@ -66,7 +63,8 @@ export function framesToCsv(frames: DeviceSnapshot[]): string {
     "系统使能",
     ...Array.from({ length: motorCount }, (_, i) => `电机${i + 1}位置(mm)`),
     ...Array.from({ length: motorCount }, (_, i) => `电机${i + 1}速度(mm/s)`),
-    ...Array.from({ length: sensorCount }, (_, i) => `传感器${i + 1}`),
+    ...Array.from({ length: sensorCount }, (_, i) => `传感器${i + 1}实际(N)`),
+    ...Array.from({ length: sensorCount }, (_, i) => `传感器${i + 1}滤波(N)`),
     "第1段弯曲角(deg)",
     "第2段弯曲角(deg)",
     "质量",
@@ -80,7 +78,8 @@ export function framesToCsv(frames: DeviceSnapshot[]): string {
       frame.systemEnabled ? 1 : 0,
       ...Array.from({ length: motorCount }, (_, i) => frame.motors[i]?.positionMm ?? ""),
       ...Array.from({ length: motorCount }, (_, i) => frame.motors[i]?.velocityMmPerSec ?? ""),
-      ...Array.from({ length: sensorCount }, (_, i) => sensorValue(frame.sensors[i])),
+      ...Array.from({ length: sensorCount }, (_, i) => numberCell(frame.sensors[i]?.rawValue)),
+      ...Array.from({ length: sensorCount }, (_, i) => numberCell(frame.sensors[i]?.filteredValue)),
       frame.bend.section1.angleDeg,
       frame.bend.section2.angleDeg,
       frame.quality.status,
@@ -90,20 +89,30 @@ export function framesToCsv(frames: DeviceSnapshot[]): string {
   return [row(header), ...lines].join("\r\n") + "\r\n";
 }
 
-/** 曲线数据 → CSV：第一列时间，其余每个通道一列。 */
+/**
+ * 曲线数据 → CSV：绝对时间 + **相对秒** + 每个通道一列。
+ *
+ * ⚠ `charts.timestamps` 是**秒** ✗（帧 `receivedAtMs / 1000` ✓），
+ * 直接喂给 `new Date()` 会落到 1970 年 ✗ → 导出的时间列全错 ✓（本 bug ✓）。
+ * 这里显式还原成毫秒 ✓；同时补一列**相对秒** ✓ —— 分析延迟 / 误差规律时，
+ * 相对时间比绝对时间好用 ✓（Excel 里直接减就行 ✓）。
+ */
 export function chartsToCsv(charts: ChartSection): string {
   if (charts.timestamps.length === 0) return "无数据\r\n";
 
+  const origin = charts.timestamps[0];
   const header = [
     "时间",
+    "相对秒(s)",
     ...charts.channels.map((channel) =>
       channel.unit ? `${channel.name}(${channel.unit})` : channel.name,
     ),
   ];
 
-  const lines = charts.timestamps.map((ms, index) =>
+  const lines = charts.timestamps.map((seconds, index) =>
     row([
-      stamp(ms),
+      stamp(seconds * 1000),
+      (seconds - origin).toFixed(3),
       ...charts.channels.map((channel) => {
         const value = channel.points[index];
         return value == null || !Number.isFinite(value) ? "" : value;

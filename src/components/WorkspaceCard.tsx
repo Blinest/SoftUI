@@ -67,7 +67,7 @@ export function WorkspaceCard({
   id,
   children,
 }: WorkspaceCardProps) {
-  const classes = ["workspace-panel", wide ? "workspace-panel-wide" : "", className ?? ""]
+  const classes = ["workspace-panel", "tilt-card", wide ? "workspace-panel-wide" : "", className ?? ""]
     .filter(Boolean)
     .join(" ");
 

@@ -7,6 +7,10 @@
 默认 tools 目录: D:/Continuum robot/control/tdcr_control/tools
 默认输出:      src-tauri/assets/default.tdcrmodel
 
+档位由 `--gauges` 指定（默认 "20,40"）。段 id 会跟着变成 K20/P20/S20 + K40/P40/S40。
+
+几何常数**不再硬编码**：从同目录的 `calib.json` 读 L1/L2/EI/r_o，换臂型只换数据、不改脚本。
+
 包格式 (TDCRMOD1):
     0   magic  "TDCRMOD1"
     8   u32 version = 1
@@ -16,7 +20,7 @@
 
 段 id: K40/K60 = 曲率表, P40/P60 = 位姿表, S40/S60 = 形状表  (40/60 = 张力上限 N)
 """
-import argparse, math, os, struct, sys
+import argparse, json, math, os, struct, sys
 
 import numpy as np
 
@@ -24,8 +28,9 @@ SIGMA_P_MM = 5.0
 MM_PER_MRAD = 0.5
 W_F = SIGMA_P_MM / MM_PER_MRAD
 SHAPE_NODES = 12
-L_TOTAL_M = 0.445177422          # 与 tendon_coupling.py 的 L1=L2=0.2225887 一致
+# 旧的硬编码（445.2mm 臂）已移除；现在从 calib.json 读，见 read_calib()。
 DEFAULT_TOOLS = r"D:\Continuum robot\control\tdcr_control\tools"
+DEFAULT_GAUGES = "20,40"
 
 
 def so3_log(R):
@@ -46,16 +51,36 @@ def so3_log(R):
     return (th / (2.0 * math.sin(th))) * w
 
 
-def seg_lengths():
-    a = math.radians(12.0)
-    r = 0.020
-    lax_a = 2 * (math.pi * r / (6 * math.cos(a))) * math.sin(a)
-    lax_b = 2 * (math.pi * r / (3 * math.cos(a))) * math.sin(a)
-    return 50 * lax_a, 25 * lax_b
+def find_in(tools_dir, name):
+    """在 tools_dir 以及它的 tables/ 子目录下找文件。
+
+    新导出的模型包把 npz 放在 `tables/` 里、calib 放在根上；旧目录是平铺的。
+    两种都兼容，省得每次手动挪文件。
+    """
+    for path in (os.path.join(tools_dir, name), os.path.join(tools_dir, "tables", name)):
+        if os.path.exists(path):
+            return path
+    return None
 
 
-def build(tools_dir, gauge, L1):
-    z = np.load(os.path.join(tools_dir, "vc_table_%s.npz" % gauge), allow_pickle=True)
+def read_calib(tools_dir):
+    """从 calib.json 读几何标定。
+
+    旧版本把臂长硬编码成 0.445177422、驱动丝半径 6mm —— 换臂型后这些就全错了，
+    而"错的几何 + 对的表"是最难查的一种不一致：模型能加载、形状却是错的。
+    """
+    path = find_in(tools_dir, "calib.json")
+    if not os.path.exists(path):
+        raise SystemExit("缺少 calib.json：%s（换臂型必须提供几何标定）" % path)
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def build(tools_dir, gauge, L1, L_total):
+    table_path = find_in(tools_dir, "vc_table_%s.npz" % gauge)
+    if table_path is None:
+        raise SystemExit("找不到 vc_table_%s.npz（查过 %s 和其中的 tables/）" % (gauge, tools_dir))
+    z = np.load(table_path, allow_pickle=True)
     kS, kK, dL = z["kS"], z["kK"], z["dL_mm"]
     p_tip, R_tip = z["p_tip"], z["R_tip"]
     n = kS.shape[0]
@@ -84,7 +109,7 @@ def build(tools_dir, gauge, L1):
         s = kS[i]
         row = []
         for k in range(SHAPE_NODES):
-            j = int(np.argmin(np.abs(s - (k + 0.5) / SHAPE_NODES * L_TOTAL_M)))
+            j = int(np.argmin(np.abs(s - (k + 0.5) / SHAPE_NODES * L_total)))
             row += [kK[i, j, 0], kK[i, j, 1]]
         shape += struct.pack("<%df" % (SHAPE_NODES * 2), *np.asarray(row, np.float32))
 
@@ -95,14 +120,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("tools_dir", nargs="?", default=DEFAULT_TOOLS)
     ap.add_argument("output", nargs="?", default=os.path.join("src-tauri", "assets", "default.tdcrmodel"))
+    ap.add_argument("--gauges", default=DEFAULT_GAUGES,
+                    help='张力档位，逗号分隔（默认 "20,40"）')
     args = ap.parse_args()
 
-    L1, L2 = seg_lengths()
-    print("段长 L1=%.6f L2=%.6f m" % (L1, L2))
+    calib = read_calib(args.tools_dir)
+    L1 = float(calib["L1"])
+    L2 = float(calib["L2"])
+    L_total = L1 + L2
+    print("calib: L1=%.3f L2=%.3f (总长 %.4f m)  EI=%.4f  r_o=%.4f m"
+          % (L1, L2, L_total, float(calib["EI"]), float(calib["r_o"])))
 
+    gauges = [g.strip() for g in args.gauges.split(",") if g.strip()]
     sections = []
-    for gauge in ("40", "60"):
-        k, p, s = build(args.tools_dir, gauge, L1)
+    for gauge in gauges:
+        k, p, s = build(args.tools_dir, gauge, L1, L_total)
         sections += [("K" + gauge, k), ("P" + gauge, p), ("S" + gauge, s)]
         print("  %sN: kappa=%d pose=%d shape=%d bytes" % (gauge, len(k), len(p), len(s)))
 

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SoftUI · 智能策略编排全链路 · 架构导图</title>
+<style>
+  :root{
+    --bg:#06080f; --bg2:#0b1020; --panel:rgba(18,26,48,.72); --panel2:rgba(24,34,60,.55);
+    --line:rgba(96,140,255,.22); --line2:rgba(96,140,255,.42);
+    --txt:#e8eefc; --muted:#8fa3c8; --dim:#6d7f9e;
+    --blue:#4c9aff; --cyan:#38e1d0; --violet:#8b7dff; --amber:#fbbf24; --green:#34d399; --red:#ff6b6b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; color:var(--txt); background:
+      radial-gradient(1200px 700px at 78% -8%, rgba(76,154,255,.18), transparent 60%),
+      radial-gradient(900px 600px at 6% 108%, rgba(139,125,255,.16), transparent 60%),
+      linear-gradient(160deg,var(--bg) 0%,var(--bg2) 100%);
+    font:15px/1.62 "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    overflow:hidden;
+  }
+  /* ── 顶栏 ───────────────────────────────────────── */
+  header{
+    position:fixed; inset:0 0 auto 0; height:56px; z-index:30;
+    display:flex; align-items:center; gap:14px; padding:0 20px;
+    background:linear-gradient(180deg,rgba(6,8,15,.92),rgba(6,8,15,.55));
+    border-bottom:1px solid var(--line); backdrop-filter:blur(14px);
+  }
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.4px}
+  .brand i{width:9px;height:9px;border-radius:50%;background:var(--blue);
+    box-shadow:0 0 14px var(--blue);display:block}
+  .brand small{font-weight:500;color:var(--muted);font-size:12px;letter-spacing:1.2px}
+  .spacer{flex:1}
+  .hint{color:var(--dim);font-size:12px;font-family:var(--mono)}
+  .pager{font-family:var(--mono);font-size:12px;color:var(--muted);min-width:88px;text-align:right}
+  /* ── 左侧导航（PPT 目录栏） ─────────────────────── */
+  nav{
+    position:fixed; top:56px; left:0; bottom:0; width:274px; z-index:20;
+    padding:16px 12px 22px; overflow:auto;
+    border-right:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(10,15,28,.86),rgba(8,12,22,.7));
+    backdrop-filter:blur(10px);
+  }
+  nav .navtitle{font-size:11px;letter-spacing:2.4px;color:var(--dim);margin:4px 8px 12px;font-family:var(--mono)}
+  nav .group{margin:14px 8px 6px;font-size:11px;color:var(--dim);letter-spacing:1.6px}
+  nav a{
+    display:flex;gap:10px;align-items:flex-start; text-decoration:none; color:var(--muted);
+    padding:8px 10px; border-radius:9px; border:1px solid transparent; margin:2px 0;
+    font-size:13px; line-height:1.42; transition:.16s;
+  }
+  nav a b{font-family:var(--mono);font-size:11px;color:var(--dim);min-width:18px;text-align:right}
+  nav a:hover{color:var(--txt);background:rgba(76,154,255,.09);border-color:var(--line)}
+  nav a.active{color:#fff;background:linear-gradient(100deg,rgba(76,154,255,.24),rgba(56,225,208,.08));
+    border-color:var(--line2); box-shadow:inset 3px 0 0 var(--blue)}
+  nav a.active b{color:var(--cyan)}
+  /* ── 舞台 ───────────────────────────────────────── */
+  main{position:fixed; top:56px; left:274px; right:0; bottom:0; overflow:hidden}
+  .deck{position:absolute; inset:0; display:grid; place-items:center; padding:26px 30px 54px}
+  .slide{
+    display:none; width:100%; max-width:1180px; max-height:100%;
+    padding:30px 34px 34px; border-radius:18px; overflow:auto;
+    background:linear-gradient(180deg,var(--panel),var(--panel2));
+    border:1px solid var(--line);
+    box-shadow:0 26px 70px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);
+  }
+  .slide.active{display:block; animation:rise .22s ease-out}
+  @keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+  .kicker{font-family:var(--mono);font-size:11px;letter-spacing:3px;color:var(--cyan);margin-bottom:8px}
+  h1{margin:0 0 10px; font-size:34px; letter-spacing:.6px; line-height:1.22}
+  h2{margin:0 0 16px; font-size:25px; letter-spacing:.5px; line-height:1.28}
+  h2 .idx{font-family:var(--mono);font-size:13px;color:var(--dim);margin-right:10px}
+  h3{margin:18px 0 8px;font-size:15px;color:var(--cyan);letter-spacing:.6px}
+  p{margin:0 0 12px;color:#cfdaf2}
+  .lead{font-size:16px;color:#dbe5fa;max-width:88ch}
+  .muted{color:var(--muted)}
+  .grad{background:linear-gradient(96deg,#7fb4ff,#38e1d0 55%,#b3a6ff);
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .grid{display:grid;gap:14px}
+  .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .card{
+    padding:14px 16px;border-radius:13px;border:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(30,44,78,.5),rgba(14,20,36,.5));
+  }
+  .card h4{margin:0 0 6px;font-size:14px;color:#fff;letter-spacing:.3px}
+  .card p{margin:0;font-size:13px;color:var(--muted);line-height:1.6}
+  .card .tag{font-family:var(--mono);font-size:10.5px;color:var(--cyan);letter-spacing:1.2px}
+  ul.clean{margin:6px 0 12px;padding-left:0;list-style:none}
+  ul.clean li{position:relative;padding-left:20px;margin:7px 0;color:#cfdaf2;font-size:14px}
+  ul.clean li::before{content:"";position:absolute;left:4px;top:9px;width:6px;height:6px;border-radius:2px;
+    background:linear-gradient(135deg,var(--blue),var(--cyan));box-shadow:0 0 10px rgba(76,154,255,.7)}
+  ol.steps{margin:8px 0 12px;padding-left:0;list-style:none;counter-reset:s}
+  ol.steps li{counter-increment:s;position:relative;padding-left:38px;margin:10px 0;font-size:14px;color:#cfdaf2}
+  ol.steps li::before{content:counter(s,decimal-leading-zero);position:absolute;left:0;top:1px;
+    width:26px;height:26px;border-radius:8px;display:grid;place-items:center;
+    font-family:var(--mono);font-size:11px;color:#9dc2ff;border:1px solid var(--line2);
+    background:rgba(76,154,255,.12)}
+  code,kbd{font-family:var(--mono);font-size:12.5px;color:#a8c8ff;background:rgba(76,154,255,.1);
+    border:1px solid rgba(96,140,255,.24);border-radius:6px;padding:1px 6px}
+  .kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:6px 0 4px}
+  .kpi{padding:14px;border-radius:13px;border:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(76,154,255,.13),rgba(12,18,32,.4));text-align:center}
+  .kpi b{display:block;font-size:26px;letter-spacing:.6px;
+    background:linear-gradient(96deg,#8dc0ff,#38e1d0);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .kpi span{font-size:11.5px;color:var(--muted);letter-spacing:1px;font-family:var(--mono)}
+  /* ── 流水线（横向） ─────────────────────────────── */
+  .pipe{display:flex;align-items:stretch;gap:8px;margin:14px 0 6px;flex-wrap:nowrap}
+  .node{flex:1;min-width:0;padding:12px 11px;border-radius:12px;border:1px solid var(--line2);
+    background:linear-gradient(180deg,rgba(76,154,255,.16),rgba(12,18,32,.55));position:relative}
+  .node .n{font-family:var(--mono);font-size:10px;color:var(--cyan);letter-spacing:1.4px}
+  .node b{display:block;font-size:13px;margin:4px 0 5px;color:#fff}
+  .node span{font-size:11.5px;color:var(--muted);line-height:1.5;display:block}
+  .arrow{display:grid;place-items:center;color:var(--line2);font-size:18px;flex:0 0 14px}
+  /* ── 导图（整页） ───────────────────────────────── */
+  .map{position:relative;padding:16px;border-radius:16px;border:1px solid var(--line);
+    background:radial-gradient(700px 380px at 50% 0%,rgba(76,154,255,.1),transparent 70%),rgba(8,12,22,.55)}
+  .lane{display:grid;grid-template-columns:120px 1fr;gap:12px;align-items:center;margin:10px 0}
+  .lane .ln{font-family:var(--mono);font-size:11px;letter-spacing:1.6px;color:var(--dim);text-align:right;padding-right:4px}
+  .lane .row{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  .box{padding:10px 11px;border-radius:11px;border:1px solid var(--line2);
+    background:linear-gradient(180deg,rgba(30,46,82,.62),rgba(12,18,32,.55));font-size:12.5px;color:#dbe6fb}
+  .box b{display:block;font-size:12.5px;color:#fff;margin-bottom:3px}
+  .box em{font-style:normal;font-family:var(--mono);font-size:10.5px;color:var(--cyan);letter-spacing:.8px}
+  .lane.l1 .box{border-color:rgba(139,125,255,.4);background:linear-gradient(180deg,rgba(139,125,255,.2),rgba(12,18,32,.55))}
+  .lane.l2 .box{border-color:rgba(76,154,255,.42);background:linear-gradient(180deg,rgba(76,154,255,.18),rgba(12,18,32,.55))}
+  .lane.l3 .box{border-color:rgba(56,225,208,.4);background:linear-gradient(180deg,rgba(56,225,208,.16),rgba(12,18,32,.55))}
+  .lane.l4 .box{border-color:rgba(251,191,36,.38);background:linear-gradient(180deg,rgba(251,191,36,.14),rgba(12,18,32,.55))}
+  .flowdown{text-align:center;color:var(--line2);font-size:14px;letter-spacing:6px;margin:2px 0}
+  .feedback{margin-top:10px;padding:10px 14px;border-radius:11px;border:1px dashed rgba(52,211,153,.5);
+    background:rgba(52,211,153,.08);font-size:12.5px;color:#c9f5e3}
+  /* ── 底栏进度 ───────────────────────────────────── */
+  footer{position:fixed;left:274px;right:0;bottom:0;height:44px;z-index:25;
+    display:flex;align-items:center;gap:12px;padding:0 22px;
+    border-top:1px solid var(--line);background:rgba(6,8,15,.72);backdrop-filter:blur(10px)}
+  .btn{cursor:pointer;border:1px solid var(--line2);background:rgba(76,154,255,.1);
+    color:#cfe0ff;border-radius:9px;padding:5px 13px;font:inherit;font-size:12.5px}
+  .btn:hover{background:rgba(76,154,255,.2)}
+  .bar{flex:1;height:4px;border-radius:99px;background:rgba(255,255,255,.07);overflow:hidden}
+  .bar i{display:block;height:100%;width:0;border-radius:99px;
+    background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .25s}
+  @media (max-width:1100px){
+    nav{width:210px} main,footer{left:210px}
+    .g4,.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+    .pipe{flex-wrap:wrap}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand"><i></i>SoftUI <small>INTELLIGENT STRATEGY ORCHESTRATION</small></div>
+  <div class="spacer"></div>
+  <div class="hint">← → 翻页 · 点击左侧目录跳转</div>
+  <div class="pager" id="pager">01 / 16</div>
+</header>
+
+<nav id="nav">
+  <div class="navtitle">CONTENTS</div>
+  <div class="group">0 · 概览</div>
+  <a href="#s1"><b>01</b><span>全链路总览</span></a>
+  <a href="#s2"><b>02</b><span>能力矩阵</span></a>
+  <div class="group">1 · 意图层</div>
+  <a href="#s3"><b>03</b><span>自然语言 → 策略语义</span></a>
+  <a href="#s4"><b>04</b><span>语义编译：意图到原语</span></a>
+  <div class="group">2 · 编排层</div>
+  <a href="#s5"><b>05</b><span>动作库：示教与轨迹</span></a>
+  <a href="#s6"><b>06</b><span>可行性求解：表驱动逆解</span></a>
+  <a href="#s7"><b>07</b><span>规划采样与曲率平滑</span></a>
+  <a href="#s8"><b>08</b><span>策略方案：三层结构</span></a>
+  <a href="#s9"><b>09</b><span>规则引擎与中断编排</span></a>
+  <div class="group">3 · 执行层</div>
+  <a href="#s10"><b>10</b><span>时间线状态机</span></a>
+  <a href="#s11"><b>11</b><span>播放时钟驱动的下发</span></a>
+  <a href="#s12"><b>12</b><span>数字孪生与三维同步</span></a>
+  <div class="group">4 · 保障层</div>
+  <a href="#s13"><b>13</b><span>安全边界与权限</span></a>
+  <a href="#s14"><b>14</b><span>可观测性与审计</span></a>
+  <div class="group">5 · 全景</div>
+  <a href="#s15"><b>15</b><span>全链路导图</span></a>
+  <a href="#s16"><b>16</b><span>工程结论</span></a>
+</nav>
+
+<main>
+<div class="deck" id="deck">
+
+  <!-- 01 -->
+  <section class="slide active" id="s1">
+    <div class="kicker">SOFTUI · CONTINUUM ROBOT PLATFORM</div>
+    <h1>智能策略编排 <span class="grad">全链路架构</span></h1>
+    <p class="lead">从「一句话」到「六个电机的同步位移」——把自然语言意图，逐级编译为可验证、可复现、可审计的连续体机器人动作指令。</p>
+    <div class="pipe">
+      <div class="node"><div class="n">L1 · INTENT</div><b>自然语言意图</b><span>操作员口述任务，无需编程</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">L2 · SEMANTIC</div><b>策略语义编译</b><span>大模型结构化 → 方案 / 规则 / 时间线</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">L3 · PLAN</div><b>动作与轨迹规划</b><span>示教点 → 表驱动逆解 → 采样平滑</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">L4 · EXECUTE</div><b>确定性执行</b><span>播放时钟 → 位移插值 → 多电机同步帧</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">L5 · OBSERVE</div><b>闭环观测</b><span>实测反馈 · 曲线 · 审计</span></div>
+    </div>
+    <div class="kpis">
+      <div class="kpi"><b>5</b><span>LAYERS</span></div>
+      <div class="kpi"><b>1031</b><span>TABLE SAMPLES</span></div>
+      <div class="kpi"><b>61</b><span>CURVATURE NODES</span></div>
+      <div class="kpi"><b>6-DOF</b><span>SYNC CHANNELS</span></div>
+    </div>
+  </section>
+
+  <!-- 02 -->
+  <section class="slide" id="s2">
+    <div class="kicker">CAPABILITY MATRIX</div>
+    <h2><span class="idx">02</span>能力矩阵：把「意图」变成「可信动作」</h2>
+    <div class="grid g3">
+      <div class="card"><div class="tag">SEMANTIC</div><h4>意图解析</h4><p>大模型将自然语言解析为结构化策略：动作引用、触发条件、时序片段、异常中断。</p></div>
+      <div class="card"><div class="tag">MODEL</div><h4>模型驱动</h4><p>以 TDCRMOD1 模型包为唯一物理基准：曲率表、位姿表、形状表三位一体。</p></div>
+      <div class="card"><div class="tag">SOLVER</div><h4>表驱动逆解</h4><p>邻域加权反查，避免解析式模型在高曲率区的奇异与发散。</p></div>
+      <div class="card"><div class="tag">PLANNER</div><h4>轨迹规划</h4><p>末端路径离散化 + 曲率序列平滑，输出可执行的 κ 时间序列。</p></div>
+      <div class="card"><div class="tag">ENGINE</div><h4>规则引擎</h4><p>周期判定、张力阈值、跨阈值中断与自动恢复，支持时间线级联。</p></div>
+      <div class="card"><div class="tag">DISPATCH</div><h4>确定性下发</h4><p>以播放时钟为唯一时间基准，按时刻插值下发绝对位移，轨迹不可漂移。</p></div>
+      <div class="card"><div class="tag">TWIN</div><h4>数字孪生</h4><p>三维臂体与实机同源同帧，理论曲线与实际曲线并列对照。</p></div>
+      <div class="card"><div class="tag">GOVERN</div><h4>安全治理</h4><p>角色权限、使能校验、急停联动、失败归零四级防线。</p></div>
+      <div class="card"><div class="tag">AUDIT</div><h4>可观测性</h4><p>控制帧审计、执行日志、诊断包导出，全过程可回溯。</p></div>
+    </div>
+  </section>
+
+  <!-- 03 -->
+  <section class="slide" id="s3">
+    <div class="kicker">LAYER 1 · INTENT</div>
+    <h2><span class="idx">03</span>自然语言 → 策略语义</h2>
+    <p class="lead">入口是「一句话」，出口是「可执行的数据结构」。中间不做黑盒猜测，而是把上下文一起交给模型，让生成结果天然对齐现场资产。</p>
+    <div class="grid g2">
+      <div>
+        <h3>输入上下文（Context Injection）</h3>
+        <ul class="clean">
+          <li>动作库清单（动作 ID / 名称 / 点位数 / 规划时长）</li>
+          <li>模型库清单（型号 / 张力档位 / 曲率上限）</li>
+          <li>现有方案与时序片段（增量编辑，而非从零生成）</li>
+          <li>账号级 AI 凭证（每人独立 Key 与模型，互不干扰）</li>
+        </ul>
+      </div>
+      <div>
+        <h3>输出契约（Structured Output）</h3>
+        <ul class="clean">
+          <li>方案（Scheme）：名称、规则集、时间线、中断表</li>
+          <li>规则（Rule）：触发类型、阈值、目标动作 / 模型</li>
+          <li>片段（Block）：执行动作 / 切换模型 / 等待 + 时长</li>
+          <li>每个引用都必须命中现场真实 ID，杜绝“幻觉动作”</li>
+        </ul>
+      </div>
+    </div>
+    <h3>语义样例</h3>
+    <p><code>“先切到 20N 模型，执行巡检动作 3 遍，中途张力超过 18N 就暂停 2 秒再继续”</code></p>
+    <p class="muted">↓ 编译为：<b>switch-model</b> → <b>loop(3)</b> → <b>action</b> → <b>interrupt(tension &gt; 18N, resume)</b></p>
+  </section>
+
+  <!-- 04 -->
+  <section class="slide" id="s4">
+    <div class="kicker">LAYER 1 · COMPILATION</div>
+    <h2><span class="idx">04</span>语义编译：从「意图」到「原语」</h2>
+    <div class="grid g4">
+      <div class="card"><div class="tag">STEP 01</div><h4>意图切分</h4><p>识别任务主体、约束条件、异常策略三类要素。</p></div>
+      <div class="card"><div class="tag">STEP 02</div><h4>实体对齐</h4><p>把「巡检动作」对齐到动作库真实条目，把「20N」对齐到模型档位。</p></div>
+      <div class="card"><div class="tag">STEP 03</div><h4>时序装配</h4><p>按因果关系装配时间线，循环与等待转成可推进的片段。</p></div>
+      <div class="card"><div class="tag">STEP 04</div><h4>约束求解</h4><p>补齐时长、容差、安全检查项，输出通过校验的方案对象。</p></div>
+    </div>
+    <h3>为什么不做「端到端直出」</h3>
+    <ul class="clean">
+      <li>连续体机器人的安全边界必须显式表达，不能藏在黑盒权重里</li>
+      <li>生成结果落盘为普通数据 → 可人工复核、可版本对比、可回滚</li>
+      <li>编译产物与手写编排共用同一执行引擎，避免两条互不兼容的路径</li>
+    </ul>
+  </section>
+
+  <!-- 05 -->
+  <section class="slide" id="s5">
+    <div class="kicker">LAYER 2 · MOTION LIBRARY</div>
+    <h2><span class="idx">05</span>动作库：示教、位姿与轨迹</h2>
+    <div class="grid g2">
+      <div>
+        <h3>动作的构成</h3>
+        <ul class="clean">
+          <li><b>示教点序列</b>：末端目标位置的三维路径，与当时臂体形态解耦</li>
+          <li><b>坐标系约定</b>：示教点存 three 系（毫米），求解前统一换轴到 svc 系</li>
+          <li><b>容差</b>：末端偏差允许上限，默认 2 mm，超差即判定不可行</li>
+          <li><b>可行性缓存</b>：按（模型 × 容差 × 点数）签名缓存，避免重复求解</li>
+        </ul>
+      </div>
+      <div>
+        <h3>多模型求解矩阵</h3>
+        <p class="muted">同一个动作，对模型库中每个模型分别求解，产出独立的规划结果：</p>
+        <ul class="clean">
+          <li>可行 / 不可行 + 原因（不可达、超差、饱和）</li>
+          <li>规划时长（由末端速度与轨迹长度决定）</li>
+          <li>最大偏差（用于容差判定与质量分级）</li>
+          <li>完整采样点（含曲率序列与末端坐标）—— 执行层直接复用</li>
+        </ul>
+      </div>
+    </div>
+    <p class="muted">要点：<b>动作不是录制的关节值，而是末端意图</b>。同一动作在换臂、换模型后仍可复用。</p>
+  </section>
+
+  <!-- 06 -->
+  <section class="slide" id="s6">
+    <div class="kicker">LAYER 2 · SOLVER</div>
+    <h2><span class="idx">06</span>可行性求解：表驱动逆解</h2>
+    <p class="lead">连续体机器人没有刚性关节，逆解不存在解析闭式。系统以 Cosserat 全阶模型离线打靶生成「位移 ↔ 形状」映射表，在线只做高效邻域反查。</p>
+    <div class="grid g2">
+      <div>
+        <h3>模型包（TDCRMOD1）五段结构</h3>
+        <ul class="clean">
+          <li><b>KTB1</b>：每样本 6 路张力 + 6 路位移增量（mm）</li>
+          <li><b>PTB1</b>：四骨架点空间坐标（svc 系，米）</li>
+          <li><b>KSB1</b>：弧长网格 61 节点</li>
+          <li><b>KKB1</b>：61 节点曲率矢量（κx, κy）</li>
+          <li><b>META</b>：样本数 / 张力上限 / 弯曲范围 / 曲率峰值</li>
+        </ul>
+      </div>
+      <div>
+        <h3>在线反查策略</h3>
+        <ul class="clean">
+          <li>按末端位置检索最近邻组（K=10），距离倒数平方加权</li>
+          <li>输出 6 路位移增量，同时给出最近邻距离用于「超域」判定</li>
+          <li>距离超过阈值 → 判定目标越界，拒绝下发并提示回撤</li>
+          <li>全流程只读常量表，实时性由表驱动保证，而非迭代求解</li>
+        </ul>
+      </div>
+    </div>
+    <div class="feedback">工程价值：把「每帧几百毫秒的迭代求解」压缩为「一次内存邻域检索」，实时链路才能成立。</div>
+  </section>
+
+  <!-- 07 -->
+  <section class="slide" id="s7">
+    <div class="kicker">LAYER 2 · PLANNER</div>
+    <h2><span class="idx">07</span>规划采样与曲率平滑</h2>
+    <ol class="steps">
+      <li><b>路径离散化</b>：末端示教点按等弧长重采样，形成密集目标点列。</li>
+      <li><b>逐点反查</b>：每个目标点调用表驱动逆解，得到该时刻的 6 路段曲率。</li>
+      <li><b>序列平滑</b>：对 κx / κy 分别做滑动平滑 —— 分量分别处理，方向角才不会翻转。</li>
+      <li><b>回算校验</b>：用平滑后的曲率积分回末端位置，与目标比对，统计最大偏差。</li>
+      <li><b>可行性裁决</b>：任一采样点不可达、或最大偏差超容差，则判该模型不可行并给出原因。</li>
+    </ol>
+    <div class="grid g2">
+      <div class="card"><h4>为什么必须平滑</h4><p>最近邻反查在小邻域切换时会产生微跳变；直接下发会让电机反复加减速，表现为顿挫与异响。</p></div>
+      <div class="card"><h4>为什么分量分离</h4><p>对 κ 的模与角分别平滑会在过零点引入反向旋转；对 κx/κy 做分量平滑可保持方向连续。</p></div>
+    </div>
+  </section>
+
+  <!-- 08 -->
+  <section class="slide" id="s8">
+    <div class="kicker">LAYER 3 · POLICY</div>
+    <h2><span class="idx">08</span>策略方案：三层数据结构</h2>
+    <div class="grid g3">
+      <div class="card"><div class="tag">LAYER A</div><h4>规则集 Rules</h4><p>周期型规则（每 N 秒触发）与张力型规则（跨阈值触发）；命中后执行动作或切换模型。</p></div>
+      <div class="card"><div class="tag">LAYER B</div><h4>时间线 Timeline</h4><p>有序片段队列：执行动作 / 切换模型 / 等待；每段独立时长，整体串行推进。</p></div>
+      <div class="card"><div class="tag">LAYER C</div><h4>中断表 Interrupts</h4><p>运行期异常处理：张力跨阈值时暂停、执行补偿动作、再恢复原时间线。</p></div>
+    </div>
+    <h3>方案的生命周期</h3>
+    <ul class="clean">
+      <li><b>本地草稿</b> → 编辑态，不与现场冲突</li>
+      <li><b>提交审批</b> → 操作员改动进入待审队列，不直接影响生产</li>
+      <li><b>直传生效</b> → 管理员改动立即同步，全部终端 5 秒内一致</li>
+      <li><b>标记删除</b> → 已生效方案先摘除再落盘，避免历史终端残留</li>
+    </ul>
+  </section>
+
+  <!-- 09 -->
+  <section class="slide" id="s9">
+    <div class="kicker">LAYER 3 · ENGINE</div>
+    <h2><span class="idx">09</span>规则引擎与中断编排</h2>
+    <div class="grid g2">
+      <div>
+        <h3>节拍式判定</h3>
+        <ul class="clean">
+          <li>引擎以稳定节拍轮询：读取规则、读取实时张力、必要时推进时间线</li>
+          <li>周期规则用「上次触发标记」去重，避免同一窗口重复命中</li>
+          <li>张力规则维护滑动历史窗口，抑制瞬时噪声误触发</li>
+        </ul>
+      </div>
+      <div>
+        <h3>中断与恢复</h3>
+        <ul class="clean">
+          <li>跨阈值 → 记录中断事件 → 暂停当前播放 → 执行补偿片段</li>
+          <li>补偿完成后按原进度恢复，时间线状态不丢失</li>
+          <li>无恢复策略时停留在安全姿态，等待人工介入</li>
+        </ul>
+      </div>
+    </div>
+    <h3>执行仲裁</h3>
+    <p class="muted">同一时刻只允许一条执行主线：手动播放与策略时间线互斥，后发起者接管，被接管者必须完整收尾 —— 否则会出现「界面显示在播、实际已停」的状态撕裂。</p>
+  </section>
+
+  <!-- 10 -->
+  <section class="slide" id="s10">
+    <div class="kicker">LAYER 4 · EXECUTION</div>
+    <h2><span class="idx">10</span>时间线状态机</h2>
+    <div class="pipe">
+      <div class="node"><div class="n">S0</div><b>IDLE</b><span>无时间线 / 引擎关闭</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">S1</div><b>ADVANCE</b><span>按节拍计算当前片段与已播时长</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">S2</div><b>DISPATCH</b><span>片段开始：加载动作、启动播放实例</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">S3</div><b>PLAYING</b><span>逐帧插值，推进进度与三维形位</span></div>
+      <div class="arrow">›</div>
+      <div class="node"><div class="n">S4</div><b>FINISH</b><span>片段结束：钉住终点，进入下一片段</span></div>
+    </div>
+    <ul class="clean">
+      <li><b>时间驱动而非事件驱动</b>：片段推进依据真实时钟，避免“丢一帧就永久卡住”</li>
+      <li><b>兜底强停</b>：总时长 + 余量后强制结束，防止后台节流导致永不收尾</li>
+      <li><b>单一清理点</b>：正常结束、手动停止、兜底超时三条路径统一收尾，杜绝状态残留</li>
+    </ul>
+  </section>
+
+  <!-- 11 -->
+  <section class="slide" id="s11">
+    <div class="kicker">LAYER 4 · DISPATCH</div>
+    <h2><span class="idx">11</span>播放时钟驱动的位移下发</h2>
+    <p class="lead">下发不是“跟着渲染帧走”，而是“跟着时间轴走”：以播放时钟为唯一基准，按时刻在位移序列上插值，输出绝对位移帧。</p>
+    <div class="grid g2">
+      <div>
+        <h3>为什么要用播放时钟</h3>
+        <ul class="clean">
+          <li>渲染帧率会抖动，用帧号推进会让轨迹随时间漂移</li>
+          <li>暂停 / 恢复天然正确：时钟停，下发停，不需额外状态</li>
+          <li>拍与拍之间的缺口由插值补齐 —— <b>不丢帧、不改轨迹</b></li>
+        </ul>
+      </div>
+      <div>
+        <h3>下发帧的三重约束</h3>
+        <ul class="clean">
+          <li><b>绝对量</b>：每帧给出六路电机的目标位移，后帧自然覆盖前帧</li>
+          <li><b>节拍化</b>：固定节拍发送，避免把串口打满</li>
+          <li><b>终点钉住</b>：结束补发终点帧，确保停在规划终点而非半途</li>
+        </ul>
+      </div>
+    </div>
+    <h3>链路时序</h3>
+    <p class="muted">规划表 → 位移序列 → 播放时钟 → 时刻插值 → 多电机同步帧（0x04）→ 驱动器 → 实测位置回读 → 曲线与监控</p>
+  </section>
+
+  <!-- 12 -->
+  <section class="slide" id="s12">
+    <div class="kicker">LAYER 4 · DIGITAL TWIN</div>
+    <h2><span class="idx">12</span>数字孪生与三维同步</h2>
+    <div class="grid g2">
+      <div>
+        <h3>两跳注入架构</h3>
+        <ul class="clean">
+          <li>播放每帧把曲率分布写入共享注入槽（两跳直达渲染循环）</li>
+          <li>避开「回调 → 状态 → 派生 → 属性 → 引用 → 渲染」的长链路</li>
+          <li>长链路上任一跳断裂，表现都是“界面在播、臂体不动”，极难定位</li>
+        </ul>
+      </div>
+      <div>
+        <h3>形位平滑</h3>
+        <ul class="clean">
+          <li>目标形位与实测形位各自独立阻尼，互不干扰</li>
+          <li>目标清空时平滑回落至实测，而非瞬跳</li>
+          <li>视角状态持久化：切页签返回后相机、勾选、轨迹全部还原</li>
+        </ul>
+      </div>
+    </div>
+    <h3>理论 vs 实际</h3>
+    <p class="muted">曲率分布、腱张力、形变投影三条曲线并列：实线为实测/快照，点线为由指令反推的理论值 —— 偏差即模型与执行质量的度量。</p>
+  </section>
+
+  <!-- 13 -->
+  <section class="slide" id="s13">
+    <div class="kicker">LAYER 5 · SAFETY</div>
+    <h2><span class="idx">13</span>安全边界与权限治理</h2>
+    <div class="grid g2">
+      <div class="card"><div class="tag">GATE 01</div><h4>角色权限</h4><p>动作下发需 <code>SendMotionCommand</code> 能力位；操作员与管理员的审批路径分离，越权直接拒绝。</p></div>
+      <div class="card"><div class="tag">GATE 02</div><h4>使能校验</h4><p>未使能或处于急停状态时，任何下发链路一律短路，界面给出明确原因而非静默失败。</p></div>
+      <div class="card"><div class="tag">GATE 03</div><h4>可及性判定</h4><p>目标超出位移表覆盖范围即拒绝执行，提示回撤，不尝试“近似硬发”。</p></div>
+      <div class="card"><div class="tag">GATE 04</div><h4>异常收敛</h4><p>连续下发失败达阈值即自动停止跟随；失败归零策略确保异常后回到确定姿态。</p></div>
+    </div>
+    <h3>审批与人机边界</h3>
+    <ul class="clean">
+      <li>改动分「直传」与「待审」两条通道，由角色决定，不由客户端声明</li>
+      <li>空改动不产生审批单 —— 无信息量的流程噪音同样是缺陷</li>
+      <li>现场急停永远优先于软件层任何编排逻辑</li>
+    </ul>
+  </section>
+
+  <!-- 14 -->
+  <section class="slide" id="s14">
+    <div class="kicker">LAYER 5 · OBSERVABILITY</div>
+    <h2><span class="idx">14</span>可观测性与审计</h2>
+    <div class="grid g3">
+      <div class="card"><div class="tag">TRACE</div><h4>控制帧审计</h4><p>每条下发指令留痕：时间、设备、安全态、原始帧、结果。</p></div>
+      <div class="card"><div class="tag">LOG</div><h4>执行日志</h4><p>片段级事件、失败原因、中断与恢复过程集中呈现，单一入口。</p></div>
+      <div class="card"><div class="tag">CHART</div><h4>双轨曲线</h4><p>目标位移与速度曲线对照实测，一眼看出是规划问题还是执行问题。</p></div>
+      <div class="card"><div class="tag">DIAG</div><h4>诊断包</h4><p>状态快照、模型信息、日志与曲线打包导出，离线复盘。</p></div>
+      <div class="card"><div class="tag">STATE</div><h4>状态自愈</h4><p>显示态与实际执行态持续校验，发现残留立即收敛，界面不说谎。</p></div>
+      <div class="card"><div class="tag">EXPORT</div><h4>资产导出</h4><p>模型包、动作轨迹、方案数据标准化导出，支持迁移与归档。</p></div>
+    </div>
+  </section>
+
+  <!-- 15 导图 -->
+  <section class="slide" id="s15">
+    <div class="kicker">END-TO-END MAP</div>
+    <h2><span class="idx">15</span>全链路导图</h2>
+    <div class="map">
+      <div class="lane l1">
+        <div class="ln">L1 意图</div>
+        <div class="row">
+          <div class="box"><b>自然语言输入</b><em>NATURAL LANGUAGE</em>任务、约束、异常策略</div>
+          <div class="box"><b>上下文注入</b><em>CONTEXT</em>动作库 / 模型库 / 现有方案 / 凭证</div>
+          <div class="box"><b>语义编译</b><em>SEMANTIC COMPILE</em>实体对齐 · 时序装配 · 约束求解</div>
+          <div class="box"><b>方案对象</b><em>SCHEME</em>规则集 / 时间线 / 中断表</div>
+        </div>
+      </div>
+      <div class="flowdown">↓</div>
+      <div class="lane l2">
+        <div class="ln">L2 编排</div>
+        <div class="row">
+          <div class="box"><b>动作库</b><em>MOTION LIBRARY</em>示教点 · 容差 · 坐标换轴</div>
+          <div class="box"><b>表驱动逆解</b><em>TABLE IK</em>K 邻域加权 · 越界判定</div>
+          <div class="box"><b>轨迹规划</b><em>PLANNER</em>采样 · κ 平滑 · 回算校验</div>
+          <div class="box"><b>可行性缓存</b><em>FEASIBILITY</em>多模型矩阵 · 偏差分级</div>
+        </div>
+      </div>
+      <div class="flowdown">↓</div>
+      <div class="lane l3">
+        <div class="ln">L3 执行</div>
+        <div class="row">
+          <div class="box"><b>规则引擎</b><em>ENGINE</em>周期 / 张力 · 去重 · 窗口</div>
+          <div class="box"><b>时间线状态机</b><em>STATE MACHINE</em>推进 · 派发 · 收尾</div>
+          <div class="box"><b>播放与插值</b><em>PLAYBACK CLOCK</em>时刻插值 · 不丢帧</div>
+          <div class="box"><b>多电机同步帧</b><em>0x04 DISPATCH</em>六路绝对位移 · 终点钉住</div>
+        </div>
+      </div>
+      <div class="flowdown">↓</div>
+      <div class="lane l4">
+        <div class="ln">L4 保障</div>
+        <div class="row">
+          <div class="box"><b>权限与审批</b><em>GOVERNANCE</em>角色能力位 · 直传 / 待审</div>
+          <div class="box"><b>使能与急停</b><em>INTERLOCK</em>四级防线 · 短路保护</div>
+          <div class="box"><b>数字孪生</b><em>TWIN</em>两跳注入 · 独立阻尼</div>
+          <div class="box"><b>观测与审计</b><em>OBSERVE</em>双轨曲线 · 审计 · 诊断包</div>
+        </div>
+      </div>
+      <div class="feedback">◀ 闭环：实测位移与形位持续回流 → 驱动曲线对照、状态自愈与下一次编排决策</div>
+    </div>
+  </section>
+
+  <!-- 16 -->
+  <section class="slide" id="s16">
+    <div class="kicker">CONCLUSION</div>
+    <h2><span class="idx">16</span>工程结论</h2>
+    <div class="grid g2">
+      <div class="card"><h4>确定性优先</h4><p>时间轴是唯一时间基准。任何“按帧推进”的写法都会在掉帧、切页、后台节流时引入漂移。</p></div>
+      <div class="card"><h4>模型即契约</h4><p>模型包是物理事实的唯一来源。前端不做解析式近似，避免“能加载、形状却错”的隐性错误。</p></div>
+      <div class="card"><h4>状态单一来源</h4><p>执行态、显示态、播放态必须同源。多份状态是“界面在播、电机已停”这类问题的根因。</p></div>
+      <div class="card"><h4>异常即收敛</h4><p>失败不沉默：要么归零、要么停跟随、要么显式报错。静默失败在现场等于事故。</p></div>
+    </div>
+    <h3>演进方向</h3>
+    <ul class="clean">
+      <li>轨迹表加密采样，进一步压低邻域切换带来的微跳变</li>
+      <li>下发电机引入实测位置闭环与速率整形，兼顾跟随精度与运行平顺</li>
+      <li>规则引擎扩展为可视化编排：策略即图，图即策略</li>
+    </ul>
+    <p class="muted" style="margin-top:16px">SoftUI · 连续体机器人智能编排平台 · 架构导图 v1.0</p>
+  </section>
+
+</div>
+</main>
+
+<footer>
+  <button class="btn" id="prev">← 上一页</button>
+  <button class="btn" id="next">下一页 →</button>
+  <div class="bar"><i id="progress"></i></div>
+  <span class="muted" style="font-family:var(--mono);font-size:11.5px" id="title">全链路总览</span>
+</footer>
+
+<script>
+(function(){
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var links = Array.prototype.slice.call(document.querySelectorAll('nav a'));
+  var idx = 0;
+
+  function show(i, push){
+    idx = Math.max(0, Math.min(slides.length - 1, i));
+    slides.forEach(function(el, n){ el.classList.toggle('active', n === idx); });
+    links.forEach(function(a, n){ a.classList.toggle('active', n === idx); });
+    document.getElementById('pager').textContent =
+      String(idx + 1).padStart(2, '0') + ' / ' + String(slides.length).padStart(2, '0');
+    document.getElementById('progress').style.width = ((idx + 1) / slides.length * 100) + '%';
+    document.getElementById('title').textContent =
+      slides[idx].querySelector('h1, h2') ? slides[idx].querySelector('h1, h2').textContent.replace(/^\s*\d+\s*/, '') : '';
+    if (push !== false && location.hash !== '#' + slides[idx].id) {
+      history.replaceState(null, '', '#' + slides[idx].id);
+    }
+    var active = links[idx];
+    if (active && active.scrollIntoView) active.scrollIntoView({block:'nearest'});
+  }
+
+  links.forEach(function(a, n){
+    a.addEventListener('click', function(ev){ ev.preventDefault(); show(n); });
+  });
+  document.getElementById('prev').addEventListener('click', function(){ show(idx - 1); });
+  document.getElementById('next').addEventListener('click', function(){ show(idx + 1); });
+  document.addEventListener('keydown', function(ev){
+    if (ev.key === 'ArrowRight' || ev.key === 'PageDown' || ev.key === ' ') { ev.preventDefault(); show(idx + 1); }
+    else if (ev.key === 'ArrowLeft' || ev.key === 'PageUp') { ev.preventDefault(); show(idx - 1); }
+    else if (ev.key === 'Home') { show(0); }
+    else if (ev.key === 'End') { show(slides.length - 1); }
+  });
+
+  var fromHash = slides.findIndex(function(el){ return '#' + el.id === location.hash; });
+  show(fromHash >= 0 ? fromHash : 0, false);
+})();
+</script>
+</body>
+</html>

@@ -435,7 +435,50 @@ const server = http.createServer((req, res) => {
     const body =
       "(function(){\n" +
       source.replace(/^export /gm, "") +
-      "\nwindow.__SOFTUI_PROTOCOL__ = { LegacyV1Codec: LegacyV1Codec, parseStatusFrame: parseStatusFrame, encodeStatusFrame: encodeStatusFrame, checksum: checksum, ProtocolError: ProtocolError };\n})();\n";
+      "\nwindow.__SOFTUI_PROTOCOL__ = { " +
+      // ⚠️ 改名 / 新增导出时必须同步这里：漏一个就是「源码里明明有、
+      //    运行时 window.__SOFTUI_PROTOCOL__ 上却是 undefined」，
+      //    报错还会指到桩里那句完全无关的调用上。
+      [
+        "FrameParser",
+        "LegacyV1Codec",
+        "parseUpFrame",
+        "parseStatusFrame",
+        "encodeStatusFrame",
+        "checksum",
+        "ProtocolError",
+        "FUNCTION",
+        "SCALE",
+        "MAGIC_DOWN",
+        "MAGIC_UP_V1",
+        "MAGIC_UP_V2",
+        "DEV_SYS",
+        "DEV_DRIVE",
+        "DEV_TENSION",
+        "DEV_CALIB",
+        "healthLabel",
+        "calibStatusLabel",
+        "calibStageLabel",
+        "calibErrorLabel",
+        "encodeVersionNegotiation",
+        "encodeMotorCommand",
+        "encodeMultiMotorCommand",
+        "encodeHomeCommand",
+        "encodeCustomMotorCommand",
+        "encodeSensorInit",
+        "encodeSensorRead",
+        "encodeSensorReadAll",
+        "encodeSensorCalibration",
+        "encodePerceptZero",
+        "encodeSetMountDirection",
+        "encodeGravityCompensation",
+        "encodeSingleBendCommand",
+        "encodeActiveControlCommand",
+        "encodeBalanceCalibration",
+      ]
+        .map(function (name) { return name + ": " + name; })
+        .join(", ") +
+      " };\n})();\n";
     return send(
       res,
       200,

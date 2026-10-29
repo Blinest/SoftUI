@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use crate::protocol::{self, DeviceStatus, ProtocolError};
+use crate::protocol::{self, DeviceStatus, ProtocolError, ProtocolVersion};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,8 +306,9 @@ impl SimulatorTransport {
     fn enqueue_next_status(&mut self) -> Result<(), TransportError> {
         let status = simulated_status(self.sequence);
         self.sequence = self.sequence.saturating_add(1);
+        // 模拟设备直接发 V2（0x55 + 设备ID）上行帧：无硬件时也能把新协议路径跑通。
         self.pending_reads
-            .push_back(protocol::encode_status_frame(&status)?);
+            .push_back(protocol::encode_status_frame(&status, ProtocolVersion::V2)?);
         Ok(())
     }
 }
@@ -356,10 +357,14 @@ fn simulated_status(sequence: u64) -> DeviceStatus {
     let sensors = (0..6)
         .map(|index| {
             let phase = sequence as f64 / 1.8 + index as f64;
+            // 指令集：每路是「一条张力通道」而不是三轴传感器 ——
+            //   x = 滤波 + 通道平衡后的张力；y = 原始值；z = 保留
+            let filtered = 32.0 + phase.sin() * 3.2;
+            let actual = filtered + (phase * 2.3).cos() * 0.35;
+            // x = 实际值（未滤波），y = 滤波值 —— 与固件的口径一致
             protocol::SensorData {
-                x: 32.0 + phase.sin() * 3.2,
-                y: 18.0 + phase.cos() * 2.1,
-                z: 11.5 + (phase * 0.7).sin() * 1.4,
+                x: actual,
+                y: filtered,
             }
         })
         .collect::<Vec<_>>();
@@ -369,8 +374,8 @@ fn simulated_status(sequence: u64) -> DeviceStatus {
         num_sensors: sensors.len() as u8,
         motors,
         sensors,
-        bend_angle1_deg: (sequence as f64 / 2.0).sin() * 46.8 + 15.6,
-        bend_angle2_deg: (sequence as f64 / 2.0 + 0.6).sin() * 38.4 + 12.8,
+        scale: (sequence as f64 / 2.0).sin() * 46.8 + 15.6,
+        arm_bend: (sequence as f64 / 2.0 + 0.6).sin() * 38.4 + 12.8,
         system_state: 1,
     }
 }
@@ -378,16 +383,24 @@ fn simulated_status(sequence: u64) -> DeviceStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{encode_motor_command, parse_status_frame};
+    use crate::protocol::{encode_motor_command, FrameParser, UpMessage};
     use serialport::{SerialPortInfo, SerialPortType, UsbPortInfo};
 
     #[test]
-    fn simulator_read_returns_legacy_status_frame() {
+    fn simulator_read_returns_v2_status_frame() {
         let mut transport = SimulatorTransport::with_seed(12).expect("simulator");
 
         let bytes = transport.read().expect("read");
-        let status = parse_status_frame(&bytes).expect("status");
+        assert_eq!(bytes[0], protocol::MAGIC_UP_V2, "模拟设备应发 V2 上行帧");
+        assert_eq!(bytes[1], protocol::DEV_DRIVE);
 
+        let mut parser = FrameParser::new();
+        let status = match parser.push_bytes(&bytes).into_iter().next().expect("frame") {
+            Ok(UpMessage::Status(status)) => status,
+            other => panic!("期望状态帧，实际 {other:?}"),
+        };
+
+        assert_eq!(parser.last_version(), 2);
         assert_eq!(status.num_motors, 6);
         assert_eq!(status.num_sensors, 6);
         assert_eq!(status.system_state, 1);
@@ -396,13 +409,14 @@ mod tests {
     #[test]
     fn simulator_records_written_command_and_generates_followup_status() {
         let mut transport = SimulatorTransport::new().expect("simulator");
-        let command = encode_motor_command(1, 5.0, 10.0, 3.0).expect("command");
+        let command = encode_motor_command(1, 5.0, 10.0).expect("command");
 
         transport.write(&command).expect("write");
-        let status = parse_status_frame(&transport.read().expect("read")).expect("status");
+        let mut parser = FrameParser::new();
+        let decoded = parser.push_bytes(&transport.read().expect("read"));
 
         assert_eq!(transport.written_frames(), &[command]);
-        assert_eq!(status.num_motors, 6);
+        assert!(matches!(decoded[0], Ok(UpMessage::Status(_))));
     }
 
     #[test]

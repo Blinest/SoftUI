@@ -88,6 +88,13 @@ export interface CardGridProps {
   /** 布局的持久化标识，变化时跳过占位动画，避免整屏卡片一起飞。 */
   layoutKey?: string;
   ariaLabel?: string;
+  /**
+   * 行高上限（px）。用于**打断"量容器 → 行高变大 → 容器变高"的反馈回路** ✗：
+   * 容器是 min-height 时它会跟着内容长 ✓，量出来的可用高度越来越大 ✓，
+   * 行高一路顶到内置上限（400）✗，然后再也缩不回来 ✗。
+   * 传一个明确的上限后，行高不再随容器增长 ✓。
+   */
+  maxRowHeight?: number;
 }
 
 /**
@@ -106,6 +113,7 @@ export function CardGrid({
   draggableForCard,
   layoutKey,
   ariaLabel = "卡片布局",
+  maxRowHeight,
 }: CardGridProps) {
   const gridRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragSession | null>(null);
@@ -163,9 +171,10 @@ export function CardGrid({
   const metrics = useMemo(() => {
     if (box.height <= 0 || rowCount <= 0) return baseMetrics;
     const available = box.height - (rowCount - 1) * baseMetrics.gap;
-    const rowHeight = Math.max(150, Math.min(400, Math.floor(available / rowCount)));
+    const cap = Math.min(400, maxRowHeight ?? 400);
+    const rowHeight = Math.max(150, Math.min(cap, Math.floor(available / rowCount)));
     return { ...baseMetrics, rowHeight };
-  }, [baseMetrics, box.height, rowCount]);
+  }, [baseMetrics, box.height, rowCount, maxRowHeight]);
 
   const contentHeight = rowCount > 0
     ? rowCount * metrics.rowHeight + (rowCount - 1) * metrics.gap
@@ -434,13 +443,16 @@ export function CardGrid({
         const geometry = dragging ? overlay : geometryFor(card.id);
         return (
           <article
-            className={`feature-card${dragging ? " is-dragging" : ""}${editable ? " is-editable" : ""}`}
+            className={`feature-card tilt-card${dragging ? " is-dragging" : ""}${editable ? " is-editable" : ""}`}
             key={card.id}
             role="region"
             aria-label={header?.title}
             style={geometry
               ? {
-                transform: `translate(${geometry.x}px, ${geometry.y}px)`,
+                // 位置用**独立的 translate 属性**，不是 transform。
+                // 行内 transform 会压过 CSS 里 .tilt-card 的倾斜（行内样式优先级最高），
+                // 倾斜就彻底失效；拆成两个属性后各管一段，互不干扰。
+                translate: `${geometry.x}px ${geometry.y}px`,
                 width: `${geometry.width}px`,
                 height: `${geometry.height}px`,
               }
@@ -465,11 +477,15 @@ export function CardGrid({
                       onPointerUp={() => endDrag()}
                       onPointerCancel={() => endDrag(true)}
                     >
-                      <GripVertical className="feature-card-grip" aria-hidden="true" size={14} />
+                      <GripVertical className="feature-card-grip" aria-hidden="true" size={20} height={20} viewBox="5 0 15 25" />
                     </span>
                   ) : null}
-                  {header.icon}
-                  <h2>{header.title}</h2>
+                  {/* 图标**放进 h2 里** ✓ —— 这样图标与标题天然同一行，
+                      不再依赖 flex 换行策略（那种策略被别的规则覆盖过 ✗）*/}
+                  <h2>
+                    {header.icon ? <span className="feature-card-title-icon">{header.icon}</span> : null}
+                    {header.title}
+                  </h2>
                 </div>
                 <div className="feature-card-action">
                   {header.action}

@@ -9,12 +9,12 @@ export interface WorkbenchLayoutProps {
   contextLabel?: string;
 }
 
-/** 设备工作台模板：左侧设备上下文栏 + 顶部视图标签 + 右侧任务区。 */
+/** 设备工作台模板：左侧设备管理区栏 + 顶部视图标签 + 右侧任务区。 */
 export function WorkbenchLayout({
   context,
   tabs,
   children,
-  contextLabel = "设备上下文",
+  contextLabel = "设备管理区",
 }: WorkbenchLayoutProps) {
   const [collapsed, setCollapsed] = useState(false);
   return (

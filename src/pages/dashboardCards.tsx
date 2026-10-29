@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
+import { readPolicyLog } from "../robot/policyEngine";
+
 import { sessionBelongsToDevice } from "../robot/sessionMatch";
 import type {
   DashboardCardId,
@@ -112,10 +114,21 @@ export const dashboardCardRegistry: Record<DashboardCardId, DashboardCardDefinit
     icon: AlertTriangle,
     render: ({ snapshot }) => {
       const deviceId = snapshot.live.selectedDeviceId;
-      const alerts = snapshot.logs
+      const deviceAlerts = snapshot.logs
         .filter((entry) => (entry.level === "error" || entry.level === "warn")
-          && (!entry.deviceId || entry.deviceId === deviceId))
-        .slice(0, 3);
+          && (!entry.deviceId || entry.deviceId === deviceId));
+
+      // **策略编排的失败**也进告警 ✓（原来只在策略卡里自己看 ✗）
+      const policyAlerts = readPolicyLog()
+        .filter((entry) => !entry.ok)
+        .slice(0, 3)
+        .map((entry) => ({
+          id: `policy-${entry.id}`,
+          level: "warn" as const,
+          message: `策略「${entry.ruleNote}」执行失败：${entry.error ?? entry.reason}`,
+        }));
+
+      const alerts = [...policyAlerts, ...deviceAlerts].slice(0, 3);
       return alerts.length > 0 ? (
         <div className="feature-list">
           {alerts.map((entry) => (

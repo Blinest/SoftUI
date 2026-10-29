@@ -7,6 +7,10 @@
   grid-template-columns: 224px minmax(0, 1fr);
   grid-template-rows: 56px minmax(0, 1fr) 28px;
   overflow: hidden;
+  /* 背景保持**干净的平色**：磨砂只做在卡片上（.tilt-card）。
+     之前给页面铺过色斑 / 点阵 / 颗粒，是想让玻璃"有东西可糊"，但那等于拿整站观感
+     去换卡片的质感，代价太大，已全部撤掉。卡片的磨砂改由它自己的半透明底 +
+     颗粒 + 受光面 + 边框高光撑起来，不依赖背后有什么。 */
   background: var(--surface-page);
   color: var(--text-primary);
   transition: grid-template-columns 180ms ease;
@@ -72,6 +76,8 @@
 }
 
 .sidebar-nav {
+  /* 滑块的定位参照：绝对定位子元素挂在它的 padding box 上 */
+  position: relative;
   display: grid;
   gap: 20px;
   padding: 16px 12px;
@@ -91,6 +97,9 @@
 }
 
 .sidebar-nav-link {
+  /* 位置化的菜单项才盖得住绝对定位的滑块（否则滑块会压住文字） */
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -100,6 +109,9 @@
   border-radius: var(--radius-card);
   color: var(--text-sidebar);
   text-decoration: none;
+  /* 移动端点击时浏览器会糊一层半透明黑（tap highlight），正好压掉玻璃底。
+     按下反馈改由胶囊的柔光提供，这里把它关掉。 */
+  -webkit-tap-highlight-color: transparent;
 }
 
 .sidebar-nav-link > span {
@@ -109,10 +121,23 @@
   white-space: nowrap;
 }
 
-.sidebar-nav-link:hover,
-.sidebar-nav-link.is-active {
+/* 悬停底色只在**非当前项**上给。
+ *
+ * 否则会出现这个现象：点一个非当前项 → 它变成当前项，可指针还停在原地，
+ * 于是悬停底色继续盖在玻璃胶囊上；深色主题的 --surface-page（#171f25）几乎是黑的，
+ * 菜单项又在 z-index: 1，正好把 z-index: 0 的胶囊整个压掉 —— 看起来就是
+ * "点击后被黑色覆盖"。 */
+.sidebar-nav-link:hover:not(.is-active) {
   border-color: var(--border-default);
   background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+/* 选中态刻意**不画 background / border**：那两样现在由 .nav-sliding-indicator 承担，
+   它是会连续移动的那一层，这里再画一次就会叠成两层、而且切换时瞬间跳变。
+   也刻意不动 font-weight —— 改字重会让文字重新排版、每个字的宽度跳一下，
+   那正是"文字不稳定"的来源。选中感由滑块 + 文字颜色一起表达。 */
+.sidebar-nav-link.is-active {
   color: var(--text-primary);
 }
 
@@ -140,6 +165,105 @@
 .app-sidebar.is-collapsed .sidebar-nav-link {
   justify-content: center;
   padding: 0;
+}
+
+/* ---- 菜单滑块：选中背景的连续移动 ----
+ *
+ * 只改这一个节点的 transform / width / height，所以过渡**中途**换目标时，浏览器会从
+ * 「当前计算值」接着走 —— 快速连点不会回弹、不会先跳回起点。这是 CSS 过渡自带的语义，
+ * 前提是别用 animation + keyframes、也别每次切换重新挂载节点。
+ *
+ * 配套要求（缺一个就会出问题）：
+ *   - 容器：position: relative
+ *   - 菜单项：position: relative + z-index: 1，否则绝对定位的滑块会压住文字
+ *   - 选中态：不要再自己画 background / border，也不要改 font-weight */
+
+/* 外壳：只负责"在哪、多大"。位置与尺寸走过渡，所以中途换目标会从当前值接着走。
+ * 视觉全交给内层胶囊，自身不画任何东西 —— 也因此**不能**加 overflow: hidden，
+ * 否则移动中被拉长的胶囊会被裁掉。
+ * 也刻意不写 will-change: transform：它会把外壳提升成合成层，可能让胶囊的
+ * backdrop-filter 采样不到后面的内容（玻璃就"糊"不出东西）。 */
+.nav-sliding-indicator {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 0;
+  pointer-events: none;
+  transition:
+    transform 260ms cubic-bezier(0.32, 0.72, 0.24, 1),
+    width 260ms cubic-bezier(0.32, 0.72, 0.24, 1),
+    height 260ms cubic-bezier(0.32, 0.72, 0.24, 1);
+}
+
+/* 半透明玻璃胶囊。三层叠出"玻璃"：
+ *   1. 半透明底色（按主题给的 --glass-pill-bg）+ 顶部微亮→透明的渐变，给一点厚度感
+ *   2. backdrop-filter 把底下的内容模糊掉（这里底下是侧栏底色，有悬停高亮或纹理时
+ *      才看得出差别）
+ *   3. ::before 的 1px 渐变描边 = 边缘那层细高光
+ * transform 由 JS 逐帧写（沿移动方向拉伸 + 到位弹性回弹），所以这里**不设 transition**。 */
+.nav-sliding-indicator__capsule {
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-card);
+  background:
+    linear-gradient(180deg, var(--glass-pill-sheen-top), var(--glass-pill-sheen-bottom) 62%),
+    var(--glass-pill-bg);
+  -webkit-backdrop-filter: blur(10px) saturate(170%);
+  backdrop-filter: blur(10px) saturate(170%);
+  box-shadow:
+    var(--glass-pill-shadow) 0 2px 10px,
+    inset 0 1px 0 var(--glass-pill-rim-soft);
+  transform-origin: 50% 50%;
+  /* 按下时柔光亮起 / 收掉要淡入淡出，别硬切。
+   * 位移不在这条里 —— 那是外壳的 transform 过渡负责的。 */
+  transition: box-shadow 200ms ease;
+}
+
+/* 边缘细高光：1px 渐变描边。用 mask 挖空中间，只留最外 1px；
+ * 比普通 border 多了"越靠左上越亮、右下收暗"的走向，才像玻璃受光。 */
+.nav-sliding-indicator__capsule::before {
+  position: absolute;
+  inset: 0;
+  padding: 1px;
+  border-radius: inherit;
+  background: linear-gradient(
+    145deg,
+    var(--glass-pill-rim-strong),
+    var(--glass-pill-rim-soft) 46%,
+    transparent 68%,
+    var(--glass-pill-rim-soft)
+  );
+  content: "";
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* 按住当前项时的外圈柔光。
+ *
+ * 画在**胶囊**上，不是画在菜单项上 —— 菜单项在 z-index: 1，它自己的任何背景或阴影
+ * 都会盖住胶囊；柔光必须和玻璃层待在同一个节点上才压得住、也才不会有"两套边框"。
+ *
+ * 半径刻意压在 9px 以内：导航容器是 overflow: auto（侧栏 padding 12px、
+ * 设置栏 padding 10px），更大的光辉会被裁出一条硬直边，反而更难看。
+ * 想要更散的柔光，得先把容器 padding 放大。 */
+.sidebar-nav:has(.sidebar-nav-link.is-active:active) .nav-sliding-indicator__capsule,
+.settings-navigation-tabs:has(.settings-nav-item.is-active:active) .nav-sliding-indicator__capsule {
+  box-shadow:
+    var(--glass-pill-glow) 0 0 0 1px,
+    var(--glass-pill-glow) 0 0 9px 1px,
+    var(--glass-pill-glow-soft) inset 0 0 12px,
+    var(--glass-pill-shadow) 0 2px 10px,
+    inset 0 1px 0 var(--glass-pill-rim-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nav-sliding-indicator,
+  .nav-sliding-indicator__capsule {
+    transition: none;
+  }
 }
 
 /* ---- 全局状态栏 ---- */

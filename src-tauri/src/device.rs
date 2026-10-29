@@ -1,5 +1,8 @@
 use crate::{
-    protocol::{DeviceStatus, LegacyV1Codec, ProtocolError},
+    protocol::{
+        encode_version_negotiation, CalibrationEvent, DeviceStatus, FrameParser, ProtocolError,
+        TensionFrame, UpMessage,
+    },
     transport::{SerialConnectionConfig, SerialTransport, Transport, TransportError},
 };
 use serde::{Deserialize, Serialize};
@@ -63,6 +66,14 @@ impl DeviceRegistry {
             configs: HashMap::new(),
             next_connection: 1,
         }
+    }
+
+    /// 这个 device_id 是否对应一条**真实存在的传输通道**（能真正收到字节）。
+    ///
+    /// 用来替代早期"按 `serial:` 前缀判断"的写法 —— 见 `lib.rs` 的
+    /// `device_has_transport` 注释。
+    pub fn contains(&self, device_id: &str) -> bool {
+        self.records.contains_key(device_id)
     }
 
     pub fn list(&self) -> Vec<DeviceConnectionRecord> {
@@ -176,6 +187,87 @@ impl DeviceRegistry {
             .collect()
     }
 
+    /// **收到设备帧 → 链路已通** ✓ —— 把握手态推进到 `Ready` ✓。
+    ///
+    /// 为什么必须有 ✗：`P1` 本地解析模式下（前端默认 ✓），浏览器把原始字节
+    /// **自己解析** ✓，只把解析后的帧经 `frame_ingest` 上报 ✓，
+    /// **原始字节从不到后端**✗ → 后端的 `handshake()` 永远等不到应答 ✓ →
+    /// 状态卡在 `Handshaking` ✗ → 安全判定 `connected = false` ✓ →
+    /// 界面"一直握手中、控制全不可用"✗（本 bug ✓）。
+    ///
+    /// 语义上也更对 ✓：帧能进来，就说明端口打开 ✓、波特率对 ✓、协议在跑 ✓。
+    pub fn note_frame(&mut self, device_id: &str) {
+        let Some(record) = self.records.get(device_id).cloned() else {
+            return;
+        };
+        let Some(runtime) = self.serial_devices.get_mut(&record.port_name) else {
+            return;
+        };
+        if matches!(
+            runtime.state,
+            DeviceConnectionState::Handshaking
+                | DeviceConnectionState::Reconnecting
+                | DeviceConnectionState::Error
+        ) {
+            runtime.state = DeviceConnectionState::Ready;
+        }
+        let next_state = runtime.state.clone();
+        if let Some(record) = self.records.get_mut(device_id) {
+            record.state = next_state;
+        }
+    }
+
+    /// **浏览器上报的已解析帧 → 推进接收帧计数** ✓。
+    ///
+    /// 为什么必须单独记 ✗：`received_frames` 原来只在后端自己的
+    /// `poll_status()`（读字节 + 解析 ✓）里递增 ✓。
+    /// 而 `P1` 本地解析模式下，字节由浏览器解析 ✓、后端**读不到原始字节**✗，
+    /// 加上"浏览器持有的串口不做状态轮询" ✓ → 这个计数永远停在 0 ✗ →
+    /// 界面上"接收帧 0"，但数据其实是通的 ✓（本 bug ✓）。
+    ///
+    /// 只给 `frame_ingest` 用 ✓；`webserial_push`（原始字节路径）不调它 ✗，
+    /// 否则会和 `poll_status` 重复计数 ✓。
+    pub fn note_ingested_frame(&mut self, device_id: &str) {
+        let Some(record) = self.records.get(device_id).cloned() else {
+            return;
+        };
+        let Some(runtime) = self.serial_devices.get_mut(&record.port_name) else {
+            return;
+        };
+        runtime.received_frames = runtime.received_frames.saturating_add(1);
+        runtime.last_frame_ms = now_ms();
+        runtime.last_ingest_ms = now_ms();
+    }
+
+    /// **这个端口最近是否有客户端在做本地解析** ✓。
+    ///
+    /// 有 → `webserial_push` 的原始字节应当**丢弃** ✓：
+    /// 否则解析器会同时吃到"已解析帧"和"原始字节"两份数据 ✓ →
+    /// 半包 / 重复块 → 协议错误疯长 ✗（现场现象 ✓）。
+    pub fn has_recent_ingest(&self, port_name: &str, window_ms: u64) -> bool {
+        let Some(runtime) = self.serial_devices.get(port_name) else {
+            return false;
+        };
+        runtime.last_ingest_ms > 0 && now_ms().saturating_sub(runtime.last_ingest_ms) < window_ms
+    }
+
+    /// **按端口名推进握手态** ✓ —— 给"浏览器把原始字节推上来"那条路径用 ✓。
+    ///
+    /// 两条上报路径要**都**覆盖 ✗：
+    ///   · `P1` 本地解析 → `frame_ingest`（解析后的帧 ✓）
+    ///   · 老路径 → `webserial_push`（原始字节 ✓，后端自己解析 ✓）
+    /// 只修一条的话，另一条仍然卡在 `Handshaking` ✓（实测 ✓）。
+    pub fn note_port_activity(&mut self, port_name: &str) {
+        let device_id = self
+            .records
+            .iter()
+            .find(|(_, record)| record.port_name == port_name)
+            .map(|(id, _)| id.clone());
+        if let Some(device_id) = device_id {
+            self.note_frame(&device_id);
+        }
+    }
+
     pub fn mark_control_enabled(
         &mut self,
         device_id: &str,
@@ -228,11 +320,64 @@ impl DeviceRegistry {
                 continue;
             };
             let reconnect_config = self.configs.get(&record.port_name).cloned();
+            /**
+             * ⚠ **浏览器持有的串口（`webserial:*`）后端一律不碰** ✗。
+             *
+             * 这类设备的真实端口在**操作员的电脑上** ✓，数据由浏览器解析后上报 ✓。
+             * 后端在本机 `SerialTransport::open("webserial:0")` 必然失败 ✓ →
+             * `mark_reconnecting` → 每秒重试 ✓ → 界面永远显示"重连中"✗、
+             * 而且会把这个**根本用不了的设备**留在列表里 ✓（现场现象 ✓）。
+             */
+            let browser_owned = record.port_name.starts_with("webserial:");
             let Some(runtime) = self.serial_devices.get_mut(&record.port_name) else {
                 continue;
             };
 
-            let (status, error, error_code) = if runtime.state
+            let (status, error, error_code) = if browser_owned {
+                /**
+                 * ⚠ **命令队列照常刷** ✗ —— 这是"电机全都不动、但反馈正常"的根因 ✓。
+                 *
+                 * 浏览器持有的串口：数据由浏览器读 ✓，但**下行命令**必须先由这里
+                 * 把队列里的帧写进 `WebSerialTransport` 的 tx 缓冲 ✓，
+                 * 浏览器再靠 `webserial_wait_tx` 拉走写串口 ✓。
+                 * 上一版为了"后端别碰浏览器串口"把这一段整个跳过了 ✗ →
+                 * 命令永远停在 `pending_commands` 里 ✓ → 下位机收不到任何帧 ✗，
+                 * 而**读取路径完全不受影响** ✓（所以反馈照常解析 ✓，正是现场现象 ✓）。
+                 *
+                 * 这里只跳过：打开串口 ✓、重连 ✓、状态超时判定 ✓。
+                 */
+                let queue_error = runtime.flush_command_queue().err();
+                /**
+                 * **心跳超时** ✓ —— 浏览器端断开后必须让状态跟着掉 ✗。
+                 *
+                 * 页面刷新 / 关标签时浏览器会 `sendBeacon` 注销 ✓，
+                 * 但崩溃、断网、强杀进程时不会 ✓ → 后端留着一条"已连接"✗ →
+                 * 界面显示连着、**接收帧永远不涨**✗（现场现象 ✓）。
+                 * 判据用"超过 **120 秒**没有新帧"✓ —— 原来是 15 秒 ✗，
+                 * 太激进：固件校验没对齐时**所有帧都被丢弃** ✓ →
+                 * 15 秒后状态被打成 Error ✗ → 之后连"启动控制系统"都被拖累 ✓
+                 * （实测：点启动/关闭都没反应 ✓）。
+                 * 120 秒足够区分"浏览器真的没了"，又不会误伤正在排障的现场 ✓。
+                 */
+                if runtime.last_frame_ms > 0
+                    && now_ms().saturating_sub(runtime.last_frame_ms) > 120_000
+                    && matches!(
+                        runtime.state,
+                        DeviceConnectionState::Ready | DeviceConnectionState::Enabled
+                    )
+                {
+                    runtime.state = DeviceConnectionState::Error;
+                    runtime.last_error = Some("超过 120 秒没有收到任何帧（浏览器端可能已断开）".into());
+                    runtime.last_error_code = Some("StaleBrowserSession".into());
+                }
+                if let Some(error) = queue_error {
+                    let code = error.code().to_string();
+                    runtime.remember_error_with_code(format!("{error:?}"), code.clone());
+                    (None, Some(format!("{error:?}")), Some(code))
+                } else {
+                    (None, None, None)
+                }
+            } else if runtime.state
                 == DeviceConnectionState::Reconnecting
                 || runtime.state == DeviceConnectionState::Error
             {
@@ -421,6 +566,18 @@ impl DeviceRegistry {
     fn reserve_for_test(&mut self, record: DeviceConnectionRecord) {
         self.records.insert(record.device_id.clone(), record);
     }
+
+    /// 连同**传输通道**一起登记：`send_command` 要按 port_name 取 runtime，
+    /// 只登记 records 的话会以 DeviceNotFound 失败（测发送链路时必须用这个）。
+    #[cfg(test)]
+    fn reserve_runtime_for_test(&mut self, record: DeviceConnectionRecord) {
+        let transport = crate::transport::SimulatorTransport::new().expect("simulator should start");
+        self.serial_devices.insert(
+            record.port_name.clone(),
+            DeviceRuntime::new(Box::new(transport) as Box<dyn Transport>),
+        );
+        self.records.insert(record.device_id.clone(), record);
+    }
 }
 
 impl Default for DeviceRegistry {
@@ -475,6 +632,12 @@ pub struct RuntimeStatus {
     pub last_status: Option<DeviceStatus>,
     pub received_frames: u64,
     pub protocol_errors: u64,
+    /// **最近一次 `frame_ingest`（浏览器本地解析后上报）的时刻** ✓
+    ///
+    /// 用来判断"是否已经有客户端在做本地解析" ✓ ——
+    /// 有的话就不该再接受原始字节（`webserial_push`）✗，
+    /// 否则两个来源同时喂解析器 → 重复/交错 → 协议错误疯长 ✗（现场现象 ✓）。
+    pub last_ingest_ms: u64,
     pub sent_commands: u64,
     pub pending_commands: usize,
     pub reconnect_attempts: u32,
@@ -490,11 +653,27 @@ pub struct RuntimeStatus {
     pub control_enabled: bool,
     pub last_error: Option<String>,
     pub last_error_code: Option<String>,
+
+    // ── 指令集 V2：多设备上行 ──
+    /// 当前上行协议版本：1 = Legacy V1（`0xBB`），2 = V2（`0x55` + 设备 ID）。
+    pub protocol_version: u8,
+    /// 是否已回过版本协商（`AA 09 01 02`）。只需发一次。
+    pub protocol_negotiated: bool,
+    /// 累计收到的张力感知帧（`0x02` / V1 `0x03`）数量。
+    pub tension_frames: u64,
+    /// 累计收到的标定事件帧（`0x03` / V1 `0x04`）数量。
+    pub calibration_events: u64,
+    /// 累计收到的未识别帧（预留设备 / 未知功能码）数量。
+    pub unknown_frames: u64,
+    /// 最近一帧张力感知。
+    pub last_tension: Option<TensionFrame>,
+    /// 最近一次标定事件。
+    pub last_calibration: Option<CalibrationEvent>,
 }
 
 pub struct DeviceRuntime<T: Transport> {
     transport: T,
-    codec: LegacyV1Codec,
+    parser: FrameParser,
     state: DeviceConnectionState,
     last_status: Option<DeviceStatus>,
     received_frames: u64,
@@ -504,6 +683,9 @@ pub struct DeviceRuntime<T: Transport> {
     reconnect_attempts: u32,
     last_reconnect_ms: u64,
     last_frame_ms: u64,
+    /// **最近一次 `frame_ingest`（浏览器本地解析后上报）的时刻** ✓
+    /// 用来判断"是否已有客户端在做本地解析" ✓
+    last_ingest_ms: u64,
     last_command_ms: u64,
     command_high_watermark: usize,
     emergency_latched: bool,
@@ -511,13 +693,20 @@ pub struct DeviceRuntime<T: Transport> {
     control_enabled: bool,
     last_error: Option<String>,
     last_error_code: Option<String>,
+    /// 已经回过版本协商，不要重复发。
+    protocol_negotiated: bool,
+    tension_frames: u64,
+    calibration_events: u64,
+    unknown_frames: u64,
+    last_tension: Option<TensionFrame>,
+    last_calibration: Option<CalibrationEvent>,
 }
 
 impl<T: Transport> DeviceRuntime<T> {
     pub fn new(transport: T) -> Self {
         Self {
             transport,
-            codec: LegacyV1Codec::new(),
+            parser: FrameParser::new(),
             state: DeviceConnectionState::Idle,
             last_status: None,
             received_frames: 0,
@@ -527,12 +716,19 @@ impl<T: Transport> DeviceRuntime<T> {
             reconnect_attempts: 0,
             last_reconnect_ms: 0,
             last_frame_ms: 0,
+            last_ingest_ms: 0,
             last_command_ms: 0,
             command_high_watermark: 0,
             emergency_latched: false,
             control_enabled: false,
             last_error: None,
             last_error_code: None,
+            protocol_negotiated: false,
+            tension_frames: 0,
+            calibration_events: 0,
+            unknown_frames: 0,
+            last_tension: None,
+            last_calibration: None,
         }
     }
 
@@ -542,6 +738,7 @@ impl<T: Transport> DeviceRuntime<T> {
             last_status: self.last_status.clone(),
             received_frames: self.received_frames,
             protocol_errors: self.protocol_errors,
+            last_ingest_ms: self.last_ingest_ms,
             sent_commands: self.sent_commands,
             pending_commands: self.pending_commands.len(),
             reconnect_attempts: self.reconnect_attempts,
@@ -552,6 +749,13 @@ impl<T: Transport> DeviceRuntime<T> {
             control_enabled: self.control_enabled,
             last_error: self.last_error.clone(),
             last_error_code: self.last_error_code.clone(),
+            protocol_version: self.parser.last_version(),
+            protocol_negotiated: self.protocol_negotiated,
+            tension_frames: self.tension_frames,
+            calibration_events: self.calibration_events,
+            unknown_frames: self.unknown_frames,
+            last_tension: self.last_tension.clone(),
+            last_calibration: self.last_calibration,
         }
     }
 
@@ -579,11 +783,18 @@ impl<T: Transport> DeviceRuntime<T> {
                 return Err(DeviceRuntimeError::Transport(error));
             }
         };
-        let decoded = self.codec.push_bytes(&bytes);
+        let decoded = self.parser.push_bytes(&bytes);
+        if decoded.is_empty() {
+            return Err(DeviceRuntimeError::NoStatusFrame);
+        }
+
+        let mut last_status: Option<DeviceStatus> = None;
+        let mut first_error: Option<ProtocolError> = None;
 
         for frame in decoded {
             match frame {
-                Ok(status) => {
+                // ── 系统状态帧：唯一会推进设备状态的帧 ──
+                Ok(UpMessage::Status(status)) => {
                     self.received_frames = self.received_frames.saturating_add(1);
                     self.last_status = Some(status.clone());
                     self.last_frame_ms = now_ms();
@@ -606,19 +817,74 @@ impl<T: Transport> DeviceRuntime<T> {
                     } else {
                         DeviceConnectionState::Ready
                     };
-                    return Ok(status);
+                    last_status = Some(status);
+                }
+                // ── 张力感知帧 / 标定事件帧：只记账，不推进设备状态 ──
+                Ok(UpMessage::Tension(tension)) => {
+                    self.tension_frames = self.tension_frames.saturating_add(1);
+                    self.last_tension = Some(tension);
+                }
+                Ok(UpMessage::Calibration(event)) => {
+                    self.calibration_events = self.calibration_events.saturating_add(1);
+                    self.last_calibration = Some(event);
+                }
+                // ── 握手应答：下位机确认已切到 V2 ──
+                Ok(UpMessage::Handshake(_)) => {
+                    self.protocol_negotiated = true;
+                }
+                Ok(UpMessage::Unknown(_)) => {
+                    self.unknown_frames = self.unknown_frames.saturating_add(1);
                 }
                 Err(error) => {
                     self.protocol_errors = self.protocol_errors.saturating_add(1);
-                    self.state = DeviceConnectionState::Error;
                     self.last_error = Some(format!("{error:?}"));
                     self.last_error_code = Some("PROTOCOL_FRAME".to_string());
-                    return Err(DeviceRuntimeError::Protocol(error));
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
         }
 
-        Err(DeviceRuntimeError::NoStatusFrame)
+        // 下位机上电默认发 V1；确认收到过帧之后再发一次协商，切到 V2 上行。
+        // 只需一次：「默认 V1 → 上位机声明支持 V2 → 下位机切 V2」是一次性动作。
+        if last_status.is_some() {
+            self.maybe_queue_protocol_negotiation();
+        }
+
+        if let Some(status) = last_status {
+            return Ok(status);
+        }
+        // 这一批里一个状态帧都没有：可能是只收到了张力帧（500ms 一帧，与状态的
+        // 200ms 节奏不同），也可能是校验错。前者不算故障，后者才置 Error。
+        match first_error {
+            Some(error) => {
+                self.state = DeviceConnectionState::Error;
+                Err(DeviceRuntimeError::Protocol(error))
+            }
+            None => Err(DeviceRuntimeError::NoStatusFrame),
+        }
+    }
+
+    /// 发一次版本协商（`AA 09 01 02`），让下位机把上行切到 V2。
+    ///
+    /// 只发一次：下位机已经是 V2（收到过 `0x55` 帧）或已回过握手应答时都不再发，
+    /// 否则会变成每 200ms 一次的噪声。
+    fn maybe_queue_protocol_negotiation(&mut self) {
+        if self.protocol_negotiated || self.parser.last_version() >= 2 {
+            self.protocol_negotiated = true;
+            return;
+        }
+        let Ok(frame) = encode_version_negotiation(2) else {
+            return;
+        };
+        // **直接写出，不排进 pending_commands**：协商是一次性动作，而队列会被
+        // `mark_control_enabled(false)` 与急停清空 —— 帧被清掉、标志却已置位，
+        // 就再也不会协商，表现是"下位机永远停在 V1"且毫无线索。
+        // 整帧写进串口不会和队列里的用户命令错位：串口是字节流，整帧不会互相穿插。
+        if self.send_command(&frame).is_ok() {
+            self.protocol_negotiated = true;
+        }
     }
 
     pub fn send_command(&mut self, frame: &[u8]) -> Result<(), DeviceRuntimeError> {
@@ -731,10 +997,12 @@ impl<T: Transport> DeviceRuntime<T> {
 impl DeviceRuntime<Box<dyn Transport>> {
     pub fn replace_transport(&mut self, transport: Box<dyn Transport>) {
         self.transport = transport;
-        self.codec = LegacyV1Codec::new();
+        self.parser = FrameParser::new();
         self.state = DeviceConnectionState::Handshaking;
         self.last_error = None;
         self.last_error_code = None;
+        // 换了物理链路就要重新协商：新设备可能只认 V1。
+        self.protocol_negotiated = false;
     }
 }
 
@@ -806,7 +1074,7 @@ mod tests {
     fn runtime_sends_commands_through_transport() {
         let transport = SimulatorTransport::new().expect("simulator");
         let mut runtime = DeviceRuntime::new(transport);
-        let command = encode_motor_command(2, 10.0, 12.0, 4.0).expect("command");
+        let command = encode_motor_command(2, 10.0, 12.0).expect("command");
 
         runtime.send_command(&command).expect("send");
         let status = runtime.status();
@@ -820,7 +1088,7 @@ mod tests {
     fn normal_command_waits_for_background_flush() {
         let transport = SimulatorTransport::new().expect("simulator");
         let mut runtime = DeviceRuntime::new(transport);
-        let command = encode_motor_command(2, 10.0, 12.0, 4.0).expect("command");
+        let command = encode_motor_command(2, 10.0, 12.0).expect("command");
 
         runtime.enqueue_command(command.clone(), CommandPriority::Normal);
         assert_eq!(runtime.status().pending_commands, 1);
@@ -840,7 +1108,7 @@ mod tests {
     fn emergency_command_clears_normal_pending_commands() {
         let transport = SimulatorTransport::new().expect("simulator");
         let mut runtime = DeviceRuntime::new(transport);
-        let normal = encode_motor_command(2, 10.0, 12.0, 4.0).expect("command");
+        let normal = encode_motor_command(2, 10.0, 12.0).expect("command");
         let emergency =
             encode_system_control_command(SystemControlAction::EmergencyStop).expect("emergency");
 
@@ -854,6 +1122,76 @@ mod tests {
         let transport = runtime.into_transport();
 
         assert_eq!(transport.written_frames(), &[emergency]);
+    }
+
+    /// V2 上行帧的头部是 4 字节（`55 设备ID 功能码 LEN`），V1 是 3 字节（`BB 功能码 LEN`）。
+    /// 同一个数据段换头即可得到一帧合法的 V1 帧。
+    fn to_legacy_v1_frame(v2_frame: &[u8]) -> Vec<u8> {
+        let len = v2_frame[3] as usize;
+        let mut frame = vec![0xBB, 0x02, len as u8];
+        frame.extend_from_slice(&v2_frame[4..4 + len]);
+        let sum = frame.iter().fold(0u8, |acc, byte| acc.wrapping_add(*byte));
+        frame.push(sum);
+        frame
+    }
+
+    #[test]
+    fn runtime_negotiates_v2_after_first_v1_status_frame() {
+        let mut simulator = SimulatorTransport::new().expect("simulator");
+        let v1 = to_legacy_v1_frame(&simulator.read().expect("frame"));
+        let v2 = simulator.read().expect("frame");
+
+        let transport = FragmentedTransport {
+            chunks: vec![v1, v2.clone(), v2],
+            writes: Vec::new(),
+        };
+        let mut runtime = DeviceRuntime::new(transport);
+
+        runtime.poll_status().expect("first status");
+        assert_eq!(
+            runtime.status().protocol_version,
+            1,
+            "只收到 V1 帧时协议版本必须照实报 1"
+        );
+
+        let transport = runtime.into_transport();
+        assert_eq!(
+            transport.writes,
+            vec![vec![0xAA, 0x09, 0x01, 0x02, 0xB6]],
+            "首个 V1 状态帧之后应写出一帧版本协商（AA 09 01 02）"
+        );
+    }
+
+    #[test]
+    fn runtime_skips_negotiation_when_device_already_speaks_v2() {
+        let transport = SimulatorTransport::new().expect("simulator");
+        let mut runtime = DeviceRuntime::new(transport);
+
+        // 模拟设备发的是 V2 帧，本来就无需协商。
+        runtime.poll_status().expect("status");
+        assert_eq!(runtime.status().protocol_version, 2);
+        assert!(runtime.status().protocol_negotiated);
+
+        let transport = runtime.into_transport();
+        assert!(
+            transport.written_frames().is_empty(),
+            "已经是 V2 就不该再发协商帧：{:?}",
+            transport.written_frames()
+        );
+    }
+
+    #[test]
+    fn runtime_tracks_tension_and_calibration_frames_separately() {
+        let mut runtime = DeviceRuntime::new(SimulatorTransport::new().expect("simulator"));
+
+        runtime.poll_status().expect("status");
+        let status = runtime.status();
+
+        // 状态帧计数只算状态帧：张力/标定帧是另一个节拍，混进去会让界面帧率显示虚高。
+        assert_eq!(status.received_frames, 1);
+        assert_eq!(status.tension_frames, 0);
+        assert_eq!(status.calibration_events, 0);
+        assert!(status.last_tension.is_none());
     }
 
     #[test]
@@ -911,9 +1249,37 @@ mod tests {
     }
 
     #[test]
+    fn registry_finds_devices_regardless_of_id_prefix() {
+        // ★ 回归测试：Web Serial 设备的 id 是前端给的 deviceName（如 `TDCR_v1`），
+        //   没有 `serial:` 前缀。上层曾经按前缀判断"能不能下发指令"，结果这类设备
+        //   （以及 `simulator:0`）的**每一条指令都被静默丢弃**，而审计日志照样记
+        //   "已发送" —— 现场表现是"点了没反应、设备永不确认"，查日志却一切正常。
+        let mut registry = DeviceRegistry::new();
+        registry.reserve_runtime_for_test(DeviceConnectionRecord {
+            device_id: "TDCR_v1".to_string(),
+            connection_id: "conn-1".to_string(),
+            port_name: "webserial:0".to_string(),
+            baud_rate: 115_200,
+            state: DeviceConnectionState::Ready,
+            connected_at_ms: 1,
+        });
+
+        assert!(registry.contains("TDCR_v1"), "按 id 就该找得到，与前缀无关");
+        assert!(!registry.contains("serial:COM7"), "没注册的 id 不该被找到");
+
+        let command = encode_motor_command(1, 5.0, 10.0).expect("command");
+        assert!(
+            registry
+                .send_command("TDCR_v1", &command, CommandPriority::Normal)
+                .is_ok(),
+            "无前缀的 id 也必须能进发送链路"
+        );
+    }
+
+    #[test]
     fn registry_rejects_command_for_missing_device() {
         let mut registry = DeviceRegistry::new();
-        let command = encode_motor_command(1, 5.0, 10.0, 3.0).expect("command");
+        let command = encode_motor_command(1, 5.0, 10.0).expect("command");
 
         assert_eq!(
             registry.send_command("serial:COM404", &command, CommandPriority::Normal),

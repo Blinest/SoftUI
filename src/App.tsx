@@ -6,6 +6,7 @@ import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-d
 import "./App.css";
 import { pageTitles, routeToPage } from "./app/navigation";
 import ConnectDialog from "./components/ConnectDialog";
+import { CommandPalette } from "./components/CommandPalette";
 import { AppFooter } from "./components/layout/AppFooter";
 import { GlobalStatusBar } from "./components/layout/GlobalStatusBar";
 import { SidebarNav } from "./components/layout/SidebarNav";
@@ -23,7 +24,9 @@ import {
 import { resetLayout } from "./state/layoutStore";
 import { applyTheme, writeThemePreference } from "./state/themeStore";
 import { hasPermission } from "./state/permissions";
+import { directMotorCommand, directSystemControl } from "./robot/directDispatch";
 import { errorText } from "./utils";
+import { useCardTilt } from "./components/CardTilt";
 import { downloadText, exportStamp, framesToCsv } from "./utils/download";
 import { angleDegToCurvaturePerM, curvaturePerMToAngleDeg, DEFAULT_DYNAMICS_CONFIG } from "./dynamics/svcModel";
 
@@ -398,6 +401,9 @@ function LoginPage({
 function AppShell() {
   const location = useLocation();
   const currentPage = routeToPage(location.pathname);
+  // 卡片的磨砂玻璃光斑 / 边框提亮 / 3D 倾斜：全局一份委托监听，
+  // 不给每张卡片挂状态 —— 指针每帧都在动，走 setState 会把卡片子树反复重渲染。
+  useCardTilt();
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot>(makeFallbackSnapshot);
   const [serialPorts, setSerialPorts] = useState<SerialPortDescriptor[]>([]);
   const [serialPortsError, setSerialPortsError] = useState<string | null>(null);
@@ -516,7 +522,10 @@ function AppShell() {
     void fetchSnapshot("bootstrap_state");
   }, [fetchSnapshot]);
 
-  const openConnectDialog = useCallback(() => {
+  /** 从「串口发现」点进来时带上的端口名；连接对话框打开后用它预选。 */
+  const [pendingConnectPort, setPendingConnectPort] = useState<string | null>(null);
+  const openConnectDialog = useCallback((portName?: string) => {
+    setPendingConnectPort(portName ?? null);
     setConnectionError(null);
     setConnectDialogOpen(true);
   }, []);
@@ -531,9 +540,10 @@ function AppShell() {
     document.title = `${pageTitles[currentPage]} · SoftUI 上位机`;
   }, [currentPage]);
 
-  const refreshSerialPorts = useCallback(async () => {
+  /** @param forcePick 强制弹浏览器端口选择框 —— 用于「更换 / 添加端口」。 */
+  const refreshSerialPorts = useCallback(async (forcePick?: boolean) => {
     try {
-      const ports = await invoke<SerialPortDescriptor[]>("list_serial_ports");
+      const ports = await invoke<SerialPortDescriptor[]>("list_serial_ports", { forcePick: Boolean(forcePick) });
       setSerialPorts(ports);
       setSerialPortsError(null);
     } catch (invokeError) {
@@ -576,8 +586,16 @@ function AppShell() {
     }
   }, []);
 
-  // 轻量实时更新：各页面统一 500ms 拉取最新帧 + 统计。
-  // 曲线页的高频曲线数据由 ChartsPage 独立调用 fetch_live_window(100ms) 获取。
+  /**
+   * 实时数据 / 控制页需要**高刷**（由 WorkspacePage 通过 `onLiveFastChange` 上报）。
+   *
+   * 通用节拍 500ms 对"看图"够用，但拖动实时跟随时不行 —— 设备 200ms 出一帧，再叠 500ms
+   * 轮询，显示可能晚 700ms，操作员会以为臂体没动。
+   *
+   * **上限卡在 150ms**：比设备出帧（200ms）还快没有意义，只是空转 RPC。
+   * 曲线页的高频曲线数据另走 ChartsPage 的 fetch_live_window(100ms)。
+   */
+  const [liveFast, setLiveFast] = useState(false);
   useEffect(() => {
     if (!authenticated) return;
     let pending = false;
@@ -587,9 +605,9 @@ function AppShell() {
       void fetchLiveLatest().finally(() => {
         pending = false;
       });
-    }, 500);
+    }, liveFast ? 150 : 500);
     return () => window.clearInterval(timer);
-  }, [fetchLiveLatest, authenticated]);
+  }, [fetchLiveLatest, authenticated, liveFast]);
 
   // Poll connected devices list
   const refreshConnectedDevices = useCallback(async () => {
@@ -960,7 +978,7 @@ function AppShell() {
   /**
    * 播放期间轮询整份快照。
    *
-   * ⚠ 手动控制（三维拖动 / 末端位姿 / 电机读数）、监控等区块全部从 `snapshot` 派生，
+   * ⚠ 控制（三维拖动 / 末端位姿 / 电机读数）、监控等区块全部从 `snapshot` 派生，
    *   而 `snapshot` 只在登录、迁移、以及命令回调里刷新 —— 不轮询的话，播放时这些
    *   区块会一直停在打开页面那一刻的数据（只有工作区那条走 fetch_live_latest 的会动）。
    *
@@ -992,7 +1010,75 @@ function AppShell() {
     return () => window.clearTimeout(timer);
   }, [commandNotice]);
 
+  /**
+   * **下位机状态帧确认** ✓ —— 真正代表"设备已使能"的判据 ✗ 不是 RPC 回执 ✓。
+   *
+   * 序列：点按钮 → 服务器回执（我的）→ 设备回状态帧（systemEnabled=true）✓。
+   * 第二步到了才把提示升级为成功 ✓，中间一直显示"等待状态帧"✓ 不撒谎 ✗。
+   */
+  useEffect(() => {
+    if (lastSystemControl !== "enable") return;
+    const enabled = snapshot.live.latest?.systemEnabled;
+    if (!enabled) return;
+    setCommandNotice((prev) =>
+      prev && prev.tone === "warn" && prev.message.includes("服务器数据已同步")
+        ? { tone: "ok", message: "启动控制系统：服务器数据已同步，且收到设备状态帧" }
+        : prev,
+    );
+  }, [snapshot.live.latest?.systemEnabled, lastSystemControl]);
+
   const submitSystemControl = useCallback(async (action: SystemControlAction) => {
+    /**
+     * **先响应，再确认** ✓ —— 原来必须等 RPC 回来界面才有动静 ✗。
+     *
+     * 源站是 HTTP/1.1 ✓，Cloudflare 到源站的并发连接有限 ✓ →
+     * 一次性命令经常要排队十几秒 ✗ → 操作员以为"点了没反应"✓
+     * （实测 ✓）。这里先把**意图**落到界面上 ✓，后端返回再覆盖 ✓。
+     *
+     * ⚠ 安全底线：**失败必须回滚** ✗ —— 使能状态不能让界面撒谎 ✓。
+     * 真失败时后端 `guard_command_allowed` 也会拦住后续动作 ✓（双重保险 ✓）。
+     */
+    const label =
+      action === "enable" ? "启动控制系统" : action === "emergencyStop" ? "紧急停止" : "停止控制";
+    const previous = lastSystemControl;
+    /**
+     * **本机直发优先** ✓ —— 持有串口时直接写出去 ✓（ms 级 ✓），
+     * 不再等后端排队 ✓。后端仍异步调用一次做状态对账 ✓
+     * （系统控制帧是幂等的 ✓：重复使能 / 失能 / 急停都无害 ✓）。
+     */
+    const sentDirect = directSystemControl(action);
+    setLastSystemControl(action);
+    setCommandNotice({
+      tone: "warn",
+      message: sentDirect
+        ? `${label}：已直连串口下发，服务器数据同步中…`
+        : `${label}：指令已发出，等待服务器回执…`,
+    });
+
+    /**
+     * **直发成功就不再转后端** ✓ —— 转一次会让设备再收一遍同样的帧 ✗，
+     * 多一轮往返、多一次机械动作风险 ✓，收益为零 ✓。
+     */
+    if (sentDirect) {
+      setCommandNotice({ tone: "ok", message: `${label}：已直连串口下发` });
+      /**
+       * **只记录、不发送** ✓ —— 后端据此更新 `control_enabled` / 审计 / 会话录制 ✓，
+       * 但**不会再把帧写一遍** ✓（发了就是双份动作 ✗）。
+       * 异步、不 await、失败静默 ✓：指令已经真的发出去了 ✓，对账慢不该拖界面 ✓。
+       */
+      void invoke<RuntimeSnapshot>("control_frame_log", {
+        request: {
+          deviceId: snapshot.live.selectedDeviceId,
+          kind: "system-control",
+          frameHex: sentDirect,
+          action,
+        },
+      })
+        .then((next) => setSnapshot(next))
+        .catch((error) => console.warn("[direct-dispatch] 后端对账失败（指令已发出）", error));
+      return;
+    }
+
     try {
       const next = await invoke<RuntimeSnapshot>("submit_system_control", {
         request: {
@@ -1003,14 +1089,43 @@ function AppShell() {
       setSnapshot(next);
       // 记下意图：界面靠它区分「已失能」和「未使能」。
       setLastSystemControl(action);
+      /**
+       * ⚠ 这里只代表**服务器已接收并发出帧** ✗，**不代表下位机执行成功** ✓。
+       * 下位机确认要看状态帧里的 `systemEnabled` ✓（见下面的 effect ✓）。
+       */
+      setCommandNotice({
+        tone: "warn",
+        message: `${label}：服务器数据已同步`,
+      });
     } catch (invokeError) {
-      // 命令失败必须有反馈：Tauri 的 reject 是字符串，直接并进顶层横幅。
+      // **回滚** —— 不能让界面显示"已启动"而实际没启动 ✗
+      setLastSystemControl(previous);
       console.error(invokeError);
       setCommandNotice({ tone: "error", message: errorText(invokeError, "系统操作失败") });
     }
-  }, [snapshot.live.selectedDeviceId]);
+  }, [snapshot.live.selectedDeviceId, lastSystemControl]);
 
   const sendMotorCommand = useCallback(async (command: MotorCommandDraft) => {
+    /**
+     * **单电机定位直发** ✓ —— ⚠ `0x10` 的 `dist` 是**相对距离** ✓，
+     * 所以直发成功后**绝不转后端** ✗（转了设备会走两倍距离 ✓）。
+     * 后端只做"记录不发送"的对账 ✓。
+     */
+    const motorHex = directMotorCommand(command.motorId, command.positionMm, command.velocityMmPerSec);
+    if (motorHex) {
+      void invoke<RuntimeSnapshot>("control_frame_log", {
+        request: {
+          deviceId: snapshot.live.selectedDeviceId,
+          kind: "motor",
+          frameHex: motorHex,
+          action: null,
+        },
+      })
+        .then((next) => setSnapshot(next))
+        .catch((error) => console.warn("[direct-dispatch] 后端对账失败（指令已发出）", error));
+      return;
+    }
+
     try {
       const next = await invoke<RuntimeSnapshot>("send_motor_command", {
         request: {
@@ -1125,6 +1240,9 @@ function AppShell() {
         onToggleCollapsed={() => setSidebarCollapsed((collapsed) => !collapsed)}
         permissions={snapshot.authSession.permissions}
       />
+      {/* 命令面板挂在壳层而不是某个页面里：它要能在任意页面唤起。
+          条目直接用导航那份数据（同样按权限过滤），不再维护第二份命令表。 */}
+      <CommandPalette permissions={snapshot.authSession.permissions} />
       <GlobalStatusBar
         currentDeviceLabel={snapshot.live.selectedDeviceId || "未选择设备"}
         connectionLabel={snapshot.connection.state}
@@ -1187,6 +1305,7 @@ function AppShell() {
               element={
                 <WorkspacePage
                   snapshot={snapshot}
+                  sessions={sessions}
                   serialPorts={serialPorts}
                   serialPortsError={serialPortsError}
                   connectedDevices={connectedDevices}
@@ -1200,6 +1319,7 @@ function AppShell() {
                   onWorkspaceCommand={submitWorkspaceCommand}
                   onNotice={handleCommandNotice}
                   systemControlAction={lastSystemControl}
+                  onLiveFastChange={setLiveFast}
                 />
               }
             />
@@ -1255,7 +1375,9 @@ function AppShell() {
             onSaveProfile={handleSaveProfile}
             onDeleteProfile={handleDeleteProfile}
             canSaveProfiles={hasPermission(snapshot, "manageSettings")}
-            onRefreshPorts={refreshSerialPorts}
+            onRefreshPorts={() => refreshSerialPorts()}
+            onPickPort={() => refreshSerialPorts(true)}
+            preselectPort={pendingConnectPort}
             onClose={() => setConnectDialogOpen(false)}
           />
         </div>

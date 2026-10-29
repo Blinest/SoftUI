@@ -111,9 +111,9 @@
       var f = t.forceN;
       sensors.push({
         id: c + 1,
-        raw: [f + n * 2, 0, 0],
-        filtered: [f + n, 0, 0],
-        alias: ["F" + (c + 1), "-", "-"],
+        // 与真实状态帧一样只给两个数：rawValue = 原始值，filteredValue = 滤波+平衡后。
+        rawValue: f + n * 2,
+        filteredValue: f + n,
         unit: "N",
         quality: "ok",
       });
@@ -548,6 +548,54 @@
    * 业务错误（比如密码错），必须原样抛出去，否则登录失败会被仿真掩盖。 */
   var backend = { mode: "unknown", rust: 0, sim: 0, errors: 0, lastError: "" };
 
+  /**
+   * 本机解析模式下，用**本机**的计数器纠正后端返回的统计。
+   *
+   * 为什么必须纠正：`P1_LOCAL_PARSE` 打开时字节**不出浏览器**，后端一帧都收不到 ——
+   * 它返回的 `receivedFrames / storedFrames` 结构上恒为 0 ✗。
+   * 但界面上「协议 / 帧号」取的是本地快照（正常递增 ✓），「接收帧」「存储帧」取的却是
+   * 后端 ✗ —— 于是出现"帧号在涨、两个计数不动"的怪象 ✓。
+   * 统计口径必须和解析口径一致：谁在解析，就用谁的数。
+   */
+  function patchLocalStats(cmd, data) {
+    if (!P1_LOCAL_PARSE || !wsActive || !data || typeof data !== "object") return data;
+    var local = localStats();
+    if (cmd === "device_runtime_status" && typeof data.receivedFrames === "number") {
+      data.receivedFrames = local.totalFrames;
+      data.protocolErrors = local.droppedFrames;
+      if ("unknownFrames" in data) data.unknownFrames = wsUnknownFrames;
+      if ("tensionFrames" in data) data.tensionFrames = wsTensionFrames;
+      if ("state" in data && local.totalFrames > 0 && data.state === "handshaking") {
+        data.state = "ready"; // 本地已经解出帧了，就不该再显示"握手"
+      }
+    }
+    // ⚠️ 「握手中」这个字样来自 **`device.state`**（DeviceCard 直接读连接记录里的
+    // state），不是 runtimeStatus.state —— 只改后者界面上没有任何变化。
+    // 设备记录、快照里的 connection 都要一起按本机解析结果纠正。
+    var devices = Array.isArray(data)
+      ? data
+      : Array.isArray(data.devices)
+        ? data.devices
+        : null;
+    if (devices) {
+      for (var i = 0; i < devices.length; i += 1) {
+        var d = devices[i];
+        if (d && d.state === "handshaking" && local.totalFrames > 0) d.state = "ready";
+      }
+    }
+    if (data.connection && data.connection.state === "handshaking" && local.totalFrames > 0) {
+      data.connection = Object.assign({}, data.connection, { state: "ready" });
+    }
+    if (data.runtimeDiagnostics && typeof data.runtimeDiagnostics === "object") {
+      data.runtimeDiagnostics = Object.assign({}, data.runtimeDiagnostics, {
+        storedFrames: local.storedFrames,
+        totalFrames: local.totalFrames,
+        droppedFrames: local.droppedFrames,
+      });
+    }
+    return data;
+  }
+
   function simInvoke(cmd, args) {
     var out;
     if (Object.prototype.hasOwnProperty.call(HANDLERS, cmd)) {
@@ -601,7 +649,45 @@
     } catch (error) { /* 隐私模式下写不了：退化为"每次打开都要重新登录" */ }
   }
 
-  function doRpc(cmd, args, noFallback) {
+  var reregistering = null;
+
+  /** 把"浏览器已开好、但网关重启后丢了登记"的串口重新登记一遍。并发调用只登记一次。 */
+  function reregisterDevice() {
+    if (!wsActive || !wsActive.port) return Promise.reject(new Error("本端没有已打开的串口"));
+    if (!reregistering) {
+      reregistering = doRpc(
+        "webserial_open",
+        {
+          portName: wsActive.name,
+          baudRate: wsActive.baudRate || 115200,
+          clientId: SYNC_ID,
+          deviceName: DEVICE_NAME,
+        },
+        true,
+      ).then(
+        function (record) { reregistering = null; return record; },
+        function (error) { reregistering = null; throw error; },
+      );
+    }
+    return reregistering;
+  }
+
+  /**
+   * **RPC 耗时统计** ✓ —— 用来回答"指令为什么慢"✗。
+   *
+   * 控制台：`__SOFTUI_WS__.rpcStats()` → 返回最近 60 条的耗时统计 ✓。
+   * 关键判读：如果 `send_*` 类命令的耗时远高于平均值 ✓，
+   * 就是**请求排队**（源站 HTTP/1.1 并发被轮询占满 ✓）；
+   * 如果耗时正常但界面反应慢 ✓，那是**主线程被渲染阻塞** ✓，两条路完全不同 ✓。
+   */
+  var RPC_SAMPLES = [];
+  function recordRpc(cmd, ms, ok) {
+    RPC_SAMPLES.push({ cmd: cmd, ms: ms, ok: ok, at: nowMs() });
+    if (RPC_SAMPLES.length > 60) RPC_SAMPLES.shift();
+  }
+
+  function doRpc(cmd, args, noFallback, retry) {
+    var startedAt = (window.performance && performance.now) ? performance.now() : Date.now();
     lastCalls.push({ cmd: cmd, args: args, at: nowMs() });
     if (lastCalls.length > 200) lastCalls.shift();
 
@@ -622,15 +708,34 @@
         if (payload && payload.ok === true) {
           backend.mode = "rust";
           backend.rust += 1;
-          return payload.data;
+          return patchLocalStats(cmd, payload.data);
         }
         var appError = new Error((payload && payload.error) || "后端返回失败");
         appError.__appError = true;
         throw appError;
       })
+      .then(function (value) {
+        recordRpc(cmd, ((window.performance && performance.now) ? performance.now() : Date.now()) - startedAt, true);
+        return value;
+      })
       .catch(function (error) {
+        recordRpc(cmd, ((window.performance && performance.now) ? performance.now() : Date.now()) - startedAt, false);
         if (error && error.__appError) {
           backend.errors += 1;
+          // ★ 后端说"找不到这个设备"时补救一次。
+          //
+          // 典型场景：浏览器已把 Web Serial 端口开好（deviceId = 前端传的 deviceName，
+          // 如 `TDCR_v1`），但**网关重启过** —— 设备登记存在网关内存里，重启即丢，
+          // 而浏览器还记着旧 id。于是每条指令都发向一个后端不认识的设备，报
+          // `DeviceNotFound`。表现极隐蔽：界面一切正常，指令全不生效，目标值永远是 --。
+          //
+          // 补救很简单：浏览器手里还握着那个 SerialPort，重新调一次 webserial_open
+          // 就能把登记补回去，再把原命令重发一次（只补一次，避免死循环）。
+          if (!retry && wsActive && /DeviceNotFound/.test(String(error.message || ""))) {
+            return reregisterDevice().then(function () {
+              return doRpc(cmd, args, noFallback, true);
+            });
+          }
           throw error;
         }
         // 服务端专属命令：把失败如实抛出去，让调用方重试，而不是假装成功
@@ -667,6 +772,8 @@
    *      想再添加一个已授权端口：地址后加 ?addport=1 再点扫描。
    * ─────────────────────────────────────────────────────────────── */
   var wsPorts = [];
+  /** 用户在**浏览器弹窗**里选中的那个 SerialPort。它是"哪一个才是我的设备"的唯一可靠依据。 */
+  var wsPicked = null;
   var FORCE_PICK = /[?&]addport=1\b/.test(location.search);
 
   /* Web Serial 不会暴露系统端口名（COM3 / /dev/ttyUSB0），
@@ -701,6 +808,7 @@
     var vid = typeof info.usbVendorId === "number" ? info.usbVendorId : null;
     var pid = typeof info.usbProductId === "number" ? info.usbProductId : null;
 
+    var picked = port === wsPicked;
     var label = "本机串口 " + (index + 1);
     if (vid !== null) {
       var vendor = USB_VENDORS[vid] || ("厂商 " + hex4(vid));
@@ -710,7 +818,13 @@
       label += "（非 USB 串口，浏览器不提供端口号）";
     }
 
+    // ★ 标出"刚在浏览器弹窗里选中的那个"。浏览器弹窗**是显示 COM 号的**，
+    //   而 getPorts() 拿不到端口号 —— 所以用户在那一次选择里看到的信息最多，
+    //   必须在界面上把这个身份保留下来（否则两个同型号 CH340 完全无从分辨）。
+    if (picked) label = "★ " + label + "（刚在浏览器弹窗中选择）";
+
     return {
+      picked: picked,
       portName: "webserial:" + index,
       portType: "usb",
       description: label,
@@ -721,6 +835,31 @@
       pid: pid,
       likelyAvailable: true,
     };
+  }
+
+  /* ?wsdebug=1 时把原始信息打到控制台：排查"设备在别的工具里能看到、
+   * 这里却看不到"时，先确认浏览器到底拿到了几个端口、各自 vid/pid 是什么。 */
+  function wsDumpPorts() {
+    try {
+      console.info("[webserial] 浏览器当前可见的已授权端口：" + wsPorts.length + " 个");
+      wsPorts.forEach(function (port, index) {
+        var info = {};
+        try { info = (port.getInfo && port.getInfo()) || {}; } catch (e) { info = {}; }
+        console.info(
+          "  #" + index + " vid=" + (info.usbVendorId !== undefined ? hex4(info.usbVendorId) : "无") +
+          " pid=" + (info.usbProductId !== undefined ? hex4(info.usbProductId) : "无") +
+          (port === wsPicked ? "   ← 刚在弹窗中选中" : "")
+        );
+      });
+      console.info(
+        "[webserial] 若这里没有你的设备：Web Serial 只能拿到**已授权**端口。" +
+        "点「扫描串口」会弹浏览器的端口选择框（那一层才有 COM 号）；" +
+        "列表里没有目标设备，通常是：端口被别的串口工具占用 / 设备未插好 / " +
+        "该端口不是 USB 串口（浏览器不提供端口号）。"
+      );
+    } catch (error) {
+      console.warn("[webserial] 端口转储失败:", error);
+    }
   }
 
   function syncWsPorts(ports) {
@@ -738,7 +877,14 @@
   var DEVICE_NAME = (/[?&]device=([A-Za-z0-9_.-]{1,32})/.exec(location.search) || [])[1] || "TDCR_v1";
   var wsHasGranted = false;
 
-  function listLocalSerialPorts() {
+  /**
+   * @param forcePick 强制弹出浏览器的端口选择框。
+   *
+   * Web Serial 的坑：`requestPort()` 只在**还没授权过任何端口**时才会自动弹窗；
+   * 一旦授权过，`getPorts()` 就直接返回旧的，界面再也拿不到"选新端口"的机会 ✗。
+   * 想换设备必须显式强制弹窗（原来只能靠地址栏 `?addport=1`，界面上没法发现）。
+   */
+  function listLocalSerialPorts(forcePick) {
     if (!navigator.serial || typeof navigator.serial.getPorts !== "function") {
       var why = window.isSecureContext === false
         ? "当前不是安全上下文（Web Serial 要求 HTTPS 或 localhost）。"
@@ -752,24 +898,43 @@
     // 中间只要夹一个 await，Chrome 就判定"用户手势已失效"而静默什么都不弹 ——
     // 表现就是点了「扫描串口」毫无反应。所以首次扫描时这里同步把选择框弹出。
     var pick = null;
-    if (!wsHasGranted || FORCE_PICK) {
+    if (!wsHasGranted || FORCE_PICK || forcePick) {
       try {
-        pick = navigator.serial.requestPort();
+        // ⚠️ requestPort() 的**返回值必须留着**。
+        // 浏览器弹窗里是显示 COM 号的，而 getPorts() 拿不到端口号 ——
+        // 用户在弹窗里那一次选择，是"哪一个才是我的设备"的唯一可靠依据。
+        // 原来这里把返回值丢了、只用 getPorts() 的累积列表，于是界面上列出的顺序
+        // 与用户刚选的完全无关；两个同型号 CH340 时根本没法分辨，只能靠猜。
+        pick = navigator.serial.requestPort().then(function (port) {
+          wsPicked = port;
+          return port;
+        });
       } catch (error) {
         pick = Promise.reject(error);
       }
     }
 
     var merge = function (granted) {
-      wsHasGranted = granted.length > 0;
-      wsPorts = granted.slice();
+      var list = granted.slice();
+      // 把刚选中的那个排到最前：界面默认就指向它，不必在几条同名条目里再猜一次。
+      if (wsPicked) {
+        var at = list.indexOf(wsPicked);
+        if (at >= 0) list.splice(at, 1);
+        // 即使不在 getPorts() 里也放最前 —— 用户刚授权过，它必定可用
+        list.unshift(wsPicked);
+      }
+      wsHasGranted = list.length > 0;
+      wsPorts = list;
       window.__SOFTUI_WS_PORTS__ = wsPorts;
-      if (granted.length === 0) {
+      if (wsPorts.length === 0) {
         throw new Error(
           "没有选中任何串口。点「扫描串口」后浏览器会弹出端口选择框，" +
-          "请在列表里选中你的设备（Windows 上通常显示为 COM3）并确认。"
+          "请在列表里选中你的设备并确认。" +
+          "（弹窗里显示的是系统端口名如 COM3；网页本身拿不到这个名字，" +
+          "所以必须在这一步选对。）"
         );
       }
+      if (/[?&]wsdebug=1\b/.test(location.search)) wsDumpPorts();
       return wsPorts.map(wsDescribe);
     };
 
@@ -841,9 +1006,24 @@
    * 而接收字节又恰好在同一个循环里发 —— 失败就连带把字节丢掉。
    * 改成挂起后，空闲时链路上只有一个未完成的请求。
    */
+  /**
+   * 连续失败计数 ✓ —— 端口已关却还在重试时 ✓，**退避**并最终**停下** ✗。
+   *
+   * 原来失败后立刻重试 ✓ → 端口关了就是每秒几十条 `webserial 端口未打开`✗
+   * → 控制台刷屏 ✓、还白白打满 RPC 链路 ✗（本 bug ✓）。
+   */
+  var wsTxFailures = 0;
+  var wsTxTimer = null;
+
+  /**
+   * **串口收发统计** ✓ —— 用来区分"没发出去"还是"没收到"✗。
+   * 控制台执行 `__SOFTUI_WS__.stats()` 即可 ✓。
+   */
+  var wsStats = { txBytes: 0, rxBytes: 0, lastTxAt: 0, lastRxAt: 0, writeErrors: 0, readErrors: 0 };
+
   function wsTxLoop() {
     if (!wsActive || !wsActive.running) return;
-    doRpc("webserial_wait_tx", { portName: wsActive.name, timeoutMs: 15000 }, true)
+    doRpc("webserial_wait_tx", { portName: wsActive.name, timeoutMs: 300 }, true)
       .then(function (bytes) {
         if (!wsActive || !wsActive.running) return;
         if (!bytes || bytes.length === 0) return;
@@ -853,21 +1033,80 @@
         return writer
           .write(new Uint8Array(bytes))
           .then(
-            function () { writer.releaseLock(); },
+            function () {
+              writer.releaseLock();
+              wsStats.txBytes += bytes.length;
+              wsStats.lastTxAt = Date.now();
+            },
             function (error) {
               try { writer.releaseLock(); } catch (ignored) {}
+              wsStats.writeErrors += 1;
               console.warn("[webserial] 写串口失败:", error && error.message);
             },
           );
       })
       .catch(function (error) {
-        if (wsActive && wsActive.running) {
+        wsTxFailures += 1;
+        if (!wsActive || !wsActive.running) return;
+        // 前 2 次照常提示 ✓，之后**只提示一次**再静默 ✗
+        if (wsTxFailures <= 2) {
           console.warn("[webserial] 取命令失败:", error && error.message);
+        } else if (wsTxFailures === 3) {
+          console.warn("[webserial] 连续失败，暂停发送通道（重连接口会恢复）✗");
+        }
+        /**
+         * ⚠ **绝不能用"停循环"当错误处理** ✗ —— 这是"点按钮要等 10 秒"甚至
+         * "再也发不出去"的根因 ✓：
+         *   · 长轮询偶发失败 → 计数累到 5 → `running = false` → **发送通道永久关闭** ✗
+         *   · 命令照常进后端缓冲 ✓，但**没有人来拉**✗ → 只能刷新页面才恢复 ✗
+         * 现在：只记数、只提示，循环照跑 ✓（长轮询失败本来就是"这 5 秒没命令"✓）。
+         */
+        if (wsTxFailures === 5) {
+          console.warn("[webserial] 取命令连续失败 5 次，继续重试（不再停循环）");
         }
       })
       .then(function () {
-        if (wsActive && wsActive.running) wsTxLoop();
+        if (!wsActive || !wsActive.running) return;
+        // 成功一次就清零 ✓；失败则**指数退避** ✓（200ms × 2^n，上限 8 秒 ✓）
+        if (wsTxFailures === 0) {
+          wsTxLoop();
+          return;
+        }
+        /**
+         * **退避上限 8s → 400ms** ✗ —— 8 秒退避正是"点完等 10 秒才动"的来源 ✓：
+         *   命令进后端缓冲后要等下一轮轮询才被拉走 ✓ → 抖动一次就拖 8 秒 ✗。
+         *   取命令的长轮询本来就是空闲等待 ✓，失败多半是隧道抖动 ✓，
+         *   用 100/200/400ms 快速重试即可 ✓。
+         */
+        var delay = Math.min(400, 100 * Math.pow(2, wsTxFailures - 1));
+        wsTxTimer = window.setTimeout(function () {
+          if (wsActive && wsActive.running) wsTxLoop();
+        }, delay);
       });
+  }
+
+  /**
+   * 只有在**真的解出过一帧有效数据**之后，才把当前波特率记为"上次可用"。
+   *
+   * 原来是在 `wsConnect` 成功后就记 ✗ —— 于是"连上了但速率不对"这种情形会把
+   * 错速率固化进 localStorage ✓，下次刷新自动重连又用回它 ✓，症状和这次一模一样
+   * （一直停在「握手」、帧表全空），非常难看出来。
+   */
+  /** 连接成功 / 重连时清零失败计数 ✓ */
+  function resetTxFailures() {
+    wsTxFailures = 0;
+    if (wsTxTimer) {
+      window.clearTimeout(wsTxTimer);
+      wsTxTimer = null;
+    }
+  }
+
+  function markBaudVerified() {
+    if (!wsActive || wsActive.baudVerified) return;
+    wsActive.baudVerified = true;
+    try {
+      window.localStorage.setItem("softui.baud", String(wsActive.baudRate));
+    } catch (ignored) {}
   }
 
   function wsStartRead() {
@@ -880,31 +1119,84 @@
         return;
       }
       var reader = port.readable.getReader();
+      /**
+       * **把 reader 挂到会话上** ✓ —— 断开时必须 `cancel()` 它 ✓。
+       * 只调 `port.close()` 不行 ✗：有活动 reader 锁时 close 会**抛错或挂起** ✓
+       * → 端口保持打开 ✓ → 刷新后仍被占着 ✓（"一直被 webserial:0 占着"本 bug ✓）。
+       */
+      if (wsActive) wsActive.reader = reader;
       (function pump() {
         reader
           .read()
           .then(function (result) {
             if (!wsActive || !wsActive.running || result.done) {
+              if (wsActive && wsActive.reader === reader) wsActive.reader = null;
               try { reader.releaseLock(); } catch (ignored) {}
               return;
             }
             var value = result.value;
             if (value && value.length) {
+              wsStats.rxBytes += value.length;
+              wsStats.lastRxAt = Date.now();
+              /**
+               * **兜底补建解析器** ✓ —— 协议模块可能比连接晚到 ✓。
+               * 不补的话就要一直走"推原始字节给后端"那条路 ✗ → 协议错误疯长 ✗。
+               */
+              if (!wsCodec && window.__SOFTUI_PROTOCOL__) {
+                wsCodec = new window.__SOFTUI_PROTOCOL__.FrameParser();
+              }
               if (P1_LOCAL_PARSE && wsCodec) {
                 // 本机解析：字节不出浏览器，解析结果直接进本地环形缓冲
                 wsCodec.pushBytes(value).forEach(function (decoded) {
-                  if (decoded.ok) {
+                  if (decoded && decoded.ok) {
+                    wsStats.parsedFrames = (wsStats.parsedFrames || 0) + 1;
+                  } else {
+                    wsStats.parseErrors = (wsStats.parseErrors || 0) + 1;
+                  }
+                  if (!decoded.ok) {
+                    // 校验错时解析器只前进 1 字节重找帧头，所以这里是"噪声字节数"的近似；
+                    // 长度对不上之类的真解析异常也一并记进去，徽标上能看到。
+                    wsErrors += 1;
+                    return;
+                  }
+                  var message = decoded.ok;
+                  /**
+                   * **本地自证：收到合法协议帧** ✓ —— 这是"才允许向后端登记"的门槛 ✓。
+                   * （见 `wsConnect` 里的 `waitForProtocol` ✓）
+                   */
+                  if (wsActive && !wsActive.protocolVerified) {
+                    wsActive.protocolVerified = true;
+                  }
+                  if (message.kind === "status") {
+                    markBaudVerified();
                     wsFrameSeq += 1;
-                    var snap = buildSnapshot(decoded.ok, wsFrameSeq);
+                    var snap = buildSnapshot(message, wsFrameSeq);
                     wsLastFrame = snap;
                     wsDirtyFrame = snap; // 等 10Hz 上报
                     wsRing.push(snap);
                     if (wsRing.length > WS_CAPACITY) {
                       wsRing.splice(0, wsRing.length - WS_CAPACITY);
                     }
-                  } else if (decoded.error === "InvalidChecksum") {
-                    wsErrors += 1;
+                    return;
                   }
+                  // 张力感知帧（500ms 一帧）与标定事件帧（事件触发）：
+                  // 与状态帧不是同一个节拍，不能塞进 wsRing。
+                  if (message.kind === "tension") {
+                    wsLastTension = message;
+                    wsTensionFrames += 1;
+                    return;
+                  }
+                  if (message.kind === "calibration") {
+                    wsLastCalibration = message;
+                    wsCalibrationEvents += 1;
+                    return;
+                  }
+                  if (message.kind === "handshake") {
+                    wsHandshake = message;
+                    return;
+                  }
+                  // 预留设备 / 未知功能码：解析内核不认识但不报错，计数即可。
+                  wsUnknownFrames += 1;
                 });
               } else {
                 for (var i = 0; i < value.length; i += 1) wsRxBuf.push(value[i]);
@@ -914,6 +1206,7 @@
             pump();
           })
           .catch(function () {
+            if (wsActive && wsActive.reader === reader) wsActive.reader = null;
             try { reader.releaseLock(); } catch (ignored) {}
           });
       })();
@@ -933,12 +1226,21 @@
   // 所以这个开关是把整条链路切回去，而不是只关一半。
   var P1_LOCAL_PARSE = !/[?&]p1=0\b/.test(location.search);
   var WS_CAPACITY = 600;
-  var wsCodec = window.__SOFTUI_PROTOCOL__ ? new window.__SOFTUI_PROTOCOL__.LegacyV1Codec() : null;
+  // 帧解析器：V1（0xBB）与 V2（0x55 + 设备ID）混流都认，与 Rust 的 FrameParser 逐条对齐。
+  var wsCodec = window.__SOFTUI_PROTOCOL__ ? new window.__SOFTUI_PROTOCOL__.FrameParser() : null;
   var wsRing = [];
   var wsLastFrame = null;
   var wsFrameSeq = 0;
   var wsErrors = 0;
   var wsDirtyFrame = null;
+  // 指令集 V2 的另外两类上行帧。界面暂时没有对应面板，但**必须收下来**：
+  // 否则以后做面板时会回头怀疑「到底有没有收到」，而那时候串口现场未必还在。
+  var wsLastTension = null;
+  var wsLastCalibration = null;
+  var wsHandshake = null;
+  var wsTensionFrames = 0;
+  var wsCalibrationEvents = 0;
+  var wsUnknownFrames = 0;
 
   function adaptMotor(id, motor) {
     return {
@@ -951,13 +1253,21 @@
     };
   }
 
+  /* 固件口径：状态帧里每路是**一路压力通道**，只有两个数 ——
+   * x = 实际值（未经滤波的读数），y = 滤波值。每路 4 字节。
+   * （旧固件是 6 字节、多一个保留位 z；解析器两种步长都接受。）
+   *
+   * 字段名必须与后端 `adapt_sensor` 逐字一致：本机解析与后端解析都是
+   * `DeviceSnapshot.sensors` 的产出方，两边形状一旦分叉，同一份环形缓冲里
+   * 就会出现两种帧结构，图表和 CSV 都会莫名其妙地缺列。 */
   function adaptSensor(id, sensor, seq) {
-    var raw = [sensor.x, sensor.y, sensor.z];
     return {
       id: id,
-      raw: raw,
-      filtered: [raw[0] * 0.96, raw[1] * 0.95, raw[2] * 0.94],
-      alias: ["X", "Y", "Z"],
+      // 固件口径：x = 实际值（未滤波），y = 滤波值。
+      // 与后端 adapt_sensor 逐字对齐 —— 这两处是 DeviceSnapshot.sensors 的唯二产出方，
+      // 形状或映射一旦分叉，同一份环形缓冲里就会出现两种语义的帧。
+      rawValue: sensor.x,
+      filteredValue: sensor.y,
       unit: "N",
       quality: seq % 15 === 0 ? "warning" : "ok",
     };
@@ -978,7 +1288,8 @@
       connectionId: "webserial",
       receivedAtMs: Date.now(),
       sequence: seq,
-      protocolVersion: "Legacy V1",
+      // 下位机上电发 V1，收到 `AA 09 01 02` 后切 V2 —— 显示的必须是**实际在跑**的那个。
+      protocolVersion: wsCodec && wsCodec.lastVersion() >= 2 ? "V2 (0x55)" : "Legacy V1 (0xBB)",
       systemEnabled: status.systemState !== 0,
       motors: status.motors.map(function (m, i) { return adaptMotor(i + 1, m); }),
       sensors: status.sensors.map(function (s, i) { return adaptSensor(i + 1, s, seq); }),
@@ -1007,7 +1318,8 @@
 
   /* 把解析好的帧按 10Hz 上报：本机不需要高频，其它端看的是"趋势"。 */
   function wsSyncUp() {
-    if (!P1_LOCAL_PARSE || !wsActive || !wsDirtyFrame) return;
+    // **未登记不上报** ✓ —— 后端还没有这台设备 ✓，推上去只会报"未知设备"✗
+    if (!P1_LOCAL_PARSE || !wsActive || !wsActive.registered || !wsDirtyFrame) return;
     var frame = wsDirtyFrame;
     wsDirtyFrame = null;
     doRpc("frame_ingest", { frame: frame }, true).catch(function () { /* 下个周期不重试，遥测允许丢单帧 */ });
@@ -1020,6 +1332,228 @@
    * 用 sendBeacon 发一个 keepalive 请求关掉它 —— 普通 fetch 在卸载时会
    * 被浏览器取消，sendBeacon 不会。
    * ─────────────────────────────────────────────────────────────────── */
+  /* ── D. 指令直发（本机模式）──────────────────────────────────────
+   * 为什么 ✗：写入原来要"前端 → 后端排队 → 浏览器拉取 → 写串口"✓，
+   * 源站 HTTP/1.1 + Cloudflare 隧道下，一条指令排队十几秒 ✗（实测 ✓）。
+   * 而**读取早就是本机直连**了 ✓，只有写入绕了远路 ✗。
+   * 现在：持有串口的那一端直接编码 + 写串口 ✓ → ms 级 ✓；
+   * 不持有串口的端（手机 / 另一台电脑）仍走后端排队 ✓。
+   * ─────────────────────────────────────────────────────────────── */
+
+  /** 下行帧：`AA func LEN [data] SUM` ✓ */
+  function encodeDownFrame(func, data) {
+    var frame = [0xAA, func & 0xff, data.length];
+    for (var i = 0; i < data.length; i += 1) frame.push(data[i] & 0xff);
+    var sum = 0;
+    for (var j = 0; j < frame.length; j += 1) sum = (sum + frame[j]) & 0xff;
+    frame.push(sum);
+    return frame;
+  }
+
+  function be16(value) {
+    return [(value >> 8) & 0xff, value & 0xff];
+  }
+
+  function toI16(value, factor) {
+    var scaled = Math.round(value * factor);
+    if (!isFinite(scaled) || scaled < -32768 || scaled > 32767) {
+      throw new Error("数值超出协议范围：" + value);
+    }
+    return scaled < 0 ? scaled + 0x10000 : scaled;
+  }
+
+  function toU16(value, factor) {
+    var scaled = Math.round(value * factor);
+    if (!isFinite(scaled) || scaled < 0 || scaled > 65535) {
+      throw new Error("速度超出协议范围：" + value);
+    }
+    return scaled;
+  }
+
+  /** **直接写串口** ✓ —— 本端持有端口时返回 true ✓，否则 false（调用方回退走后端 ✓）。*/
+  function toHex(bytes) {
+    return bytes
+      .map(function (b) { return (b < 16 ? "0" : "") + b.toString(16).toUpperCase(); })
+      .join("");
+  }
+
+  /**
+   * **直接写串口** ✓ —— 返回本次实际写出的**帧 hex** ✓，失败返回 `""` ✓。
+   *
+   * 返回 hex 是为了让调用方把它送去后端**只记录不发送**（`control_frame_log`）✓：
+   * 后端据此更新 `control_enabled` / 审计 / 会话录制 ✓，但**不会再发一遍** ✓。
+   */
+  function sendDirect(bytes) {
+    if (!wsActive || !wsActive.running || !wsActive.port || !wsActive.port.writable) {
+      return "";
+    }
+    try {
+      var writer = wsActive.port.writable.getWriter();
+      writer
+        .write(Uint8Array.from(bytes))
+        .then(
+          function () {
+            wsStats.txBytes += bytes.length;
+            wsStats.lastTxAt = Date.now();
+            writer.releaseLock();
+          },
+          function (error) {
+            wsStats.writeErrors += 1;
+            console.warn("[webserial] 直发写串口失败:", error && error.message);
+            try { writer.releaseLock(); } catch (ignored) {}
+          },
+        );
+      return toHex(bytes);
+    } catch (error) {
+      console.warn("[webserial] 直发异常:", error && error.message);
+      return "";
+    }
+  }
+
+  /** 系统控制：使能 `0x01` / 急停 `0x02` / 失能 `0x00`，无数据段 ✓ */
+  function directSystemControl(action) {
+    var func = action === "enable" ? 0x01 : action === "emergencyStop" ? 0x02 : 0x00;
+    return sendDirect(encodeDownFrame(func, []));
+  }
+
+  /**
+   * **多电机同步位移 `0x11`** ✓ —— 六路**绝对目标位移（mm，带符号）** ✓。
+   *
+   * 绝对量 ⇒ 幂等 ⇒ 重复发送无害 ✓（相对位移的 `0x10` 不行 ✗）。
+   * 动作组播放、曲率/位姿下发都走这条 ✓。
+   */
+  function directMultiMotor(positionsMm, startAddress) {
+    var list = positionsMm || [];
+    if (list.length === 0) return "";
+    if (list.length > 6) list = list.slice(0, 6);
+    var data = [list.length, startAddress || 1];
+    for (var i = 0; i < list.length; i += 1) {
+      var value = Number(list[i]);
+      if (!isFinite(value)) return "";
+      var scaled = Math.round(value * 100);          // 0.01mm
+      if (scaled < -32768 || scaled > 32767) return "";
+      if (scaled < 0) scaled += 0x10000;
+      data = data.concat(be16(scaled));
+    }
+    return sendDirect(encodeDownFrame(0x11, data));
+  }
+
+  /** 一键归零：多电机同步位移帧 `0x11`，六路目标位移全 0 ✓ */
+  function directHome(motorCount, startAddress) {
+    var count = motorCount || 6;
+    var zeros = [];
+    for (var i = 0; i < count; i += 1) zeros.push(0);
+    return directMultiMotor(zeros, startAddress || 1);
+  }
+
+  /** 单电机定位 `0x10`：`addr dir dist(2) vel(2)` ✓ */
+  function directMotorCommand(motorId, positionMm, velocityMmPerSec) {
+    var direction = positionMm >= 0 ? 0 : 1;
+    var distance = toI16(Math.abs(positionMm), 100);   // ×0.01mm
+    var velocity = toU16(Math.abs(velocityMmPerSec || 5), 100); // ×0.01mm/s
+    var data = [motorId, direction]
+      .concat(be16(distance))
+      .concat(be16(velocity));
+    return sendDirect(encodeDownFrame(0x10, data));
+  }
+
+  /**
+   * **强制释放所有本机串口** ✓ —— 兜底手段 ✓。
+   *
+   * 什么时候用 ✗：上一次异常退出 / 多个标签页 / 旧版本没释放干净 ✓ →
+   * 浏览器认为端口"仍在打开"✓ → 怎么连都报占用 ✓（现场表现 ✓）。
+   * 这里把所有已知 port 对象的 reader 取消掉再 close ✓，并清掉本地会话 ✓。
+   * 控制台调用：`__SOFTUI_WS__.forceRelease()` ✓
+   */
+  function forceRelease() {
+    var targets = [];
+    if (wsActive && wsActive.port) targets.push(wsActive.port);
+    (wsPorts || []).forEach(function (port) { if (targets.indexOf(port) < 0) targets.push(port); });
+    var reader = wsActive && wsActive.reader ? wsActive.reader : null;
+    wsActive = null;
+    var jobs = targets.map(function (port) {
+      var cancel = reader
+        ? Promise.resolve(reader.cancel()).catch(function () {})
+        : Promise.resolve();
+      return cancel
+        .then(function () {
+          try { if (reader) reader.releaseLock(); } catch (ignored) {}
+        })
+        .then(function () { return Promise.resolve(port.close()).catch(function () {}); })
+        .then(function () { return { ok: true }; });
+    });
+    var granted = (navigator.serial && navigator.serial.getPorts)
+      ? navigator.serial.getPorts().catch(function () { return []; })
+      : Promise.resolve([]);
+    return granted.then(function (list) {
+      (list || []).forEach(function (port) {
+        try { Promise.resolve(port.close()).catch(function () {}); } catch (ignored) {}
+      });
+      return Promise.all(jobs).then(function () {
+        wsPorts = [];
+        wsHasGranted = false;
+        window.__SOFTUI_WS_PORTS__ = [];
+        console.info("[webserial] 已尝试强制释放 " + (targets.length + (list || []).length) + " 个端口句柄");
+        return { released: targets.length + (list || []).length };
+      });
+    });
+  }
+
+  window.__SOFTUI_WS__ = {
+    /* **指令直发** ✓ —— 返回 true 表示"本机已直接写串口"✓，false 表示"本端没有串口，走后端"✓ */
+    directSystemControl: directSystemControl,
+    directHome: directHome,
+    directMultiMotor: directMultiMotor,
+    directMotorCommand: directMotorCommand,
+    /** 本端是否持有可用串口（决定直发 / 转发）*/
+    isLocal: function () {
+      return Boolean(wsActive && wsActive.running && wsActive.port && wsActive.port.writable);
+    },
+    forceRelease: forceRelease,
+    /** 端口状态 + 收发统计 ✓（诊断"握手一直不动"用 ✓）*/
+    /** **RPC 耗时统计** ✓ —— 按命令聚合：次数 / 中位 / 最大 ✓ */
+    rpcStats: function () {
+      var byCmd = {};
+      RPC_SAMPLES.forEach(function (item) {
+        var entry = byCmd[item.cmd] || (byCmd[item.cmd] = { n: 0, ms: [], failed: 0 });
+        entry.n += 1;
+        entry.ms.push(item.ms);
+        if (!item.ok) entry.failed += 1;
+      });
+      var out = {};
+      Object.keys(byCmd).forEach(function (cmd) {
+        var list = byCmd[cmd].ms.slice().sort(function (a, b) { return a - b; });
+        out[cmd] = {
+          calls: byCmd[cmd].n,
+          failed: byCmd[cmd].failed,
+          medianMs: Math.round(list[Math.floor(list.length / 2)]),
+          maxMs: Math.round(list[list.length - 1]),
+        };
+      });
+      return out;
+    },
+    stats: function () {
+      return {
+        opened: Boolean(wsActive),
+        portName: wsActive ? wsActive.name : null,
+        baudRate: wsActive ? wsActive.baudRate : null,
+        readable: Boolean(wsActive && wsActive.port && wsActive.port.readable),
+        writable: Boolean(wsActive && wsActive.port && wsActive.port.writable),
+        txBytes: wsStats.txBytes,
+        rxBytes: wsStats.rxBytes,
+        // **解析侧可见** ✓ —— 判断"收到字节但解析不出帧"用
+        hasCodec: Boolean(wsCodec),
+        parsedFrames: wsStats.parsedFrames || 0,
+        parseErrors: wsStats.parseErrors || 0,
+        protocolVerified: Boolean(wsActive && wsActive.protocolVerified),
+        registered: Boolean(wsActive && wsActive.registered),
+        writeErrors: wsStats.writeErrors,
+        lastTxMs: wsStats.lastTxAt ? Date.now() - wsStats.lastTxAt : null,
+        lastRxMs: wsStats.lastRxAt ? Date.now() - wsStats.lastRxAt : null,
+      };
+    },
+  };
+
   window.addEventListener("pagehide", function () {
     if (!wsActive) return;
     var name = wsActive.name;
@@ -1032,27 +1566,118 @@
     }
   });
 
-  function wsConnect(index, baudRate) {
+  /**
+   * **协议探针窗口（ms）** ✓ —— 打开端口后先本地解析，拿到**合法帧**才向后端登记 ✓。
+   *
+   * 为什么要把顺序倒过来 ✗：原来"先 `webserial_open` 登记、再开始收数据" ✓ →
+   * 端口能开、但设备不回帧（波特率错 / 选错 COM 口 / 接线问题）时 ✓，
+   * 后端里就留下一条**永远握手不上的幽灵设备** ✗ → 界面一直"握手中" ✓、
+   * 设备列表里挂着用不了的东西 ✗（现场现象 ✓）。
+   *
+   * 现在：**前端先自证"我听到的是 SoftUI 设备"** ✓，然后才发 `webserial_open` ✓。
+   * 探针窗口内一个合法帧都没有 → 直接断开并报出可执行的排查方向 ✓。
+   */
+  var PROTOCOL_PROBE_MS = 4000;
+
+  /**
+   * ⚠ **清掉历史调试开关** ✗ —— `softui.skipProtocolCheck` 是排查期临时加的 ✓，
+   * 留着会让协议探针被永久绕过 ✓ → "一连接就握手、永远不推进"✗（现场现象 ✓）。
+   * 每次加载清一次 ✓，需要时再显式设置 ✓。
+   */
+  try {
+    window.localStorage.removeItem("softui.skipProtocolCheck");
+    window.localStorage.removeItem("softui.autoReconnect");
+  } catch (ignored) {}
+
+  function wsConnect(index, baudRate, retried) {
+    if (wsActive) {
+      return wsDisconnect("").then(function () { return wsConnect(index, baudRate, retried); });
+    }
     var port = wsPorts[index];
     if (!port) {
       return Promise.reject(new Error("找不到本机串口 " + index + "，请先点「扫描串口」重新选择。"));
     }
     var baud = baudRate || 115200;
     var name = "webserial:" + index;
+
+    /** **向后端登记** ✓ —— 只有协议验证通过（或明示跳过）才会走到这里 ✓ */
+    function registerWithBackend() {
+      return doRpc("webserial_open", {
+        portName: name,
+        baudRate: baud,
+        clientId: SYNC_ID,
+        deviceName: DEVICE_NAME,
+      }).then(function (record) {
+        if (wsActive) wsActive.registered = true;
+        return record;
+      });
+    }
+
+    /** **等第一帧合法协议** ✓（超时就拒绝，让用户去查硬件 ✓）*/
+    function waitForProtocol() {
+      var skip = false;
+      try {
+        skip = window.localStorage.getItem("softui.skipProtocolCheck") === "1";
+      } catch (ignored) {}
+      // 老路径（`?p1=0`）没有本地解析 ✓ → 无法自证 ✓ → 直接登记（保持旧行为 ✓）
+      if (skip || !P1_LOCAL_PARSE || !wsCodec) return Promise.resolve();
+      return new Promise(function (resolve, reject) {
+        var startedAt = Date.now();
+        var timer = setInterval(function () {
+          if (!wsActive || !wsActive.running) {
+            clearInterval(timer);
+            reject(new Error("串口已关闭"));
+            return;
+          }
+          if (wsActive.protocolVerified) {
+            clearInterval(timer);
+            resolve();
+            return;
+          }
+          if (Date.now() - startedAt > PROTOCOL_PROBE_MS) {
+            clearInterval(timer);
+            reject(new Error(
+              "已打开 " + name + " @" + baud + "，但 " + PROTOCOL_PROBE_MS / 1000 +
+                " 秒内没有收到任何合法协议帧（累计收到 " + wsStats.rxBytes + " 字节）。\n" +
+                "排查顺序：① 波特率是否与设备一致 ② 是否选错了 COM 口（两个 CH340 在列表里同名）③ 设备是否上电、TX/RX 是否接反。\n" +
+                "确认要跳过校验：localStorage.setItem(\"softui.skipProtocolCheck\", \"1\") 后重试。"
+            ));
+          }
+        }, 100);
+      });
+    }
+
     return port
       .open({ baudRate: baud })
       .then(function () {
-        return doRpc("webserial_open", {
-          portName: name,
+        // **先建会话、先收数据** ✓ —— 注意此时 `registered` 还是 false ✓
+        wsActive = {
+          index: index,
+          name: name,
+          port: port,
           baudRate: baud,
-          clientId: SYNC_ID,
-          // 设备显示名。Web Serial 拿不到 COM 号，这里给一个业务上有意义的名字，
-          // 界面和录制会话里就用它标识设备。
-          deviceName: DEVICE_NAME,
-        });
+          running: true,
+          registered: false,
+          protocolVerified: false,
+        };
+        /**
+         * ⚠ 原来写的是 `if (wsCodec && window.__SOFTUI_PROTOCOL__)` ✗ ——
+         * 首次连接时 `wsCodec` 就是 null ✓ → 条件永远为假 → **本地解析从未启用**✗ →
+         * 所有字节都被 `webserial_push` 推给后端解析 ✓ → 后端那份解析器
+         * 面对半包 / 粘包会不断记"协议错误"✗（现场"协议错误疯长"✓）。
+         * 只要协议模块在，就重建一个干净的解析器 ✓。
+         */
+        if (window.__SOFTUI_PROTOCOL__) {
+          wsCodec = new window.__SOFTUI_PROTOCOL__.FrameParser();
+        }
+        wsStartRead();
+        return waitForProtocol();
+      })
+      .then(function () {
+        return registerWithBackend();
       })
       .then(function (record) {
-        wsActive = { index: index, name: name, port: port, running: true };
+        resetTxFailures();   // **重连成功 → 清失败计数** ✓（否则退避会一直卡着 ✗）
         wsPushPending = null;
         WS_SEQ = 0;
         wsRing = [];
@@ -1060,23 +1685,51 @@
         wsFrameSeq = 0;
         wsErrors = 0;
         wsDirtyFrame = null;
-        if (wsCodec) wsCodec = new window.__SOFTUI_PROTOCOL__.LegacyV1Codec();
-        if (!wsSyncTimer) wsSyncTimer = setInterval(wsSyncUp, 100); // 10Hz
-        wsStartRead();
+        wsLastTension = null;
+        wsLastCalibration = null;
+        wsHandshake = null;
+        wsTensionFrames = 0;
+        wsCalibrationEvents = 0;
+        wsUnknownFrames = 0;
+        if (!wsSyncTimer) wsSyncTimer = setInterval(wsSyncUp, 1000); // 1Hz —— 只给后端留档，界面不吃它
         wsTxLoop(); // 命令：挂起式长轮询，不再 20ms 一轮
         if (wsFlushTimer) clearInterval(wsFlushTimer);
-        wsFlushTimer = setInterval(wsFlushRx, 50); // 接收：有数据才发，50ms 一拍
-        console.info("[webserial] 已打开本机串口 " + name + " @ " + baud);
+        wsFlushTimer = setInterval(wsFlushRx, 100); // 接收：有数据才发，100ms 一拍
+        // **记住这次用的是哪条口** ✓ —— 下次（且只有开了自动重连时）按指纹找回 ✓
+        try {
+          window.localStorage.setItem("softui.lastPortKey", portKey(port));
+          window.localStorage.setItem("softui.baud", String(baud));
+        } catch (ignored) {}
+        console.info("[webserial] 已打开本机串口 " + name + " @ " + baud + "（协议已验证 ✓）");
         return record;
       })
       .catch(function (error) {
-        // 连到一半失败时后端可能已经注册了设备并摘掉了模拟设备，
-        // 这里必须补一次关闭，否则两边都空着（界面一台设备都没有）。
-        try { port.close(); } catch (ignored) {}
-        return doRpc("webserial_close", { portName: name })
-          .catch(function () {})
+        var errName = (error && error.name) || "";
+        // 端口被判定为"仍打开" → 强关一次再重试
+        if (!retried && errName === "InvalidStateError") {
+          return Promise.resolve(port.close()).catch(function () {})
+            .then(function () { return new Promise(function (r) { setTimeout(r, 150); }); })
+            .then(function () { return wsConnect(index, baudRate, true); });
+        }
+        // 失败收尾：把已开的端口和后端登记都清掉（本端没登记就只在本地关）
+        var wasRegistered = Boolean(wsActive && wsActive.registered);
+        var reader = wsActive && wsActive.reader ? wsActive.reader : null;
+        if (wsActive) wsActive.running = false;
+        wsActive = null;
+        var release = reader
+          ? Promise.resolve(reader.cancel()).catch(function () {}).then(function () {
+              try { reader.releaseLock(); } catch (ignored) {}
+            })
+          : Promise.resolve();
+        return release
+          .then(function () {
+            if (wasRegistered) return doRpc("webserial_close", { portName: name }).catch(function () {});
+            return null;
+          })
+          .then(function () { return Promise.resolve(port.close()).catch(function () {}); })
           .then(function () {
             var msg = (error && error.message) ? error.message : String(error);
+            if (error && error.__appError) throw error;   // 后端业务错误原样抛
             throw new Error("打开本机串口失败：" + msg);
           });
       });
@@ -1091,6 +1744,7 @@
     }
     var name = wsActive.name;
     var port = wsActive.port;
+    var reader = wsActive.reader || null;
     wsActive.running = false;
     if (wsFlushTimer) { clearInterval(wsFlushTimer); wsFlushTimer = null; }
     if (wsSyncTimer) { clearInterval(wsSyncTimer); wsSyncTimer = null; }
@@ -1098,10 +1752,31 @@
     wsSyncUp(); // 断开前把最后一帧送出去
     wsFlushRx();
     wsActive = null;
-    return doRpc("webserial_close", { portName: name })
-      .catch(function () {})
+    /**
+     * ⚠ **必须按顺序释放** ✗：`reader.cancel()` → `releaseLock()` → `port.close()` ✓。
+     * 只关端口 ✗ → reader 还锁着 readable ✓ → close 抛错又被 catch 吞掉 ✓ →
+     * 端口其实一直开着 ✓ → "一直被占着、连不上别的口"✗（本 bug ✓）。
+     */
+    var releaseReader = reader
+      ? Promise.resolve(reader.cancel())
+          .catch(function () {})
+          .then(function () {
+            try { reader.releaseLock(); } catch (ignored) {}
+          })
+      : Promise.resolve();
+    /** 任何一步都**最多等 1.5 秒** ✓ —— 挂住就等于端口永远放不掉 ✗ */
+    function withTimeout(promise, ms) {
+      return Promise.race([
+        promise.catch(function () {}),
+        new Promise(function (resolve) { setTimeout(resolve, ms); }),
+      ]);
+    }
+    return withTimeout(releaseReader, 1500)
       .then(function () {
-        return port.close().catch(function () {});
+        return withTimeout(doRpc("webserial_close", { portName: name }), 1500);
+      })
+      .then(function () {
+        return withTimeout(port.close(), 1500);
       })
       .then(function () {
         console.info("[webserial] 已关闭 " + name);
@@ -1346,6 +2021,67 @@
 
   setTimeout(uiTick, 300); // 早一点开始拉，少一点"打开后空等"
 
+  /* ── 刷新后自动重连串口 ─────────────────────────────────────────────
+   * 刷新会丢掉 `wsActive`（本端没有打开的端口），而设备登记在**网关内存**里 ——
+   * 于是界面还显示着设备、每条指令却报 `DeviceNotFound("TDCR_v1")`，
+   * 表现是"拖了没反应、目标值永远是 --"。实测就是卡在这里。
+   *
+   * `port.open()` **不需要用户手势**（只有 `requestPort()` 需要），所以能自动补回来。
+   * **只在恰好授权过一个端口时自动连** —— 多端口时无法判断该连哪个，
+   * 宁可让操作员自己选，也不能连错设备。
+   */
+  /**
+   * **端口的物理指纹** ✓ —— Web Serial 拿不到 COM 号 ✗，
+   * 但 `getInfo()` 有 USB 的 VID/PID ✓（同型号会撞车 ✓，但足以区分"是不是上次那条"✓）。
+   */
+  function portKey(port) {
+    try {
+      var info = port && port.getInfo ? port.getInfo() : {};
+      var vid = info.usbVendorId == null ? 0 : info.usbVendorId;
+      var pid = info.usbProductId == null ? 0 : info.usbProductId;
+      return vid + ":" + pid;
+    } catch (ignored) {
+      return "0:0";
+    }
+  }
+
+  /**
+   * **清理残留的浏览器串口登记** ✓ —— 页面一加载就做一次 ✓。
+   *
+   * 场景：上一次会话异常退出（关标签 / 崩溃 / 旧版本没注销 ✓）→ 后端还留着
+   * `webserial:N` 的登记 ✓ → 界面里挂着一条**根本用不了的设备** ✓，
+   * 后端还会每秒尝试"重连"它 ✓（本 bug ✓）。
+   *
+   * 只注销**当前不是 ready/enabled** 的那些 ✓ —— 别的设备（手机）正在用的不动 ✗。
+   */
+  setTimeout(function () {
+    if (wsActive) return;
+    doRpc("list_connected_devices", {})
+      .then(function (list) {
+        (list || []).forEach(function (item) {
+          var portName = String((item && item.portName) || "");
+          var state = String((item && item.state) || "");
+          if (portName.indexOf("webserial:") !== 0) return;
+          if (state === "ready" || state === "enabled") return;
+          doRpc("webserial_close", { portName: portName }).catch(function () {});
+          console.info("[webserial] 已注销残留登记 " + portName + "（state=" + state + "）");
+        });
+      })
+      .catch(function () {});
+  }, 1500);
+
+  /**
+   * **不做任何自动重连** ✗ —— 用户明确要求"不许自己连串口" ✓。
+   *
+   * 历史教训（三次）：只要浏览器里授权过端口 ✓，就总有一段逻辑会把它 `open()` 掉 ✗ →
+   * 表现是"一刷新就自动连上、而且连的不一定是我要的那条"✗，
+   * 并且会留下"已连接但收不到数据"的僵尸设备 ✓（接收帧卡住 ✓）。
+   *
+   * 现在：**连不连、连哪条，完全由操作员点** ✓（「扫描串口」→ 选一行 → 连接 ✓）。
+   * 需要自动补连的场景（比如移动端断线重连）请显式调用 `__SOFTUI_WS__.reconnect()`
+   * 一类的能力，而不是默认行为 ✓。
+   */
+
   var windowInFlight = null;
   var windowLast = null;
 
@@ -1381,7 +2117,7 @@
     }
 
     // 串口枚举走本机，且必须同步发起以保留"用户手势"（requestPort 的硬性要求）
-    if (cmd === "list_serial_ports") return listLocalSerialPorts();
+    if (cmd === "list_serial_ports") return listLocalSerialPorts(Boolean(args && args.forcePick));
 
     // 拥有串口的那一端直接答本地数据：零往返、零下行流量
     if (P1_LOCAL_PARSE && wsActive && wsCodec) {
@@ -1403,7 +2139,16 @@
       var req = (args && args.request) || {};
       var pn = String(req.portName || "");
       if (pn.indexOf("webserial:") === 0) {
-        return wsConnect(parseInt(pn.slice(10), 10) || 0, req.baudRate);
+        /**
+         * ⚠ **不要 `|| 0` 回退** ✗ —— 索引解析不出来时回退到 0 ✓
+         * 就是"悄悄连上第一条端口"✗（正是"自动连了别的口"的来源之一 ✓）。
+         * 解析失败 / 索引失效一律报错 ✓，让操作员重新扫描选口 ✓。
+         */
+        var wsIndex = parseInt(pn.slice(10), 10);
+        if (!Number.isFinite(wsIndex) || wsIndex < 0) {
+          return Promise.reject(new Error("串口索引无效（" + pn + "），请点「扫描串口」重新选择。"));
+        }
+        return wsConnect(wsIndex, req.baudRate);
       }
       return doRpc(cmd, args);
     }
@@ -1562,6 +2307,16 @@
 
       var role = OBSERVER ? "观察端" : "数据源端";
       var parseMode = P1_LOCAL_PARSE ? "本机解析" : "后端解析";
+      // 协议版本与新帧计数都照实显示：出问题时一眼分出是「协商没成」还是
+      // 「压根没收到张力帧」，不用回去翻控制台。
+      var proto = wsActive && wsCodec
+        ? " · " + (wsCodec.lastVersion() >= 2 ? "V2" : "V1")
+        : "";
+      var telemetry = wsTensionFrames > 0 || wsCalibrationEvents > 0 || wsUnknownFrames > 0
+        ? " · τ" + wsTensionFrames +
+          (wsCalibrationEvents > 0 ? " 标定" + wsCalibrationEvents : "") +
+          (wsUnknownFrames > 0 ? " 未知" + wsUnknownFrames : "")
+        : "";
       var src = SYNC_SOURCE
         ? (SYNC_SOURCE.self ? " · 本端供数" : " · 源:" + (SYNC_SOURCE.label || SYNC_SOURCE.clientId))
         : " · 无串口";
@@ -1581,7 +2336,7 @@
           : " · " + applied + "/" + UI_TOTAL +
             (sinceRecv < 0 ? "" : " · " + (sinceRecv < 10 ? sinceRecv.toFixed(1) + "s前" : "空转" + Math.round(sinceRecv) + "s")) +
             (pending > 0 ? " · 待发" + pending : "");
-        label.textContent = "Rust · " + role + " · " + parseMode + src + multi + syncLabel;
+        label.textContent = "Rust · " + role + " · " + parseMode + proto + src + multi + syncLabel + telemetry;
         // 同步中让小球半透明呼吸，一眼看出在干活
         ball.style.opacity = sinceRecv >= 0 && sinceRecv < 1.5 ? "0.55" : "1";
       } else if (backend.mode === "sim") {

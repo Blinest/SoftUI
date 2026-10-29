@@ -97,12 +97,27 @@
   min-height: 0;
   min-width: 0;
   overflow: auto;
-  padding: 10px;
+  /* 侧栏滚动区 ✓ —— 文字用次级色 ✓（之前继承到 body 的主色 ✓，在侧栏底色上偏亮 ✗）*/
+  color: var(--text-secondary);
+  padding: 8px 10px;
+  display: grid;
+  gap: 8px;
+  align-content: start;   /* 内容不满时**从上往下排** ✓（默认 stretch 会被拉伸 ✗）*/
+}
+
+.responsive-rail-scroll a,
+.responsive-rail-scroll button {
+  color: inherit;
 }
 
 .responsive-rail.is-collapsed .responsive-rail-title {
+  /* 折叠后标题文字隐藏、只剩切换按钮。
+   * 之前是 `justify-items: center` —— 窄屏（标题条横铺整宽）时按钮落在**正中间** ✗；
+   * 改为靠右，符合"收起/展开在界面最右侧"的直觉 ✓。
+   * 桌面端折叠成 42px 竖栏时，这一改动视觉上无差别 ✓。 */
   grid-template-columns: 1fr;
-  justify-items: center;
+  justify-items: end;
+  justify-content: end;
 }
 
 .responsive-rail.is-collapsed .responsive-rail-title > span,
@@ -249,16 +264,121 @@ body.card-dragging .card-grid .feature-card.is-dragging,
   left: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+  /* 只留布局与裁切。边框 / 圆角 / 底色 / 颗粒 / 投影 / 模糊 / 倾斜全部由 .tilt-card
+     提供 —— 两个类挂在**同一个元素**上，分开写反而会互相覆盖。
+     overflow: hidden 按 .tilt-card 给的圆角裁内容，所以圆角不必在这重复。 */
   overflow: hidden;
-  border: 1px solid var(--border-default);
+}
+
+/* ---- 卡片：磨砂玻璃的模糊 + 跟随光标的光斑 / 边框提亮 / 轻微 3D 倾斜 ----
+ *
+ * 这一层只加"光"和"倾斜"，**不加任何布局属性**（position / 尺寸 / 边框 / 底色都留给
+ * 各自的卡片外壳）：.feature-card 是 position: absolute，.workspace-panel 是常规流
+ * 栅格子项，在这里写死任一种都会踩到另一边。
+ *
+ * ⚠️ 倾斜为什么能用 transform：CardGrid 把卡片位置写成**行内 `translate`**（独立属性），
+ * 于是 CSS 的 transform 空了出来。要是位置还用行内 `transform: translate(...)`，
+ * 行内样式会压过这里的 transform，倾斜根本不会生效 —— 这是最容易踩的坑。
+ *
+ * ⚠️ 这里**不写 transition**：CardGrid 有一批 `transition: none` /
+ * `transition: transform 200ms ...` 的规则（简写会整体接管 transition）在控制卡片的
+ * 滑位动画，写在这层的过渡会被它们吃掉或拖慢。复原动画由 useCardTilt() 自己算，
+ * 两边互不依赖，日后再加规则也不会互相破坏。 */
+.tilt-card {
+  /* ---- 磨砂玻璃本体 ----
+   * 底色、受光面、颗粒**全部烤在一张不透明贴图里**（tools/make_card_grain.py 生成），
+   * 这里只负责把它铺上。这是踩过坑之后的结论：
+   *   · 早先用「color-mix 半透明底色 + 中灰噪点 + background-blend-mode: overlay」，
+   *     极度依赖混合模式按预期生效 —— 实测一旦 overlay 没生效，那张**不透明的中灰**
+   *     噪点就会当普通图层盖上去，两个主题的卡片同时变成中灰。
+   *   · 而且半透明底色会把页面底色的灰带进卡片（"卡片发灰"的直接来源）。
+   * 贴图里已经包含正确的颜色，所以这里既不需要 background-color，也不需要混合模式。 */
+  /* 受光面是**整块的 CSS 渐变**，铺在贴图之上（两层都用默认的 normal 混合，
+     不依赖任何混合模式）。它不能烤进贴图：贴图是平铺的，随 y 变化的渐变会重复成横条纹。 */
+  background-image:
+    linear-gradient(160deg, var(--glass-card-sheen), transparent 58%),
+    var(--glass-card-grain);
+  background-repeat: repeat;
+  border: 1px solid var(--glass-card-border);
   border-radius: var(--radius-card);
-  background: var(--surface-panel);
+  box-shadow:
+    inset 0 1px 0 var(--glass-card-highlight),
+    var(--glass-card-shadow) 0 8px 24px;
   color: var(--text-primary);
-  box-shadow: 0 1px 2px rgb(8 20 29 / 8%);
+  /* 这里**刻意没有 backdrop-filter**：贴图是不透明的，背后有什么都看不见，
+     装上它只会白付一份合成开销。要恢复"透过去看到背面"的玻璃观感，
+     得先把 tools/make_card_grain.py 的 TILE_ALPHA 调到 1 以下。 */
+  /* 3D 倾斜：默认 0 度，由 JS 按光标位置逐帧写 --tilt-rx / --tilt-ry。
+     perspective 给一点"近大远小"，倾斜才不像单纯压扁。 */
+  transform:
+    perspective(900px)
+    rotateX(var(--tilt-rx, 0deg))
+    rotateY(var(--tilt-ry, 0deg));
+}
+
+
+/* 径向光斑：z-index: -1 在层叠顺序里正好夹在「卡片自身背景」与「常规流内容」之间，
+ * 所以光斑打在玻璃面上、不会糊住文字，也不需要给内容加 position / z-index。 */
+.tilt-card::before {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: radial-gradient(
+    var(--glass-card-spot-size) circle at var(--tilt-px, 50%) var(--tilt-py, 50%),
+    rgb(var(--glass-card-spot-rgb) / var(--glass-card-spot-alpha)),
+    transparent 62%
+  );
+  content: "";
+  opacity: 0;
+  transition: opacity 260ms ease;
+  pointer-events: none;
+}
+
+/* 边框局部提亮：1px 渐变描边（mask 挖空中间），渐变中心跟着光标走。
+ * 径向渐变自带"越远越淡"，所以"靠近光标的边框更亮"不需要按每条边单独算。 */
+.tilt-card::after {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  padding: 1px;
+  border-radius: inherit;
+  background: radial-gradient(
+    var(--glass-card-spot-size) circle at var(--tilt-px, 50%) var(--tilt-py, 50%),
+    var(--glass-card-edge),
+    transparent 66%
+  );
+  content: "";
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 260ms ease;
+  pointer-events: none;
+}
+
+.tilt-card:hover::before,
+.tilt-card:hover::after {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 只去掉倾斜；光斑与边框提亮保留 —— 那是静态高光，不是动效。
+     倾斜关掉后 transform: none 就不再产生层叠上下文，::before 的 z-index: -1
+     会漏到卡片背后，所以这里补一个 isolation 顶上。
+     （正常态刻意不加它：isolation 属于会建立 backdrop root 的那类属性，
+       有可能让同一元素上的 backdrop-filter 采样不到页面背景。） */
+  .tilt-card {
+    transform: none;
+    isolation: isolate;
+  }
 }
 
 .card-grid.is-animating .feature-card {
-  transition: transform 200ms cubic-bezier(0.2, 0, 0, 1), width 200ms cubic-bezier(0.2, 0, 0, 1),
+  /* 位置改用独立的 translate 属性（见 CardGrid 的行内样式），
+     所以这条也要跟着从 transform 改成 translate。 */
+  transition: translate 200ms cubic-bezier(0.2, 0, 0, 1), width 200ms cubic-bezier(0.2, 0, 0, 1),
     height 200ms cubic-bezier(0.2, 0, 0, 1);
 }
 
@@ -274,9 +394,11 @@ body.card-dragging .card-grid .feature-card.is-dragging,
 
 /* ---- 可编辑（拖动 / 缩放） ---- */
 
+.feature-card-grip-handle,
 .feature-card-grip {
   flex: 0 0 auto;
   color: var(--text-muted);
+  cursor: grab;
   opacity: 0.55;
 }
 
@@ -372,20 +494,29 @@ body.card-dragging .feature-card-grip-handle {
   position: absolute;
   right: 0;
   bottom: 0;
-  z-index: 2;
-  width: 22px;
-  height: 22px;
+  /* 提到内容之上 ✓ —— 原来 z-index:2 会被卡片内容（3D 画布、表格等）盖住 ✗ */
+  z-index: 6;
+  /* 画在**卡片内侧** ✓：卡片有 overflow:hidden 时，超出边界的部分会被裁掉 ✗ */
+  width: 20px;
+  height: 20px;
   background-image: linear-gradient(
     135deg,
     transparent 0 46%,
-    var(--border-default) 46% 56%,
+    /* 回退色必须写死 ✗ —— --border-default 缺失时整个渐变会变成透明 ✓ */
+    var(--border-default, #94a3b8) 46% 56%,
     transparent 56% 66%,
-    var(--border-default) 66% 76%,
+    var(--border-default, #94a3b8) 66% 76%,
     transparent 76%
   );
   cursor: nwse-resize;
   touch-action: none;
   opacity: 0.75;
+}
+
+.card-resize-handle {
+  /* 显式给个底色与不透明度，避免父级或主题没给变量时**完全看不见** ✗ */
+  opacity: 0.55;
+  pointer-events: auto;
 }
 
 .card-resize-handle:hover {
@@ -396,11 +527,45 @@ body.card-dragging .feature-card-grip-handle {
 .feature-card-header > div {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;        /* 手柄换到下一行 ✓ */
   gap: 7px;
   min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* 手柄保持自身尺寸 ✓。
+ * 历史教训：这里曾为了"手柄独占一行"写过 `flex: 0 0 100%` ✗ ——
+ * 那是**后台**的需求 ✓，写进全局样式后把**前台**的手柄拉成整行宽（473.67px）✗。
+ * 后台的布局由 admin.css 自己控制 ✓，全局这里只保证「不被拉伸」✓。 */
+.feature-card-header > div > .feature-card-grip-handle {
+  flex: 0 0 auto;
+  width: auto;
+}
+
+.feature-card-header > div > svg {
+  flex: 0 0 auto;         /* 图标不压缩 ✓ */
+}
+
+/* 标题里的图标容器（JSX 里 icon 被包进 h2 内部的 span ✓）
+ * —— flex 让「图标 + 文字」**必然同一行** ✓ */
+.feature-card-title-icon {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  /* 图标偏上 ✗ —— 因为 svg 默认是**行内元素**，会按文字基线对齐，留出基线间隙。
+     改成块级 + 自己垂直居中 ✓。 */
+  line-height: 0;
+}
+
+.feature-card-title-icon > svg {
+  display: block;
+  vertical-align: middle;
 }
 
 .feature-card-header h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
   margin: 0;
   overflow: hidden;
@@ -536,6 +701,28 @@ body.card-dragging .feature-card-grip-handle {
   .settings-navigation {
     grid-row: auto;
     max-height: 220px;
+  }
+
+  /* ⚠️ 折叠态的 `:has()` 规则（上面约 136 行）**没写进媒体查询** ✗，
+   * 在窄屏也生效，优先级还比这里的 `grid-template-columns: 1fr` 高（`:has()` + 2 个类），
+   * 于是手机上折叠后变成「42px + 1fr」两列 ✗ —— 页签被塞进第二列、
+   * 下方留出一大片空白。这里用同样带 `:has()` 的选择器把它压回单列 ✓。 */
+  .workbench-layout:has(.workbench-context.is-collapsed),
+  .chart-layout:has(.chart-channels.is-collapsed),
+  .settings-layout:has(.settings-navigation.is-collapsed) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 折叠后**只应剩下标题条**。
+   * 原来只隐藏了 `.responsive-rail-scroll`（display:none），但轨道模板
+   * `grid-template-rows: auto 1fr` 里的 **1fr 行仍在** ⇒ 抽屉收起后那块空间
+   * 还是被占着，下面的页签被挤下去，看起来就是"一片空白"✗。
+   * 去掉 1fr 轨道 + 取消 220px 上限，高度就只剩标题条 ✓。 */
+  .workbench-context.is-collapsed,
+  .chart-channels.is-collapsed,
+  .settings-navigation.is-collapsed {
+    grid-template-rows: auto;
+    max-height: none;
   }
 
   /* 卡片栅格不需要在这里改列数：列数由 CardGrid 实测容器宽度算出来，

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ChevronDown } from "lucide-react";
 import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 import { ChartLayout } from "./layouts/ChartLayout";
@@ -9,15 +10,26 @@ import { hasPermission } from "./state/permissions";
 import { chartsToCsv, downloadText, exportStamp } from "./utils/download";
 import { curvatureDistributionFromSnapshot, summarizeBackbone, buildBackboneFromCurvatureDistribution } from "./dynamics/svcModel";
 import type { ChartSection, DeviceSnapshot, RuntimeSnapshot, SessionInfo } from "./softuiTypes";
+import { getTargetHistory } from "./robot/previewOverride";
 import "./styles/charts.css";
 
-type ChartKind = "position" | "velocity" | "acceleration" | "curvature" | "sensorX" | "sensorY" | "sensorZ";
+type ChartKind =
+  | "velocity"
+  | "acceleration"
+  | "curvature"
+  | "tracking"
+  | "trackingError"
+  | "sensorX"
+  | "sensorY"
+  | "sensorZ";
 
 interface ChartPanelConfig {
   key: ChartKind;
   title: string;
   unit: string;
   match: (name: string, channelType: string) => boolean;
+  /** 按**通道序号**上色 ✓ —— 合并图里"实际 M1"和"理论 M1"必须同色 ✓ */
+  colorByChannelIndex?: boolean;
 }
 
 interface CursorReadout {
@@ -26,8 +38,36 @@ interface CursorReadout {
 }
 
 const CHARTS: ChartPanelConfig[] = [
-  { key: "position", title: "电机位移曲线", unit: "mm", match: (name, type) => type === "motor" && name.endsWith(" pos") },
-  { key: "velocity", title: "电机速度曲线", unit: "mm/s", match: (name, type) => type === "motor" && name.endsWith(" vel") },
+  {
+    // **实际 + 理论合并** ✓ —— 实际实线、理论虚线、同色同轴 ✓
+    key: "tracking",
+    title: "电机位移曲线",
+    unit: "mm",
+    colorByChannelIndex: true,
+    /**
+     * ⚠ 也要收下 `Motor N pos` ✗ —— 纯实际位移图**已删** ✓（被本图取代 ✓），
+     * 若这里不匹配 ✓，侧栏那些通道会变成"没有归属的图"✗（点勾选没地方去 ✓）。
+     */
+    match: (name, type) =>
+      type === "trackA" || type === "trackT" || (type === "motor" && name.endsWith(" pos")),
+  },
+  {
+    // **跟踪误差** ✓ —— 实际 − 理论，用来找规律（恒定滞后？随速度变大？）
+    key: "trackingError",
+    title: "电机跟踪误差",
+    unit: "mm",
+    colorByChannelIndex: true,
+    match: (_name, type) => type === "trackErr",
+  },
+  {
+    // **实际 + 理论合并** ✓（实际实线 ✓ 理论虚线 ✓ 同色 ✓）
+    key: "velocity",
+    title: "电机速度曲线",
+    unit: "mm/s",
+    colorByChannelIndex: true,
+    match: (name, type) =>
+      type === "velA" || type === "velT" || (type === "motor" && name.endsWith(" vel")),
+  },
   { key: "acceleration", title: "电机加速度曲线", unit: "mm/s²", match: (name, type) => type === "motor" && name.endsWith(" acc") },
   { key: "curvature", title: "曲率分布时间曲线", unit: "1/m", match: (_name, type) => type === "curvature" },
   { key: "sensorX", title: "传感器 X 轴曲线", unit: "N", match: (name, type) => type === "sensor" && name.endsWith(" X") },
@@ -72,13 +112,327 @@ function chartsFromFrames(frames: DeviceSnapshot[]): ChartSection | null {
   channels.push({ name: "κ max", unit: "1/m", channelType: "curvature", channelIndex: basisCount + 1, points: summaries.map((summary) => summary.maxKappaPerM) });
   channels.push({ name: "κ mean", unit: "1/m", channelType: "curvature", channelIndex: basisCount + 2, points: summaries.map((summary) => summary.meanKappaPerM) });
 
+  // 一路张力通道 = 一条曲线（旧的「每路三轴」已经不存在了）。
   for (const sensor of first.sensors) {
-    sensor.alias.forEach((axis, axisIndex) => {
-      channels.push({ name: `Sensor ${sensor.id} ${axis}`, unit: sensor.unit, channelType: "sensor", channelIndex: sensor.id, points: ordered.map((frame) => frame.sensors.find((item) => item.id === sensor.id)?.filtered[axisIndex] ?? 0) });
+    channels.push({
+      name: `张力通道 ${sensor.id}`,
+      unit: sensor.unit,
+      channelType: "sensor",
+      channelIndex: sensor.id,
+      points: ordered.map((frame) => frame.sensors.find((item) => item.id === sensor.id)?.filteredValue ?? 0),
     });
   }
 
   return { windowSize: ordered.length, timestamps, channels };
+}
+
+/**
+ * **目标位移 / 速度 —— 独立一套时间轴** ✓。
+ *
+ * 为什么必须独立 ✗：图表的 x 轴是**快照帧**（100ms ✓），而目标数据有自己的
+ * 采样时刻（80ms ✓）✗ —— 塞进同一个 x 轴，**x 和 y 永远对不准** ✗
+ * （同一个横坐标的纵坐标会随时间变化 ✗，这就是"错位"的本质 ✓）。
+ *
+ * 这里让目标曲线**自带 timestamps** ✓ → x 和 y 同源 ✓ → 严格一一对应 ✓。
+ */
+function targetCharts(): ChartSection | null {
+  const history = getTargetHistory();
+  if (history.length < 2) return null;
+  const timestamps = history.map((item) => item.at / 1000);
+  const channels: ChartSection["channels"] = [];
+
+  for (let index = 0; index < 6; index += 1) {
+    const series = history.map((item) => item.values[index] ?? 0);
+
+    // **中值 + 平均** ✓（去孤立跳变 ✓，抹圆台阶 ✓）
+    const raw = series.slice();
+    const medianed = series.slice();
+    for (let at = 0; at < medianed.length; at += 1) {
+      let lo = at - 2;
+      let hi = at + 2;
+      if (lo < 0) { hi = Math.min(raw.length - 1, hi + (0 - lo)); lo = 0; }
+      if (hi > raw.length - 1) { lo = Math.max(0, lo - (hi - (raw.length - 1))); hi = raw.length - 1; }
+      const window = raw.slice(lo, hi + 1).sort((a, b) => a - b);
+      medianed[at] = window[Math.floor(window.length / 2)];
+    }
+    const smooth = medianed.slice();
+    // **3 遍** ✓ —— 原来 2 遍压不住 1.6mm 的阶跃 ✗（→ 20mm/s 峰值 ✗）
+    for (let pass = 0; pass < 3; pass += 1) {
+      for (let at = 0; at < smooth.length; at += 1) {
+        let lo = at - 2;
+        let hi = at + 2;
+        if (lo < 0) { hi = Math.min(smooth.length - 1, hi + (0 - lo)); lo = 0; }
+        if (hi > smooth.length - 1) { lo = Math.max(0, lo - (hi - (smooth.length - 1))); hi = smooth.length - 1; }
+        let sum = 0;
+        for (let k = lo; k <= hi; k += 1) sum += smooth[k];
+        smooth[at] = sum / (hi - lo + 1);
+      }
+    }
+
+    channels.push({
+      name: `目标 M${index + 1}`,
+      unit: "mm",
+      channelType: "target",
+      channelIndex: index + 1,
+      points: series,
+    });
+
+    // **速度 = 平滑位移的差分** ✓
+    const velocity: number[] = [];
+    for (let at = 0; at < smooth.length; at += 1) {
+      if (at === 0) { velocity.push(0); continue; }
+      const dt = (history[at].at - history[at - 1].at) / 1000;
+      if (!Number.isFinite(dt) || dt < 0.005) { velocity.push(velocity[at - 1] ?? 0); continue; }
+      velocity.push((smooth[at] - smooth[at - 1]) / dt);
+    }
+    channels.push({
+      name: `目标速度 M${index + 1}`,
+      unit: "mm/s",
+      channelType: "targetVel",
+      channelIndex: index + 1,
+      points: velocity,
+    });
+  }
+
+  return { windowSize: history.length, timestamps, channels };
+}
+
+/**
+ * **实际 vs 理论：合并成同一张图 + 一张误差图** ✓。
+ *
+ * 两条数据源的时间轴本来不同 ✓（实际是快照帧 ~100ms ✓，目标是播放器 ~80ms ✓），
+ * 直接叠在一条轴上会**x/y 错位** ✗ —— 所以这里以**实际帧的时间轴**为基准 ✓，
+ * 把目标序列按时间**线性插值**到这条轴上 ✓ → 同一横坐标的纵坐标才是同一时刻的 ✓。
+ *
+ * · 合并图：`实际 MN pos`（实线 ✓）+ `理论 MN pos`（虚线 ✓），同色 ✓
+ * · 误差图：`误差 MN` = 实际 − 理论 ✓ —— 用来判断是**恒定滞后**（曲线整体平移 ✓）
+ *   还是**随速度变大**（幅值跟速度相关 ✓），两者对应的补偿手段完全不同 ✓
+ *
+ * 目标覆盖不到的时间段用 `NaN` 断线 ✓（不画假的连续段 ✗）。
+ */
+function interpolateAt(timestamps: number[], points: number[], at: number): number {
+  const count = timestamps.length;
+  if (count === 0) return Number.NaN;
+  if (at < timestamps[0] || at > timestamps[count - 1]) return Number.NaN;
+  let low = 0;
+  let high = count - 1;
+  while (high - low > 1) {
+    const mid = (low + high) >> 1;
+    if (timestamps[mid] <= at) low = mid;
+    else high = mid;
+  }
+  const t0 = timestamps[low];
+  const t1 = timestamps[high];
+  const v0 = points[low];
+  const v1 = points[high];
+  if (!Number.isFinite(v0) || !Number.isFinite(v1)) return Number.NaN;
+  if (t1 === t0) return v0;
+  return v0 + (v1 - v0) * ((at - t0) / (t1 - t0));
+}
+
+function buildTracking(
+  actual: ChartSection,
+  target: ChartSection | null,
+  delayMs = 0,
+): { merge: ChartSection | null; error: ChartSection | null } {
+  /**
+   * **理论曲线延时 τ** ✓ —— 对齐"指令 → 电机实际响应"的纯滞后 ✓。
+   *
+   * 为什么 ✗：理论值是"这一刻应该在哪"✓，实际值是"上一批指令走到的位置"✓，
+   * 两者相差一个传输 + 梯形加减速启动的纯滞后 τ（实测约 1s ✓）。
+   * 不补偿就直接同轴对比 ✓ → 两条线整体错开 ✓ → 看起来到处都不对 ✗，
+   * 其实只是相位差 ✓（用户要求：先把曲线对齐，再谈误差 ✓）。
+   *
+   * 做法：理论序列取 `t − τ` 处的值 ✓（等价于把理论曲线**右移** τ 秒 ✓）。
+   * 误差也用对齐后的理论算 ✓，这样剩下的差值才是**真正的跟踪误差** ✓。
+   */
+  const delaySec = Math.max(0, delayMs) / 1000;
+  if (!target || target.channels.length === 0) return { merge: null, error: null };
+  const timestamps = actual.timestamps ?? [];
+  if (timestamps.length < 2) return { merge: null, error: null };
+  const targetStamps = target.timestamps ?? [];
+
+  const mergeChannels: ChartSection["channels"] = [];
+  const errorChannels: ChartSection["channels"] = [];
+
+  for (let motor = 1; motor <= 6; motor += 1) {
+    const actualChannel = actual.channels.find(
+      (channel) => channel.channelType === "motor" && channel.name.endsWith(" pos") && channel.channelIndex === motor,
+    );
+    const targetChannel = target.channels.find(
+      (channel) => channel.channelType === "target" && channel.channelIndex === motor,
+    );
+    if (!actualChannel || !targetChannel) continue;
+
+    const actualPoints = actualChannel.points;
+    const targetPoints = timestamps.map((stamp) =>
+      // **延时对齐**：理论取 τ 之前的值 ✓
+      interpolateAt(targetStamps, targetChannel.points, stamp - delaySec),
+    );
+
+    mergeChannels.push({
+      name: `实际 M${motor} pos`,
+      unit: "mm",
+      channelType: "trackA",
+      channelIndex: motor,
+      points: actualPoints,
+    });
+    mergeChannels.push({
+      name: `理论 M${motor} pos`,
+      unit: "mm",
+      channelType: "trackT",
+      channelIndex: motor,
+      points: targetPoints,
+    });
+
+    errorChannels.push({
+      name: `误差 M${motor}`,
+      unit: "mm",
+      channelType: "trackErr",
+      channelIndex: motor,
+      points: actualPoints.map((value, index) => {
+        const targetValue = targetPoints[index];
+        if (!Number.isFinite(value) || !Number.isFinite(targetValue)) return Number.NaN;
+        return value - targetValue;
+      }),
+    });
+  }
+
+  if (mergeChannels.length === 0) return { merge: null, error: null };
+  return {
+    merge: { windowSize: timestamps.length, timestamps, channels: mergeChannels },
+    error: { windowSize: timestamps.length, timestamps, channels: errorChannels },
+  };
+}
+
+/**
+ * **速度：实际 + 理论合并** ✓ —— 和位移同一套做法 ✓。
+ *
+ * 实际速度来自快照帧 ✓（`Motor N vel` ✓），理论速度来自播放器 ✓（`目标速度 MN` ✓），
+ * 两条时间轴不同 ✓ → 同样以**实际帧时间轴**为基准插值对齐 ✓。
+ */
+function buildVelocityTracking(
+  actual: ChartSection,
+  target: ChartSection | null,
+): ChartSection | null {
+  if (!target || target.channels.length === 0) return null;
+  const timestamps = actual.timestamps ?? [];
+  if (timestamps.length < 2) return null;
+  const targetStamps = target.timestamps ?? [];
+  const channels: ChartSection["channels"] = [];
+
+  for (let motor = 1; motor <= 6; motor += 1) {
+    const actualChannel = actual.channels.find(
+      (channel) => channel.channelType === "motor" && channel.name.endsWith(" vel") && channel.channelIndex === motor,
+    );
+    const targetChannel = target.channels.find(
+      (channel) => channel.channelType === "targetVel" && channel.channelIndex === motor,
+    );
+    if (!actualChannel || !targetChannel) continue;
+
+    channels.push({
+      name: `实际 M${motor} vel`,
+      unit: "mm/s",
+      channelType: "velA",
+      channelIndex: motor,
+      points: actualChannel.points,
+    });
+    channels.push({
+      name: `理论 M${motor} vel`,
+      unit: "mm/s",
+      channelType: "velT",
+      channelIndex: motor,
+      points: timestamps.map((stamp) => interpolateAt(targetStamps, targetChannel.points, stamp)),
+    });
+  }
+
+  if (channels.length === 0) return null;
+  return { windowSize: timestamps.length, timestamps, channels };
+}
+
+/**
+ * **侧栏用的通道全集** ✓ —— 把"只在合并图里存在"的通道也算进来 ✓。
+ *
+ * 为什么需要 ✗：合并图的理论线 / 误差线只存在于派生的 section 里 ✓，
+ * 侧栏若只读 `activeCharts` ✓ → 列表里根本看不到它们 ✗ →
+ * "左侧导航栏内容不对" ✗（本 bug ✓）。
+ */
+function sidebarSection(
+  actual: ChartSection,
+  sections: Array<ChartSection | null>,
+): ChartSection {
+  /**
+   * ⚠ **`Motor N pos` / `Motor N vel` 不再进侧栏** ✗ ——
+   * 它们已经被合并图的 `实际 MN pos / vel` 取代 ✓，两边都列就是**一个电机两组勾选框** ✗
+   * （实测位移/速度各冒出 18 条 ✗，本 bug ✓）。加速度等其余通道照旧 ✓。
+   */
+  const channels = actual.channels.filter(
+    (channel) =>
+      !(channel.channelType === "motor" && (channel.name.endsWith(" pos") || channel.name.endsWith(" vel"))),
+  );
+  for (const section of sections) {
+    if (!section || section.timestamps.length !== actual.timestamps.length) continue;
+    for (const channel of section.channels) {
+      if (!channels.some((item) => item.name === channel.name)) channels.push(channel);
+    }
+  }
+  return { windowSize: actual.windowSize, timestamps: actual.timestamps, channels };
+}
+
+/**
+ * **导出用：把「理论位移」与「跟踪误差」并进同一张表** ✓。
+ *
+ * 三者都以**实际帧时间轴**为基准 ✓（见 `buildTracking` ✓）→ 行数一致 ✓，
+ * 可以直接并列成列 ✓，不会错行 ✗。
+ *
+ * 注意不重复导出"实际位移"✗ —— `activeCharts` 里本来就有 `Motor N pos` ✓，
+ * 这里只补**理论**与**误差**两类 ✓。
+ */
+function withTracking(
+  actual: ChartSection,
+  tracking: { merge: ChartSection | null; error: ChartSection | null },
+  velocity: ChartSection | null = null,
+): ChartSection {
+  const aligned = (section: ChartSection | null) =>
+    Boolean(section && section.timestamps.length === actual.timestamps.length);
+  const extra: ChartSection["channels"] = [];
+  if (aligned(tracking.merge)) {
+    extra.push(
+      ...(tracking.merge as ChartSection).channels.filter(
+        (channel) => channel.channelType === "trackT",
+      ),
+    );
+  }
+  if (aligned(tracking.error)) {
+    extra.push(...(tracking.error as ChartSection).channels);
+  }
+  // **理论速度也并进去** ✓（实际速度本来就在 `Motor N vel` 里 ✓）
+  if (aligned(velocity)) {
+    extra.push(
+      ...(velocity as ChartSection).channels.filter((channel) => channel.channelType === "velT"),
+    );
+  }
+  if (extra.length === 0) return actual;
+  return {
+    windowSize: actual.windowSize,
+    timestamps: actual.timestamps,
+    channels: [...actual.channels, ...extra],
+  };
+}
+
+/** **理论曲线滞后 τ（ms）** ✓ —— 默认 1000ms，可在页面顶部调 ✓。*/
+export const TRACKING_DELAY_KEY = "softui.trackingDelayMs";
+export const DEFAULT_TRACKING_DELAY_MS = 1000;
+
+export function readTrackingDelayMs(): number {
+  try {
+    const raw = window.localStorage.getItem(TRACKING_DELAY_KEY);
+    const value = raw == null ? Number.NaN : Number(raw);
+    if (Number.isFinite(value) && value >= 0 && value <= 5000) return value;
+  } catch {
+    /* 忽略 */
+  }
+  return DEFAULT_TRACKING_DELAY_MS;
 }
 
 function fallbackTimestamps(charts: ChartSection) {
@@ -147,6 +501,12 @@ function ChartPanel({ config, charts, paused, timeOrigin, hidden, onToggleChanne
   const plotRef = useRef<uPlot | null>(null);
   const lastKeyRef = useRef("");
   const [readout, setReadout] = useState<CursorReadout | null>(null);
+  /**
+   * 通道选项（勾选框）与实时读数是否展开。默认收起：
+   * 每张卡片展开时标题区要占三行（标题 / 图例 / 读数），图本身被挤得很矮；
+   * 收起后只留标题行，开关上直接写着"通道 n/m"，信息不丢。
+   */
+  const [optionsOpen, setOptionsOpen] = useState(false);
 
   const panelChannels = useMemo(() => charts.channels.filter((channel) => config.match(channel.name, channel.channelType)), [charts.channels, config]);
   const visibleChannels = useMemo(() => panelChannels.filter((channel) => !hidden[channel.name]), [hidden, panelChannels]);
@@ -178,7 +538,9 @@ function ChartPanel({ config, charts, paused, timeOrigin, hidden, onToggleChanne
         time: currentTimestamps[idx],
         values: currentChannels.map((channel, index) => ({
           name: channel.name,
-          color: COLORS[index % COLORS.length],
+          color: config.colorByChannelIndex
+            ? COLORS[(Math.max(1, channel.channelIndex) - 1) % COLORS.length]
+            : COLORS[index % COLORS.length],
           value: channel.points[idx] ?? null,
           unit: channel.unit || config.unit,
         })),
@@ -193,12 +555,25 @@ function ChartPanel({ config, charts, paused, timeOrigin, hidden, onToggleChanne
       scales: { x: { time: false }, y: {} },
       series: [
         {},
-        ...visibleChannels.map((channel, index): uPlot.Series => ({
-          label: channel.name,
-          stroke: COLORS[index % COLORS.length],
-          width: 1.4,
-          points: { show: false },
-        })),
+        ...visibleChannels.map((channel, index): uPlot.Series => {
+          /**
+           * **上色规则** ✓：
+           *   合并图按**通道序号**上色 ✓（实际 M1 与 理论 M1 必须同色 ✓），
+           *   其余图按序列顺序上色 ✓（保持原样 ✓）。
+           */
+          const dashed = channel.name.startsWith("理论");
+          const color = config.colorByChannelIndex
+            ? COLORS[(Math.max(1, channel.channelIndex) - 1) % COLORS.length]
+            : COLORS[index % COLORS.length];
+          return {
+            label: channel.name,
+            stroke: color,
+            width: dashed ? 1.2 : 1.7,
+            // **理论 = 虚线** ✓（实线/虚线是唯一区分手段 ✓，颜色要留给通道 ✓）
+            dash: dashed ? [5, 3] : undefined,
+            points: { show: false },
+          };
+        }),
       ],
       axes: [
         { label: "时间 s", stroke: "#8a95a3", grid: { stroke: "rgba(255,255,255,0.06)" }, values: (_plot, vals) => vals.map((value) => (value - timeOrigin).toFixed(1)) },
@@ -240,22 +615,37 @@ function ChartPanel({ config, charts, paused, timeOrigin, hidden, onToggleChanne
       <div className="chart-split-head">
         <div className="chart-split-title-row">
           <strong>{config.title}</strong>
-          <span>{readout ? `t=${formatRelativeSeconds(readout.time - timeOrigin)}` : "移动鼠标查看当前时间"}</span>
+          <div className="chart-split-title-actions">
+            <span>{readout ? `t=${formatRelativeSeconds(readout.time - timeOrigin)}` : "移动鼠标查看当前时间"}</span>
+            <button
+              aria-expanded={optionsOpen}
+              className={`chart-split-options${optionsOpen ? " is-open" : ""}`}
+              onClick={() => setOptionsOpen((previous) => !previous)}
+              type="button"
+            >
+              <ChevronDown aria-hidden="true" size={13} />
+              通道 {visibleChannels.length}/{panelChannels.length}
+            </button>
+          </div>
         </div>
-        <div className="chart-split-legend">
-          {panelChannels.map((channel, index) => (
-            <label className={hidden[channel.name] ? "muted" : ""} key={channel.name}>
-              <input type="checkbox" checked={!hidden[channel.name]} onChange={() => onToggleChannel(channel.name)} />
-              <i style={{ background: COLORS[index % COLORS.length] }} />
-              {channel.name}
-            </label>
-          ))}
-        </div>
-        <div className="chart-readout-values">
-          {(readout?.values ?? visibleChannels.map((channel, index) => ({ name: channel.name, color: COLORS[index % COLORS.length], value: null, unit: channel.unit || config.unit }))).map((item) => (
-            <span key={item.name}><i style={{ background: item.color }} />{item.name}: <strong>{formatValue(item.value, item.unit)}</strong></span>
-          ))}
-        </div>
+        {optionsOpen ? (
+          <>
+            <div className="chart-split-legend">
+              {panelChannels.map((channel, index) => (
+                <label className={hidden[channel.name] ? "muted" : ""} key={channel.name}>
+                  <input type="checkbox" checked={!hidden[channel.name]} onChange={() => onToggleChannel(channel.name)} />
+                  <i style={{ background: COLORS[index % COLORS.length] }} />
+                  {channel.name}
+                </label>
+              ))}
+            </div>
+            <div className="chart-readout-values">
+              {(readout?.values ?? visibleChannels.map((channel, index) => ({ name: channel.name, color: COLORS[index % COLORS.length], value: null, unit: channel.unit || config.unit }))).map((item) => (
+                <span key={item.name}><i style={{ background: item.color }} />{item.name}: <strong>{formatValue(item.value, item.unit)}</strong></span>
+              ))}
+            </div>
+          </>
+        ) : null}
       </div>
       <div className="chart-split-plot" ref={hostRef} />
     </section>
@@ -279,9 +669,45 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
   const toggleChannel = useCallback((name: string) => {
     setHidden((prev) => ({ ...prev, [name]: !prev[name] }));
   }, []);
-  const liveCharts = useMemo(() => chartsFromFrames(liveFrames), [liveFrames]);
+  /**
+   * **目标位移采样版本** ✓ —— 环形缓冲是普通数组 ✗，不是 React state ✓，
+   * 所以 `useMemo` 不会知道它变了 ✗（这就是"通道看不到目标曲线"的原因 ✓）。
+   * 这里每 300ms 顶一次 ✓，只在**播放中**才起定时器 ✓（空闲零开销 ✗）。
+   */
+  const [targetTick, setTargetTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (getTargetHistory().length === 0) return;
+      setTargetTick((n) => n + 1);
+    }, 300);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const liveCharts = useMemo(() => chartsFromFrames(liveFrames), [liveFrames, targetTick]);
   const historyCharts = useMemo(() => chartsFromFrames(historyFrames), [historyFrames]);
+  /** 目标曲线的数据（自己的时间轴 ✓）*/
+  const targetData = useMemo(() => targetCharts(), [targetTick]);
   const activeCharts: ChartSection = selectedSessionId === "live" ? liveCharts ?? emptyCharts() : historyCharts ?? emptyCharts();
+  /** **实际 vs 理论** ✓ —— 合并图 + 误差图（同一时间轴 ✓，x/y 同源 ✓）*/
+  /** **理论曲线延时 τ** ✓ —— 用户可调（默认 1000ms）✓ */
+  const [tauMs, setTauMs] = useState(DEFAULT_TRACKING_DELAY_MS);
+  useEffect(() => {
+    setTauMs(readTrackingDelayMs());
+  }, []);
+  const tracking = useMemo(
+    () => buildTracking(activeCharts, targetData, tauMs),
+    [activeCharts, targetData, tauMs],
+  );
+  /** **速度合并** ✓（实际实线 + 理论虚线 ✓）*/
+  const velocityTracking = useMemo(
+    () => buildVelocityTracking(activeCharts, targetData),
+    [activeCharts, targetData],
+  );
+  /** **侧栏通道全集** ✓ —— 合并图里的理论线 / 误差线也要能勾选 ✓ */
+  const sidebarCharts = useMemo(
+    () => sidebarSection(activeCharts, [tracking.merge, tracking.error, velocityTracking]),
+    [activeCharts, tracking, velocityTracking],
+  );
   const playbackMode = selectedSessionId !== "live";
 
   // 实时模式：独立高频拉取曲线窗口（100ms），不再依赖整份快照的 charts 字段。
@@ -302,7 +728,12 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
       }
     };
     void fetchWindow();
-    const timer = window.setInterval(fetchWindow, 100);
+    /**
+     * **曲线窗口轮询 10Hz → 4Hz** ✓ —— 源站是 HTTP/1.1 ✓，
+     * Cloudflare 到源站只有约 6 个并发连接 ✗ → 高频轮询会把连接占满 ✓ →
+     * 一次性命令（启动控制系统 / 下发）排队十几秒 ✗（本 bug ✓）。
+     */
+    const timer = window.setInterval(fetchWindow, 250);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -339,7 +770,11 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
   const exportAllChannels = () => {
     try {
       const suffix = selectedSessionId === "live" ? "实时" : selectedSessionId;
-      downloadText(`曲线-${suffix}-${exportStamp()}.csv`, chartsToCsv(activeCharts));
+      // **导出带上理论位移与跟踪误差** ✓ —— 三者同一条时间轴 ✓，可直接并列成列 ✓
+      downloadText(
+        `曲线-${suffix}-${exportStamp()}.csv`,
+        chartsToCsv(withTracking(activeCharts, tracking, velocityTracking)),
+      );
       setExportPath(`已导出 ${activeCharts.timestamps.length} 行`);
       setChartError("");
     } catch (error) {
@@ -358,18 +793,18 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
   );
   const visibleNames = useMemo(() => (
     new Set(
-      activeCharts.channels
+      sidebarCharts.channels
         .filter((channel) => !hidden[channel.name])
         .map((channel) => channel.name),
     )
-  ), [activeCharts.channels, hidden]);
+  ), [sidebarCharts.channels, hidden]);
 
   return (
     <ChartLayout
       channelsLabel="曲线通道"
       channels={
         <ChannelSidebar
-          channels={activeCharts.channels}
+          channels={sidebarCharts.channels}
           visibleNames={visibleNames}
           chartKeyFor={chartKeyFor}
           chartTitles={chartTitles}
@@ -391,18 +826,60 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
         />
       }
     >
-      <div className="charts-split-grid">
-        {CHARTS.map((config) => (
-          <ChartPanel
-            key={config.key}
-            config={config}
-            charts={activeCharts}
-            paused={paused}
-            timeOrigin={timeOrigin ?? activeCharts.timestamps?.[0] ?? 0}
-            hidden={hidden}
-            onToggleChannel={toggleChannel}
+      <div className="chart-tau-row">
+        <label>
+          理论曲线延时 τ
+          <input
+            type="number"
+            min={0}
+            max={5000}
+            step={50}
+            value={tauMs}
+            onChange={(event) => {
+              const next = Math.max(0, Math.min(5000, Number(event.target.value) || 0));
+              setTauMs(next);
+              try {
+                window.localStorage.setItem(TRACKING_DELAY_KEY, String(next));
+              } catch {
+                /* 忽略 */
+              }
+            }}
           />
-        ))}
+          ms
+        </label>
+        <span className="chart-tau-hint">
+          指令下发到电机实际响应有约 1s 纯滞后；这里把理论曲线右移 τ，
+          两条线才在同一相位上对比，误差才是真正的跟踪误差。
+        </span>
+      </div>
+
+      <div className="charts-split-grid">
+        {CHARTS.map((config) => {
+          // **目标曲线用自己的 section** ✓（自己的 timestamps ✓ → x/y 同源 ✓）
+          // **合并图 / 误差图** ✓ —— 都以"实际帧时间轴"为基准 ✓（见 buildTracking ✓）
+          const charts =
+            config.key === "tracking"
+              // 没有目标数据（历史会话 ✓）→ 退回只画实际线 ✓，别整张空着 ✗
+              ? (tracking.merge ?? activeCharts)
+              : config.key === "trackingError"
+                ? (tracking.error ?? emptyCharts())
+                : config.key === "velocity"
+                  ? (velocityTracking ?? activeCharts)
+                  : activeCharts;
+          return (
+            <ChartPanel
+              key={`${config.key}-${config.key === "tracking" || config.key === "trackingError" ? tauMs : "n"}`}
+              config={config}
+              charts={charts}
+              paused={paused}
+              // **目标图不共用 frame 的时间原点** ✗ ——
+              //   两百个 epoch 毫秒 / 1000 = 十几亿秒 ✗ → 轴刻度变成"几千秒"✗（本 bug ✓）
+              timeOrigin={timeOrigin ?? charts.timestamps?.[0] ?? 0}
+              hidden={hidden}
+              onToggleChannel={toggleChannel}
+            />
+          );
+        })}
       </div>
     </ChartLayout>
   );

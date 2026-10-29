@@ -47,6 +47,9 @@ const RIDGE: f64 = 1e-6;
 /// 依据：两组表的最近邻距离中位 ≈ 0.19 / 0.22、p90 ≈ 0.32 / 0.41、max ≈ 0.79 / 1.01。
 pub const COVERAGE_RADIUS_PER_M: f64 = 1.0;
 
+/// 覆盖扫描用的方位数（8 = 每 45°）。
+pub const DIRECTIONS: usize = 8;
+
 /// 表内**A 段** κ 的上限（1/m）。
 ///
 /// 由 `assets/kappa_table_*.bin` 的样本统计得到（40N: 1.68、60N: 1.81），只用于
@@ -60,22 +63,36 @@ static TABLE_60: &[u8] = include_bytes!("../assets/kappa_table_60.bin");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KappaTableKind {
+    /// 20 N 张力上限的表（新臂模型包才有）。
+    Limit20n,
     /// 40 N 张力上限的表。
     Limit40n,
-    /// 60 N 张力上限的表（默认，弯曲范围更深）。
+    /// 60 N 张力上限的表（旧臂默认，弯曲范围更深）。
     Limit60n,
 }
 
 impl KappaTableKind {
     pub fn bytes(self) -> &'static [u8] {
         match self {
+            Self::Limit20n => &[],   // 只随模型包提供
             Self::Limit40n => TABLE_40,
             Self::Limit60n => TABLE_60,
         }
     }
 
+    /// 由张力上限（N）反查档位；未知档位返回 `None`（调用方必须报错）。
+    pub fn from_tension(tension: u8) -> Option<Self> {
+        match tension {
+            20 => Some(Self::Limit20n),
+            40 => Some(Self::Limit40n),
+            60 => Some(Self::Limit60n),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
+            Self::Limit20n => "20N",
             Self::Limit40n => "40N",
             Self::Limit60n => "60N",
         }
@@ -106,6 +123,10 @@ pub struct KappaTable {
     displacements: Vec<[f64; N_DISPLACEMENTS]>,
     /// 直臂参考态 ΔL（mm）= 查询原点处的原始插值。
     reference: [f64; N_DISPLACEMENTS],
+    /// **每个方位**的覆盖上限（0°, 45°, … 315°），加载时算好。
+    ///
+    /// 原来只有一个标量 = 8 个方向的最小值 ✗ → 一个方向覆盖差，全系统陪跑 ✗。
+    covered_limits: [f64; DIRECTIONS],
 }
 
 impl KappaTable {
@@ -156,12 +177,20 @@ impl KappaTable {
         // 直臂参考态 = 查询原点 κ=0 处的原始插值 ⇒ `lookup(原点)` 严格为 0。
         let (reference, _, _) = raw_interp(&features, &displacements, [0.0; N_FEATURES])?;
 
-        Ok(Self {
+        let mut table = Self {
             kind,
             features,
             displacements,
             reference,
-        })
+            covered_limits: [0.0; DIRECTIONS],
+        };
+        // 每个方向各自二分一次（加载时算，运行时零开销 ✓）
+        for step in 0..DIRECTIONS {
+            let phi = std::f64::consts::TAU * step as f64 / DIRECTIONS as f64;
+            let limit = table.covered_kappa_limit_at(phi);
+            table.covered_limits[step] = limit;
+        }
+        Ok(table)
     }
 
     pub fn kind(&self) -> KappaTableKind {
@@ -237,18 +266,15 @@ impl KappaTable {
     ///
     /// 扫描口径偏保守（两段等大、方向任意都要落在覆盖半径内），宁可少给一点，
     /// 也不要给一个「发出去必失败」的上限。
-    pub fn covered_kappa_limit(&self) -> f64 {
-        const DIRECTIONS: usize = 8;
+    /// 某个**方位**上的覆盖上限（沿该方向二分）。
+    pub fn covered_kappa_limit_at(&self, phi: f64) -> f64 {
         const COARSE_STEP: f64 = 0.2;
         const MAX_KAPPA: f64 = 16.0;
 
+        let (sin, cos) = phi.sin_cos();
         let covered_at = |kappa: f64| -> bool {
-            (0..DIRECTIONS).all(|step| {
-                let phi = std::f64::consts::TAU * step as f64 / DIRECTIONS as f64;
-                let (sin, cos) = phi.sin_cos();
-                let query = [kappa * cos, kappa * sin, kappa * cos, kappa * sin];
-                matches!(self.lookup(query), Ok(hit) if hit.covered)
-            })
+            let query = [kappa * cos, kappa * sin, kappa * cos, kappa * sin];
+            matches!(self.lookup(query), Ok(hit) if hit.covered)
         };
 
         if !covered_at(0.0) {
@@ -275,6 +301,32 @@ impl KappaTable {
             }
         }
         (low * 100.0).floor() / 100.0
+    }
+
+    /// 8 个方向里的**最小**上限（保守口径，保留兼容）。
+    ///
+    /// 新代码应优先用 [`Self::covered_kappa_limit_for`] —— 一个方向覆盖差
+    /// 不该让所有方向陪跑 ✗。
+    pub fn covered_kappa_limit(&self) -> f64 {
+        self.covered_limits.iter().cloned().fold(f64::INFINITY, f64::min)
+    }
+
+    /// 8 个方向各自的覆盖上限（0°, 45°, … 315°）。
+    pub fn covered_kappa_limit_per_direction(&self) -> &[f64; DIRECTIONS] {
+        &self.covered_limits
+    }
+
+    /// 按**任意方位**取上限：在相邻两个方向之间线性插值。
+    pub fn covered_kappa_limit_for(&self, phi: f64) -> f64 {
+        let mut p = phi % std::f64::consts::TAU;
+        if p < 0.0 {
+            p += std::f64::consts::TAU;
+        }
+        let scaled = p / std::f64::consts::TAU * DIRECTIONS as f64;
+        let i = (scaled.floor() as usize) % DIRECTIONS;
+        let j = (i + 1) % DIRECTIONS;
+        let t = scaled - scaled.floor();
+        self.covered_limits[i] * (1.0 - t) + self.covered_limits[j] * t
     }
 }
 
@@ -510,6 +562,70 @@ mod tests {
             hit.displacement_mm[0],
             hit.displacement_mm[3],
         );
+    }
+
+    /// 测**每个方向**的可达上限（只打印，不断言）。
+    ///
+    /// 目的：判断 `covered_kappa_limit()` 取 8 方向最小值的代价有多大 ——
+    /// 如果多数方向能到 4+，那么"方向相关上限"是有价值的；如果都在 1 附近，
+    /// 那是**表本身**的覆盖问题，改上限没用。
+    #[test]
+    fn report_per_direction_kappa_limits() {
+        fn max_for(table: &KappaTable, phi: f64) -> f64 {
+            const MAX_KAPPA: f64 = 16.0;
+            let ok_at = |kappa: f64| -> bool {
+                let (sin, cos) = phi.sin_cos();
+                let query = [kappa * cos, kappa * sin, kappa * cos, kappa * sin];
+                matches!(table.lookup(query), Ok(hit) if hit.covered)
+            };
+            if !ok_at(0.0) {
+                return 0.0;
+            }
+            let mut low = 0.0_f64;
+            let mut probe = 0.0_f64;
+            while probe < MAX_KAPPA {
+                probe = (probe + 0.2).min(MAX_KAPPA);
+                if !ok_at(probe) {
+                    break;
+                }
+                low = probe;
+            }
+            let mut high = (low + 0.2).min(MAX_KAPPA);
+            for _ in 0..12 {
+                let mid = 0.5 * (low + high);
+                if ok_at(mid) {
+                    low = mid;
+                } else {
+                    high = mid;
+                }
+            }
+            low
+        }
+
+        for kind in [KappaTableKind::Limit20n, KappaTableKind::Limit40n, KappaTableKind::Limit60n] {
+            let Ok(table) = KappaTable::load(kind) else {
+                println!("{kind:?}: 未加载");
+                continue;
+            };
+            let mut parts = Vec::new();
+            let mut worst = f64::INFINITY;
+            for step in 0..8 {
+                let phi = std::f64::consts::TAU * step as f64 / 8.0;
+                let limit = max_for(&table, phi);
+                worst = worst.min(limit);
+                parts.push(format!("{:>5.2}", limit));
+            }
+            println!(
+                "{kind:?}: [{}]  最小={:.2}  最大={:.2}  全局(现用)={:.2}",
+                parts.join(" "),
+                worst,
+                parts
+                    .iter()
+                    .map(|p| p.trim().parse::<f64>().unwrap_or(0.0))
+                    .fold(0.0_f64, f64::max),
+                table.covered_kappa_limit(),
+            );
+        }
     }
 
     #[test]

@@ -64,7 +64,8 @@ pub struct MotorDynamicsState {
 #[serde(rename_all = "camelCase")]
 pub struct SensorDynamicsState {
     pub id: u32,
-    pub force_n: [f64; 3],
+    /// 滤波 + 通道平衡后的张力（N）。指令集里一路通道只有一个值，不再分轴。
+    pub force_n: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -448,12 +449,12 @@ const GROUP_B_CABLES: [usize; 3] = [1, 3, 5];
 const GROUP_A_ALPHAS: [f64; 3] = [0.0, 2.0 * PI / 3.0, 4.0 * PI / 3.0];
 const GROUP_B_ALPHAS: [f64; 3] = [PI / 3.0, PI, 5.0 * PI / 3.0];
 
-fn sensor_value(input: &DynamicsInput, sensor_id: u32, axis: usize) -> Option<f64> {
+fn sensor_value(input: &DynamicsInput, sensor_id: u32) -> Option<f64> {
     input
         .sensors
         .iter()
         .find(|s| s.id == sensor_id)
-        .and_then(|s| s.force_n.get(axis).copied())
+        .map(|s| s.force_n)
         .filter(|v| v.is_finite())
 }
 
@@ -466,12 +467,12 @@ fn motor_position(input: &DynamicsInput, motor_id: u32) -> Option<f64> {
         .filter(|v| v.is_finite())
 }
 
-/// Extract per-cable tendon forces from sensors (sensor id i maps to cable i-1, axis 0).
+/// Extract per-cable tendon forces from sensors (sensor id i maps to cable i-1).
 pub(crate) fn derive_tendon_forces_from_sensors(input: &DynamicsInput) -> ([f64; 6], usize) {
     let mut forces = [0.0f64; 6];
     let mut present = 0usize;
     for (cable_index, entry) in forces.iter_mut().enumerate() {
-        if let Some(value) = sensor_value(input, (cable_index + 1) as u32, 0) {
+        if let Some(value) = sensor_value(input, (cable_index + 1) as u32) {
             *entry = value.max(0.0);
             present += 1;
         }
@@ -642,7 +643,7 @@ pub(crate) fn dynamics_input_from_frame(
         .iter()
         .map(|s| SensorDynamicsState {
             id: s.id,
-            force_n: s.filtered,
+            force_n: s.filtered_value,
         })
         .collect();
 
@@ -800,9 +801,8 @@ mod tests {
             sensors: (1..=6)
                 .map(|i| SensorState {
                     id: i,
-                    raw: [i as f64, 0.0, 0.0],
-                    filtered: [i as f64, 0.0, 0.0],
-                    alias: ["X".into(), "Y".into(), "Z".into()],
+                    raw_value: i as f64,
+                    filtered_value: i as f64,
                     unit: "N".into(),
                     quality: FrameQuality::Ok,
                 })

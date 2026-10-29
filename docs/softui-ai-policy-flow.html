@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>智能策略编排 · 逻辑流程（按现有代码）</title>
+<style>
+  :root{
+    --ink:#0f172a; --ink2:#334155; --muted:#64748b; --faint:#94a3b8;
+    --line:#e2e8f0; --line2:#cbd5e1; --paper:#ffffff; --bg:#f6f7f9;
+    --blue:#1d4ed8; --blue-bg:#eef3ff; --blue-line:#c7d7fe;
+    --teal:#0f766e; --teal-bg:#effbf8; --teal-line:#b7e4dc;
+    --amber:#b45309; --amber-bg:#fff8ec; --amber-line:#f3d9ab;
+    --red:#b42318; --red-bg:#fef3f2; --red-line:#f5c9c4;
+    --violet:#5b21b6; --violet-bg:#f5f1ff; --violet-line:#ddd0fb;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:14px/1.6 "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased; padding:40px 24px 64px;
+  }
+  .sheet{
+    max-width:1120px;margin:0 auto;background:var(--paper);border:1px solid var(--line);
+    border-radius:16px;padding:34px 38px 40px;box-shadow:0 12px 40px rgba(15,23,42,.07);
+  }
+  header{border-bottom:1.5px solid var(--ink);padding-bottom:14px;margin-bottom:26px}
+  h1{font-size:22px;font-weight:700;letter-spacing:-.2px}
+  .sub{margin-top:5px;font-size:12px;color:var(--muted);font-family:var(--mono)}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:12px;font-size:11.5px;color:var(--muted)}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:1px}
+  .legend .l1{background:var(--blue)} .legend .l2{background:var(--teal)}
+  .legend .l3{background:var(--amber)} .legend .l4{background:var(--red)}
+  .legend .l5{background:var(--violet)}
+
+  /* 主流程：左轴 + 右分支 */
+  .flow{display:grid;grid-template-columns:minmax(0,1fr) 300px;column-gap:34px;row-gap:0}
+  .span2{grid-column:1 / -1}
+
+  .step{position:relative;display:grid;grid-template-columns:34px 1fr;gap:12px}
+  .step .idx{
+    width:26px;height:26px;border-radius:8px;display:grid;place-items:center;
+    font-family:var(--mono);font-size:11px;font-weight:600;
+    background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue-line);
+    margin-top:3px;
+  }
+  .card{
+    border:1px solid var(--line);border-radius:11px;padding:12px 14px;background:#fff;
+  }
+  .card h3{font-size:13.5px;font-weight:650;letter-spacing:-.1px;display:flex;align-items:center;gap:8px}
+  .card h3 .tag{
+    font-family:var(--mono);font-size:9.5px;font-weight:500;letter-spacing:.4px;
+    color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:0 5px;
+  }
+  .card p{margin-top:6px;font-size:12.5px;color:var(--ink2);line-height:1.62}
+  .card ul{margin:7px 0 0 0;padding-left:16px}
+  .card li{font-size:12.5px;color:var(--ink2);margin:3px 0;line-height:1.55}
+  code{font-family:var(--mono);font-size:11.5px;background:#f1f5f9;border:1px solid var(--line);
+    border-radius:4px;padding:0 4px;color:#1e293b;white-space:nowrap}
+
+  /* 后端子流程 */
+  .step.backend .idx{background:var(--teal-bg);color:var(--teal);border-color:var(--teal-line)}
+  .step.backend .card{border-color:var(--teal-line);background:var(--teal-bg)}
+  .step.backend .flowinner{margin-top:8px;display:grid;gap:6px}
+  .mini{
+    display:flex;gap:8px;align-items:baseline;font-size:12px;color:var(--ink2);
+    padding:5px 9px;border-radius:7px;background:#fff;border:1px solid var(--teal-line);
+  }
+  .mini b{font-family:var(--mono);font-size:10px;color:var(--teal);flex:0 0 auto;letter-spacing:.5px}
+
+  /* 判断 */
+  .step.decision .idx{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-line)}
+  .step.decision .card{border-color:var(--amber-line);background:var(--amber-bg)}
+  .step.decision h3 .tag{color:var(--amber);border-color:var(--amber-line)}
+
+  /* 分支卡（右侧） */
+  .branch{position:relative;display:flex;align-items:flex-start;gap:0}
+  .branch .hair{
+    flex:0 0 auto;width:34px;height:1px;margin-top:22px;
+    background:repeating-linear-gradient(90deg,var(--red-line) 0 5px,transparent 5px 10px);
+  }
+  .branch .fcard{
+    flex:1;border:1px dashed var(--red-line);background:var(--red-bg);border-radius:10px;
+    padding:10px 12px;font-size:12px;color:var(--red);
+  }
+  .branch .fcard b{display:block;font-size:12px;color:var(--red);margin-bottom:3px}
+  .branch .fcard span{color:#7f1d1d;font-size:11.5px;line-height:1.55;display:block}
+
+  /* 竖直连线 */
+  .link{grid-column:1 / 2;height:20px;margin-left:13px;position:relative}
+  .link::before{content:"";position:absolute;left:0;top:0;bottom:8px;width:1px;background:var(--line2)}
+  .link::after{
+    content:"";position:absolute;left:-3px;bottom:2px;width:7px;height:7px;
+    border-right:1px solid var(--line2);border-bottom:1px solid var(--line2);
+    transform:rotate(45deg);
+  }
+
+  /* 收尾：方案落地 */
+  .step.persist .idx{background:var(--violet-bg);color:var(--violet);border-color:var(--violet-line)}
+  .step.persist .card{border-color:var(--violet-line);background:var(--violet-bg)}
+
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}
+  .split div{border:1px solid var(--violet-line);background:#fff;border-radius:8px;padding:8px 10px;font-size:11.5px;color:var(--ink2)}
+  .split div b{display:block;color:var(--violet);font-size:11.5px;margin-bottom:2px}
+
+  footer{margin-top:26px;border-top:1px solid var(--line);padding-top:14px;
+    font-size:11.5px;color:var(--faint);font-family:var(--mono);line-height:1.75}
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <header>
+    <h1>智能策略编排 · 逻辑流程</h1>
+    <div class="sub">AiComposeDialog.compose → RPC ai_compose_policy → 校验 → 草案 → 方案入库</div>
+    <div class="legend">
+      <span><i class="l1"></i>前端主流程</span>
+      <span><i class="l2"></i>后端（Rust）</span>
+      <span><i class="l3"></i>判定点</span>
+      <span><i class="l4"></i>失败分支（不落地）</span>
+      <span><i class="l5"></i>入库与审批</span>
+    </div>
+  </header>
+
+  <div class="flow">
+
+    <!-- 1 -->
+    <div class="step">
+      <div class="idx">01</div>
+      <div class="card">
+        <h3>用户输入 <span class="tag">compose()</span></h3>
+        <p>自然语言需求，例如「先切 20N 模型，巡检动作跑三遍，张力超 18N 停 2 秒再继续」。</p>
+        <ul>
+          <li>拼接对话历史：<code>之前的对话：…&#92;n&#92;n本次要求：…</code></li>
+          <li>用户气泡即刻上屏；<code>setDraft(null)</code> 清空上一轮草案</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- 2 -->
+    <div class="step">
+      <div class="idx">02</div>
+      <div class="card">
+        <h3>组装上下文 <span class="tag">context</span></h3>
+        <p>把「现场有哪些东西」一并交给模型，避免它编造不存在的对象。</p>
+        <ul>
+          <li><code>models[]</code>：<b>仅</b> <code>{ id, name }</code> —— 物理参数（臂长 / 曲率上限）不进来，由动作库的可行性检查负责</li>
+          <li><code>actions[]</code>：<code>{ id, name, durationSec }</code>，时长取自可行性缓存的 <code>feasibility.models[].durationMs</code> / <code>plan.durationMs</code>，未检查过为 <code>null</code></li>
+          <li><code>currentScheme</code>：对话框自身的 <code>draft</code>（AI 上一轮产物，无则 null），不是正在编辑的方案</li>
+          <li>序列化后以「可用清单：{JSON}」并入 user message；同一份清单也用于前端 <code>problems[]</code> 校验</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="link"></div>
+
+    <!-- 3 后端 -->
+    <div class="step backend">
+      <div class="idx">03</div>
+      <div class="card">
+        <h3>RPC：<code>ai_compose_policy</code> <span class="tag">lib.rs</span></h3>
+        <div class="flowinner">
+          <div class="mini"><b>KEY</b>账号自有 Key 优先 → 回落全局配置 → 都没有则报错</div>
+          <div class="mini"><b>SYS</b><code>AI_POLICY_SYSTEM_PROMPT</code>：输出骨架 + 5 条规则（只能用 context 里的 id、kind 枚举、时长范围…）</div>
+          <div class="mini"><b>USR</b><code>可用清单：{context}&#92;n&#92;n用户需求：{prompt}</code></div>
+          <div class="mini"><b>REQ</b><code>response_format: json_object</code> · <code>temperature: 0.2</code> · 超时 60s</div>
+          <div class="mini"><b>POST</b>OpenAI 兼容 <code>/chat/completions</code>，Bearer 鉴权</div>
+          <div class="mini"><b>TAKE</b>取 <code>choices[0].message.content</code></div>
+          <div class="mini"><b>CLEAN</b>剥 <code>```json</code> 围栏 → <code>serde_json::from_str</code></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="hair"></div>
+      <div class="fcard">
+        <b>F1 · HTTP / 解析失败</b>
+        <span>非 2xx → 截断前 300 字报错<br />content 缺失 → 「响应里没有 content」<br />JSON 非法 → 「返回的不是合法 JSON」</span>
+      </div>
+    </div>
+
+    <div class="link"></div>
+
+    <!-- 4 校验判定 -->
+    <div class="step decision">
+      <div class="idx">04</div>
+      <div class="card">
+        <h3>逐条语义校验 <span class="tag">problems[]</span></h3>
+        <ul>
+          <li><code>action</code> → <code>actionId</code> 必须命中 <code>context.actions</code></li>
+          <li><code>switch-model</code> → <code>modelId</code> 必须命中 <code>context.models</code></li>
+          <li><code>durationSec</code> ∈ (0, 3600]</li>
+          <li>中断 <code>targetId</code> → 按 <code>targetKind</code> 命中 models / actions</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="hair"></div>
+      <div class="fcard">
+        <b>F2 · 校验不通过</b>
+        <span>最多回显 4 条问题，<strong>整个方案不落地</strong>；用户改口后带历史重走 01</span>
+      </div>
+    </div>
+
+    <div class="link"></div>
+
+    <!-- 5 落地 -->
+    <div class="step">
+      <div class="idx">05</div>
+      <div class="card">
+        <h3>生成草案 <span class="tag">setDraft()</span></h3>
+        <p>主键由系统生成，不采信模型给的 ID。</p>
+        <ul>
+          <li>时间线：<code>id = block-{Date.now()}-{i}</code></li>
+          <li>中断：<code>id = intr-{Date.now()}-{i}</code>，补 <code>enabled=true</code> / <code>trigger="tension-spike"</code> / <code>resume=true</code> / <code>note=""</code></li>
+          <li>气泡摘要：<code>N 段时间线 · M 条中断</code></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="branch">
+      <div class="hair"></div>
+      <div class="fcard">
+        <b>F3 · 用户不接受</b>
+        <span>「再短一点」「阈值改成 3N」→ 作为新输入回到 01，<code>currentScheme</code> 与历史一起带给模型</span>
+      </div>
+    </div>
+
+    <div class="link"></div>
+
+    <!-- 6 入库 -->
+    <div class="step persist">
+      <div class="idx">06</div>
+      <div class="card">
+        <h3>写入方案 · 按角色分流 <span class="tag">persist()</span></h3>
+        <div class="split">
+          <div><b>管理员</b><code>canWriteDirectly()</code> → 直接落盘生效，全部终端 5 秒内同步</div>
+          <div><b>操作员</b><code>submitUiStore()</code> → 进入待审队列，批准后才生效</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <footer>
+    代码位置：src/pages/AiComposeDialog.tsx · compose() / 校验循环 · src-tauri/src/lib.rs · ai_compose_policy() · AI_POLICY_SYSTEM_PROMPT<br />
+    注：图中不含「段数约束」「语义归纳摘要」「草案版本链」—— 这三项当前代码里没有实现。
+  </footer>
+
+</div>
+</body>
+</html>

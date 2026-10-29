@@ -69,15 +69,50 @@
   min-width: 0;
 }
 
+/* 分组标题同时就是折叠开关。原来是个纯文本 div，三组 × 6 个通道全铺开时
+   侧栏二十多行，想找的通道得一直滚。 */
 .channel-group-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
+  width: 100%;
   min-width: 0;
+  /* 覆盖 base.css 里 button 的 min-height，否则标题会比通道行高一截 */
+  min-height: 0;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
   color: var(--text-muted);
   font-size: 12px;
   font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.channel-group-header:hover {
+  border-color: var(--border-subtle);
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+.channel-group-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 收起时箭头指右，展开时转回向下 */
+.channel-group-chevron {
+  flex: 0 0 auto;
+  transform: rotate(-90deg);
+  transition: transform 160ms ease;
+}
+
+.channel-group.is-open .channel-group-chevron {
+  transform: rotate(0deg);
 }
 
 .channel-count {
@@ -188,6 +223,47 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 标题行右侧：时间读数 + 选项开关 */
+.chart-split-title-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* "通道 n/m" 下拉开关：收起后图区能多出两行高度。 */
+.chart-split-options {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  /* 覆盖 base.css 里 button 的 min-height */
+  min-height: 0;
+  padding: 2px 7px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.chart-split-options:hover {
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+.chart-split-options svg {
+  transform: rotate(-90deg);
+  transition: transform 160ms ease;
+}
+
+.chart-split-options.is-open svg {
+  transform: rotate(0deg);
+}
+
 .chart-split-legend {
   display: flex;
   flex-wrap: wrap;
@@ -259,4 +335,42 @@
     grid-template-columns: minmax(0, 1fr);
     grid-auto-rows: minmax(240px, auto);
   }
+}
+
+/* 理论曲线延时 τ 调节行 ✓ —— 曲线分析页顶部 */
+.chart-tau-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.1));
+  border-radius: 9px;
+  background: rgba(76, 154, 255, 0.06);
+  font-size: 12px;
+  color: var(--text-muted, #8fa3c8);
+}
+.chart-tau-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-primary, #e8eefc);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chart-tau-row input {
+  width: 78px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.25);
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.chart-tau-hint {
+  flex: 1 1 260px;
+  min-width: 0;
+  line-height: 1.5;
 }

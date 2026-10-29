@@ -22,7 +22,13 @@ const STORAGE_PREFIX = "softui:layout";
  * 布局数据结构版本。卡片集合有增删（例如把摄像头从 3D 卡片里拆出来）时递增，
  * 这样用户本地缓存的旧布局会被判为不合法并回落到新的默认布局，而不是缺卡片。
  */
-const LAYOUT_SCHEMA_VERSION = 3;
+/**
+ * 布局数据结构版本。**卡片集合有增减时必须递增** ✓
+ * —— 旧布局里没有新卡的 id，`validateLayout` 会把它判废并回落默认 ✓
+ * （否则新卡"凭空消失"，就像后台的「自助注册策略」那样 ✗）。
+ * v3 → v4：后台新增 `registration` 卡 ✓
+ */
+const LAYOUT_SCHEMA_VERSION = 5;
 
 const DASHBOARD_CARD_IDS: DashboardCardId[] = [
   "connection",
@@ -45,17 +51,22 @@ const MONITOR_CARD_IDS: MonitorCardId[] = [
   "recentAlerts",
 ];
 
+/** 后台管理页的卡片（每栏一张 ✓）。 */
+const ADMIN_CARD_IDS = ["overview", "account", "users", "deviceAccess"] as const;
+
 const MANUAL_CARD_IDS: ManualCardId[] = [
-  "modelPackage",
   "curvatureDrag",
   "motorControl",
-  "sensorMonitor",
+  "systemControl",
 ];
 
 const AUTOMATIC_CARD_IDS: AutomaticCardId[] = [
-  "systemControl",
+  "modelPackage",
+  "sensorMonitor",
   "pidControl",
   "cycleLife",
+  "policyRules",
+  "motionLibrary",
 ];
 
 /** 卡片尺寸每一维的上限（列 / 行都是 1~4 格）。 */
@@ -168,24 +179,42 @@ export const defaultWorkspaceMonitorLayout: PageLayout = freezeLayout({
   ],
 });
 
-/** 设备工作台「手动控制」标签默认布局。 */
+/** 设备工作台「控制」标签默认布局。 */
 export const defaultWorkspaceManualLayout: PageLayout = freezeLayout({
   schemaVersion: LAYOUT_SCHEMA_VERSION,
   cards: [
-    { id: "modelPackage", size: "4x1", visible: true },
+    // 系统操作权限（含急停）排**最上面**：它是使能开关，先使能才有后续操作 ✓
+    { id: "systemControl", size: "4x1", visible: true },
     { id: "curvatureDrag", size: "2x3", visible: true },
     { id: "motorControl", size: "2x1", visible: true },
-    { id: "sensorMonitor", size: "2x1", visible: true },
   ],
 });
 
-/** 设备工作台「自动控制」标签默认布局。 */
+/** 设备工作台「参数调整」标签默认布局。 */
 export const defaultWorkspaceAutomaticLayout: PageLayout = freezeLayout({
   schemaVersion: LAYOUT_SCHEMA_VERSION,
   cards: [
-    { id: "systemControl", size: "4x1", visible: true },
+    { id: "modelPackage", size: "4x1", visible: true },
+    { id: "sensorMonitor", size: "2x1", visible: true },
     { id: "pidControl", size: "2x1", visible: true },
     { id: "cycleLife", size: "2x1", visible: true },
+    { id: "policyRules", size: "2x2", visible: true },
+    { id: "motionLibrary", size: "2x2", visible: true },
+  ],
+});
+
+/** 后台管理页默认布局：概览一张卡（3 个数字放一起 ✓）、其余一栏一张 ✓ */
+const defaultAdminLayout: PageLayout = freezeLayout({
+  schemaVersion: LAYOUT_SCHEMA_VERSION,
+  // ⚠ 迁移期：只放**已经搬进 CardGrid 的卡片** ✗ —— 其余 4 栏还在旧的
+  // `<section className="admin-panel">` 里。如果这里列了它们、但 childrenForCard
+  // 返回 null，它们会渲染成**空卡片**把栅格撑高（实测 2879px ✗）。
+  // 每搬完一栏就把对应 id 加进来 ✓。
+  cards: [
+    { id: "overview", size: "2x1", visible: true },
+    { id: "account", size: "2x2", visible: true },
+    { id: "users", size: "2x2", visible: true },
+    { id: "deviceAccess", size: "2x2", visible: true },
   ],
 });
 
@@ -203,6 +232,8 @@ function allowedCardIds(page: LayoutPage): string[] {
       return MANUAL_CARD_IDS;
     case "workspace-automatic":
       return AUTOMATIC_CARD_IDS;
+    case "admin":
+      return [...ADMIN_CARD_IDS];
     default:
       return DASHBOARD_CARD_IDS;
   }
@@ -215,6 +246,8 @@ export function defaultLayoutForPage(page: LayoutPage): PageLayout {
   const source =
     page === "workspace-monitor"
       ? defaultWorkspaceMonitorLayout
+      : page === "admin"
+        ? defaultAdminLayout
       : page === "workspace-manual"
         ? defaultWorkspaceManualLayout
         : page === "workspace-automatic"
@@ -253,13 +286,23 @@ export function validateLayout(value: unknown, page: LayoutPage = "dashboard"): 
     seen.add(card.id);
     cards.push({ id: card.id, size: card.size, visible: card.visible });
   }
+  // ⚠ 先补齐"新增卡片"再校验 ✗ —— 否则每次上线新卡片，用户保存过的旧布局都会
+  // 被判废并整体重置（连他调好的顺序一起丢 ✗）。补到末尾即可 ✓。
+  for (const id of allowed) {
+    if (!seen.has(id)) {
+      cards.push({ id, size: "2x1", visible: true });
+      seen.add(id);
+    }
+  }
+
   // 安全卡片必须存在；监控页则要求 3D 与摄像头卡片都在，避免旧布局缺卡片。
   if (page === "dashboard" && !seen.has("connection")) return defaultLayoutForPage(page);
   if (page === "workspace-monitor" && !(seen.has("model3d") && seen.has("camera"))) {
     return defaultLayoutForPage(page);
   }
-  // 自动控制页必须有系统操作卡片（含急停）。
-  if (page === "workspace-automatic" && !seen.has("systemControl")) {
+  // **含急停**的系统操作卡片现在在「控制」页 —— 校验跟着卡片走 ✓。
+  // 漏改这条的后果：参数调整页每次都因缺 systemControl 而回落默认布局 ✗。
+  if (page === "workspace-manual" && !seen.has("systemControl")) {
     return defaultLayoutForPage(page);
   }
   return { schemaVersion: LAYOUT_SCHEMA_VERSION, cards };

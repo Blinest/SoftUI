@@ -31,7 +31,9 @@ export type CurvatureDerivationSource =
   | "sensorMotorFusion"
   | "forceOnly"
   | "motorOnly"
-  | "legacyBendFallback";
+  | "legacyBendFallback"
+  /** 摄像头手势（手指弯折）驱动 —— 见 robot/gestureCurvature.ts。 */
+  | "gesture";
 
 export interface CurvatureDerivationDiagnostics {
   source: CurvatureDerivationSource;
@@ -116,7 +118,6 @@ const DEFAULT_TOTAL_LENGTH_MM = TOTAL_LENGTH_MM;
 export interface ForceChannelMapping {
   cableIndex: number;
   sensorId: number;
-  axisIndex: 0 | 1 | 2;
   zeroN: number;
   gain: number;
   sign: 1 | -1;
@@ -145,12 +146,21 @@ export interface CurvatureDerivationConfig {
   displacementWeight: number;
   sensorMappings: ForceChannelMapping[];
   motorMappings: MotorCableMapping[];
+  /**
+   * **远端（B 组）→ 近端（A 组）的曲率耦合系数**，0 表示两段完全解耦。
+   *
+   * 为什么需要它：驱动丝贯穿两段，收紧远端那 3 根丝时，近端那一截**也会被带着弯**。
+   * 原实现两段各用各的位移、没有任何交叉项 ✗ —— 实测表现为"只动 B 组时前半段
+   * 一点都不弯"，与实机不符。
+   *
+   * 物理上这是一个刚度分配问题，精确值应由模型/实测定；这里先给一个保守初值。
+   */
+  proximalCoupling: number;
 }
 
 export const DEFAULT_SENSOR_MAPPINGS: ForceChannelMapping[] = [0, 1, 2, 3, 4, 5].map((cableIndex) => ({
   cableIndex,
   sensorId: cableIndex + 1,
-  axisIndex: 0 as const,
   zeroN: 0,
   gain: 1,
   sign: 1 as const,
@@ -179,6 +189,9 @@ export const DEFAULT_CURVATURE_DERIVATION_CONFIG: CurvatureDerivationConfig = {
   displacementWeight: 0.65,
   sensorMappings: DEFAULT_SENSOR_MAPPINGS,
   motorMappings: DEFAULT_MOTOR_MAPPINGS,
+  // 先给 0.3：远端弯 1 1/m，近端被带弯 0.3 1/m。物理上"远端带走一部分弯矩"，
+  // 一般远小于 1。**这是需要实测校准的唯一参数**。
+  proximalCoupling: 0.3,
 };
 
 export const DEFAULT_DYNAMICS_CONFIG: DynamicsConfig = {
@@ -235,6 +248,32 @@ export function setModelCurvatureLimitPerM(limitPerM: number) {
 }
 
 /** 当前模型的曲率上限（1/m）。 */
+/** 8 方向覆盖上限（后端给；未设置时为 null，回落到标量 ✓）。 */
+let modelCurvatureLimitByDirection: readonly number[] | null = null;
+
+export function setModelCurvatureLimitByDirection(table: readonly number[] | null): void {
+  modelCurvatureLimitByDirection = table && table.length === 8 ? table : null;
+}
+
+/**
+ * 按**方位**取曲率上限（1/m）：8 个方向之间线性插值。
+ *
+ * `modelCurvatureLimit()` 是 8 个方向的**最小**值 ✗ —— 宽的方位实际能到 ~1.9。
+ * 没有方向表时回落到标量 ✓。
+ */
+export function modelCurvatureLimitForDirection(phiRad: number): number {
+  const table = modelCurvatureLimitByDirection;
+  if (!table) return modelCurvatureLimitPerM;
+  const twoPi = Math.PI * 2;
+  let p = phiRad % twoPi;
+  if (p < 0) p += twoPi;
+  const scaled = (p / twoPi) * 8;
+  const i = Math.floor(scaled) % 8;
+  const j = (i + 1) % 8;
+  const t = scaled - Math.floor(scaled);
+  return table[i] * (1 - t) + table[j] * t;
+}
+
 export function modelCurvatureLimit(): number {
   return modelCurvatureLimitPerM;
 }
@@ -314,6 +353,20 @@ export function mapSvcPointToThreeMm(pointM: [number, number, number]): [number,
   return svcToThreeMm(pointM);
 }
 
+/**
+ * **`three` 系 mm → `svc` 系 mm** ✓ —— 后端 `encode_rpy_mm` 吃的是 **svc 系 + mm** ✓。
+ *
+ * ⚠⚠ **只换轴，不换单位** ✗ —— 实测三种组合（同一末端点 ✓）：
+ *   `[x, z, y]` mm  → ✓ 可达
+ *   `[x, y, z]` mm  → ✗ 不可达（轴错 ✓）
+ *   `[x, z, y]` m   → ✗ 不可达（单位错 ✓，变成几百米 ✓）
+ *
+ * 本项目在"轴"上踩过两次 ✓（残差 435mm ✓、全部 null ✓）—— **换轴永远要实测** ✓。
+ */
+export function mapThreeMmToSvcPoint(threeMm: [number, number, number]): [number, number, number] {
+  return [threeMm[0], threeMm[2], threeMm[1]];
+}
+
 function directionNameToDeg(direction: string | undefined) {
   return direction === "right" ? 90 : direction === "down" ? 180 : direction === "left" ? 270 : 0;
 }
@@ -386,7 +439,7 @@ function extractTendonForcesFromSensors(
   let present = 0;
   for (const mapping of config.sensorMappings) {
     const sensor = frame?.sensors.find((item) => item.id === mapping.sensorId);
-    const value = sensor?.filtered[mapping.axisIndex];
+    const value = sensor?.filteredValue;
     if (sensor == null || value == null || !Number.isFinite(value)) {
       missing.push(mapping.cableIndex);
       continue;
@@ -446,7 +499,7 @@ function readSensorForce(
   const mapping = config.sensorMappings.find((m) => m.cableIndex === cableIndex);
   if (!mapping) return 0;
   const sensor = frame?.sensors.find((s) => s.id === mapping.sensorId);
-  const value = sensor?.filtered[mapping.axisIndex];
+  const value = sensor?.filteredValue;
   if (sensor == null || value == null || !Number.isFinite(value)) return 0;
   return Math.max(mapping.clampMinN, mapping.sign * mapping.gain * (value - mapping.zeroN));
 }
@@ -518,7 +571,17 @@ function segmentCurvatureFromMotors(
   const vA = curvatureVectorFromDisplacements(dispA, GROUP_A_ALPHAS, config.cableRadiusM, config.segmentLengthM[0]);
   const dispB = CABLE_GROUP_B_INDICES.map((ci) => readMotorDisplacement(frame, config, ci));
   const vB = curvatureVectorFromDisplacements(dispB, GROUP_B_ALPHAS, config.cableRadiusM, config.segmentLengthM[1]);
-  return { kxA: vA.kx, kyA: vA.ky, kxB: vB.kx, kyB: vB.ky };
+
+  // **耦合项**：A 组（近端）的曲率 = 自身位移贡献 + 远端 B 组的弯曲按系数带来的份额。
+  // 没有这一项时"只动 B 组"前半段一点都不弯 ✗ —— 那是不符合实机的。
+  // 方向取**单向**（B→A）：近端弯曲只会整体转动远端，基本不改变远端的**局部**曲率。
+  const coupling = Number.isFinite(config.proximalCoupling) ? config.proximalCoupling : 0;
+  return {
+    kxA: vA.kx + coupling * vB.kx,
+    kyA: vA.ky + coupling * vB.ky,
+    kxB: vB.kx,
+    kyB: vB.ky,
+  };
 }
 
 /** SDM 悬臂式 shape：每段内曲率自段基向段端衰减，并在两段连接处平滑过渡。 */
@@ -645,6 +708,47 @@ export function curvatureDistributionFromSdmInputs(
     segments,
     diagnostics,
   };
+}
+
+/**
+ * 由当前曲率反算 6 根驱动丝的**理论张力**（N）。
+ *
+ * 单根丝：`F ≈ M / r = EI·κ_along / r`，其中 `κ_along` 是该丝方向上的曲率分量
+ * （`κ·cos(φ − α)`）。与传感器实测对照，能看出"模型认为该多大"与"实际读到多大"的
+ * 偏差 —— 差得多，就说明刚度参数或零点需要校准。
+ *
+ * ⚠️ 天花板限制：这是**静力学线性**估计（用 `linearEiNm2`），不含迟滞、摩擦、
+ * 非线性刚度。所以它只能当参照，不能当"真值"。
+ */
+export function theoreticalTendonForcesN(
+  segments: readonly { kxPerM: number; kyPerM: number }[],
+  config: CurvatureDerivationConfig = DEFAULT_CURVATURE_DERIVATION_CONFIG,
+): number[] {
+  if (segments.length === 0) return [];
+  const half = Math.max(1, Math.floor(segments.length / 2));
+  const average = (slice: readonly { kxPerM: number; kyPerM: number }[]) => {
+    const n = Math.max(1, slice.length);
+    return {
+      kx: slice.reduce((acc, s) => acc + s.kxPerM, 0) / n,
+      ky: slice.reduce((acc, s) => acc + s.kyPerM, 0) / n,
+    };
+  };
+  const proximal = average(segments.slice(0, half));
+  const distal = average(segments.slice(half));
+
+  const cables: number[] = [];
+  for (let cable = 0; cable < 6; cable += 1) {
+    const isProximal = CABLE_GROUP_A_INDICES.includes(cable);
+    const indices = isProximal ? CABLE_GROUP_A_INDICES : CABLE_GROUP_B_INDICES;
+    const alphas = isProximal ? GROUP_A_ALPHAS : GROUP_B_ALPHAS;
+    const alpha = alphas[Math.max(0, indices.indexOf(cable))] ?? 0;
+    const kappa = isProximal ? proximal : distal;
+    const along = kappa.kx * Math.cos(alpha) + kappa.ky * Math.sin(alpha);
+    const ei = config.linearEiNm2[isProximal ? 0 : 1];
+    // 张力不能为负（丝只能拉不能推）
+    cables.push(Math.max(0, (ei * along) / Math.max(1e-6, config.cableRadiusM)));
+  }
+  return cables;
 }
 
 function svcPose(curvaturePerM: number, phi: number, s: number): [number, number, number] {

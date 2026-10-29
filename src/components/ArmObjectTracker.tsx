@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
+import { bendFromSkeleton } from "../robot/gestureCurvature";
+
 type TrackingMode = "bright" | "dark" | "auto";
 type CameraState = "idle" | "starting" | "ready" | "error";
 
@@ -406,7 +408,21 @@ function videoRect(containerW: number, containerH: number, videoW: number, video
   };
 }
 
-export default function ArmObjectTracker() {
+/** 摄像头识别到的目标弯折（`null` = 未锁定，调用方必须停发，不能沿用上一帧）。 */
+export interface GestureTrackPayload {
+  bendRad: number;
+  directionRad: number;
+  spanPx: number;
+}
+
+export default function ArmObjectTracker({
+  onTrack,
+}: {
+  /** 每处理一帧回调一次手势弯折；丢目标时传 `null`。 */
+  onTrack?: (track: GestureTrackPayload | null) => void;
+} = {}) {
+  const onTrackRef = useRef(onTrack);
+  onTrackRef.current = onTrack;
   const wrapRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
@@ -606,6 +622,10 @@ export default function ArmObjectTracker() {
       } else {
         smoothedRef.current = null;
       }
+      // 手势弯折：丢目标时**必须传 null**，让下游立刻停发 ——
+      // 沿用上一帧会让臂体一直保持弯曲，很危险。
+      const bend = result ? bendFromSkeleton(result.skeleton) : null;
+      onTrackRef.current?.(bend ? { ...bend } : null);
       if (time - lastStatusUpdateRef.current >= STATUS_INTERVAL_MS) {
         lastStatusUpdateRef.current = time;
         setReadout({
@@ -661,7 +681,8 @@ export default function ArmObjectTracker() {
     <div className="camera-feed-wrap arm-tracker" ref={wrapRef}>
       <video ref={videoRef} className="camera-feed arm-tracker-video" autoPlay muted playsInline />
       <canvas ref={overlayRef} className="arm-tracker-overlay" />
-      <div className="arm-tracker-controls">
+      <details className="arm-tracker-controls">
+        <summary>摄像头设置</summary>
         {devices.length > 0 ? (
           <label className="arm-tracker-device">
             <span>设备</span>
@@ -694,7 +715,7 @@ export default function ArmObjectTracker() {
           <input type="checkbox" checked={showMask} onChange={(event) => setShowMask(event.target.checked)} />
           <span>掩膜</span>
         </label>
-      </div>
+      </details>
       <div className={`arm-tracker-status ${readout.state}`}>
         <strong>{readout.state === "ready" && readout.angleDeg != null ? `${readout.angleDeg.toFixed(1)}°` : readout.state === "error" ? "摄像头错误" : "视觉追踪"}</strong>
         <span>{readout.message}</span>

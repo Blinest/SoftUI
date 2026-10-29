@@ -1,4 +1,6 @@
-import { AlertTriangle, Cable, RefreshCw, Wifi } from "lucide-react";
+import { AlertTriangle, Cable, Wifi } from "lucide-react";
+
+import { useEffect, useMemo } from "react";
 
 import Badge from "./Badge";
 import DeviceCard from "./DeviceCard";
@@ -25,7 +27,8 @@ export interface DeviceContextPanelProps {
    * 不依赖下位机把 `system_state` 回写进状态帧。
    */
   systemControlAction?: "enable" | "disable" | "emergencyStop" | null;
-  onOpenConnectDialog: () => void;
+  /** 打开连接对话框；可带上预选端口（点「串口发现」里的一行时）。 */
+  onOpenConnectDialog: (portName?: string) => void;
   onDisconnectDevice: (deviceId: string) => void;
   onRefreshSerialPorts: () => void;
 }
@@ -71,16 +74,20 @@ export function DeviceContextPanel({
    *   急停 → 急停锁定；点过关闭 → 已失能；点过启动（或帧说已使能）→ 已使能；
    *   都没点过 → 未使能 / 无数据。
    */
+  /**
+   * ⚠ 措辞统一到「服务器同步」口径 ✗ —— 上位机无法确认下位机真的使能了 ✓。
+   * 写"已使能"会让操作员以为设备在等指令 ✓，实际可能只是服务器记了这笔 ✓ —— 歧义 ✓。
+   */
   const enableLabel =
     systemControlAction === "emergencyStop"
-      ? "急停锁定"
+      ? "急停锁定（服务器）"
       : systemControlAction === "disable"
-        ? "已失能"
+        ? "服务器已同步：失能"
         : motionEnabled
-          ? "已使能"
+          ? "服务器已同步：使能"
           : systemEnabled === null
-            ? "无数据"
-            : "未使能";
+            ? "服务器无数据"
+            : "服务器未同步使能";
   const enableTone =
     systemControlAction === "emergencyStop" ? "is-error" : motionEnabled ? undefined : "is-warn";
   /**
@@ -96,19 +103,46 @@ export function DeviceContextPanel({
       : systemControlAction === "disable"
         ? {
             title: "系统已失能，运动指令不会下发",
-            body: <>需要动作时请到「自动控制 → 系统操作」点「启动控制系统」重新使能。</>,
+            body: <>需要动作时请到「控制 → 系统操作」点「启动控制系统」重新使能。</>,
           }
         : {
             title: "系统未使能，运动指令不会下发",
             body: (
               <>
-                「按此曲率下发 / 按位姿下发 / 发至电机 / 一键归中 / 主动控制」都会被拦截，
-                也不会向串口写入任何字节。请到「自动控制 → 系统操作」点
+                「按此曲率下发 / 按位姿下发 / 发至电机 / 一键归零 / 主动控制」都会被拦截，
+                也不会向串口写入任何字节。请到「控制 → 系统操作」点
                 <b>「启动控制系统」</b>后再下发。
               </>
             ),
           };
   const showEnableHint = !motionEnabled && (systemControlAction != null || systemEnabled === false);
+
+  // 挂载即枚举一次，之后每 5 秒刷新（getPorts 很轻，不会弹窗）。
+  useEffect(() => {
+    const tick = () => onRefreshSerialPorts();
+    tick();
+    const timer = window.setInterval(tick, 5000);
+
+  return () => window.clearInterval(timer);
+  }, [onRefreshSerialPorts]);
+
+  /**
+   * **已经连上的端口名** ✓ —— 「串口发现」要把它排除掉 ✗。
+   *
+   * 现场问题：设备连上以后，同一行还挂在「串口发现」里 ✓ →
+   * 用户以为"还能再连一次"✓ → 点进去重复连接 ✓（本 bug ✓）。
+   * 已连接的设备在**上方设备卡**里已经有一条了 ✓，这里不该再出现 ✓。
+   */
+  const connectedPortNames = useMemo(
+    () => new Set(connectedDevices.map((device) => device.portName).filter(Boolean)),
+    [connectedDevices],
+  );
+
+  /** 只列 USB 串口；`vid == null` 的是主板 COM / 蓝牙 SPP 之类，对本设备没意义。 */
+  const usbPorts = useMemo(
+    () => serialPorts.filter((port) => port.vid != null && !connectedPortNames.has(port.portName)),
+    [serialPorts, connectedPortNames],
+  );
 
   return (
     <div className="device-context-panel">
@@ -153,14 +187,16 @@ export function DeviceContextPanel({
       </div>
 
       <div className="context-action-stack">
-        <button type="button" className="ghost-btn full" onClick={onRefreshSerialPorts}>
-          <RefreshCw size={15} /><span>扫描串口</span>
-        </button>
-        <button type="button" className="ghost-btn full" onClick={onOpenConnectDialog}>
+        <button type="button" className="ghost-btn full" onClick={() => onOpenConnectDialog()}>
           <Wifi size={15} /><span>连接新设备</span>
         </button>
       </div>
 
+      {/* 打开即自动枚举，之后每 5 秒刷新一次。
+          没有「扫描串口」按钮了，这一栏要自己保持最新 —— 它叫「串口发现」，
+          就该是**持续发现**，而不是等用户点一下。
+          ⚠️ 调用必须包一层箭头函数：直接把 onRefreshSerialPorts 挂到 onClick 上时，
+          点击事件对象会被当成 forcePick 传下去，于是"刷新"变成"每次弹窗"。 */}
       <section className="context-section" aria-label="串口发现">
         <h3>串口发现</h3>
         {connectionError ? (
@@ -179,16 +215,35 @@ export function DeviceContextPanel({
           </div>
         ) : null}
         <div className="context-port-list">
-          {serialPorts.length === 0 ? (
+          {/* 只列 **USB 串口**：`vid == null` 的是主板 COM / 蓝牙 SPP 之类的
+              非 USB 端口，浏览器连端口号都不提供，对"连我这台设备"没有意义。 */}
+          {usbPorts.length === 0 ? (
             <div className="context-port-row">
               <div>
-                <strong>未发现真实串口</strong>
-                <span>{serialPortsError ?? "可继续使用 Simulator；连接硬件后点击扫描串口。"}</span>
+                {/* 全部已连接时**不能说"未发现串口"** ✗ —— 那会把"已经连上了"说成"没有设备"✗ */}
+                <strong>
+                  {connectedPortNames.size > 0 ? "当前串口都已连接" : "未发现真实串口"}
+                </strong>
+                <span>
+                  {connectedPortNames.size > 0
+                    ? "要连接另一台设备，点上方「连接新设备」，在浏览器弹窗里授权新的串口。"
+                    : (serialPortsError ?? "可继续使用 Simulator；插上硬件后这里会自动出现，或点上方「连接新设备」手动选择。")}
+                </span>
               </div>
-              <Badge tone="warn">无串口</Badge>
+              <Badge tone={connectedPortNames.size > 0 ? "ok" : "warn"}>
+                {connectedPortNames.size > 0 ? "已连接" : "无串口"}
+              </Badge>
             </div>
-          ) : serialPorts.map((port) => (
-            <div className="context-port-row" key={port.portName}>
+          ) : usbPorts.map((port) => (
+            // 点一行就直接进「连接」的参数界面（波特率等），并把这一条预选上 ——
+            // 已经发现的端口不该还要用户再点一次「连接新设备」去挑一遍。
+            <button
+              type="button"
+              className="context-port-row is-clickable"
+              key={port.portName}
+              onClick={() => onOpenConnectDialog(port.portName)}
+              title="点此设置波特率并连接"
+            >
               <div>
                 <strong>{port.portName}</strong>
                 <span title={port.description ?? port.product ?? undefined}>
@@ -196,7 +251,7 @@ export function DeviceContextPanel({
                 </span>
               </div>
               <Badge tone={port.likelyAvailable ? "ok" : "warn"}>{port.portType.toUpperCase()}</Badge>
-            </div>
+            </button>
           ))}
         </div>
       </section>

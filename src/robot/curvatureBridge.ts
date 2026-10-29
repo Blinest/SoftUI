@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+
+import { pushTargetHistory, setCurrentDisplacement } from "./previewOverride";
 import type { BackboneOutput } from "../dynamics/svcModel";
 
 /**
@@ -33,13 +35,23 @@ export interface CurvatureCommandOptions {
   /** 起始电机地址（1 基），默认 1。 */
   startAddress?: number;
   /** 全阶 Cosserat 查表档位（张力上限 N）：40 或 60，默认 60。 */
-  tableGaugeN?: 40 | 60;
+  /**
+   * 张力上限标签。**一般不要传** —— 40N/60N 只是这张表的张力上限标识，
+   * 不是两个工作窗口；真正的业务量是「曲率/位姿 ↔ 驱动丝位移 ↔ 理论张力」。
+   * 不传时后端按**当前模型**取它的最高档（旧臂 60N / 新臂 40N）。
+   */
+  tableGaugeN?: 20 | 40 | 60;
 }
 
 /** 只读查表（不下发）的选项：没有「发给谁」的语义，所以不需要 deviceId。 */
 export interface TableQueryOptions {
   /** 全阶 Cosserat 查表档位（张力上限 N）：40 或 60，默认 60。 */
-  tableGaugeN?: 40 | 60;
+  /**
+   * 张力上限标签。**一般不要传** —— 40N/60N 只是这张表的张力上限标识，
+   * 不是两个工作窗口；真正的业务量是「曲率/位姿 ↔ 驱动丝位移 ↔ 理论张力」。
+   * 不传时后端按**当前模型**取它的最高档（旧臂 60N / 新臂 40N）。
+   */
+  tableGaugeN?: 20 | 40 | 60;
 }
 
 /** 下发前校验目标设备：空串会让后端静默改用内置模拟器，这里直接拦成明确的错误。 */
@@ -86,9 +98,12 @@ export async function sendCurvatureCommand(
       startAddress: options.startAddress ?? 1,
       segmentCurvaturePerM,
       segmentDirectionRad,
-      tableGaugeN: options.tableGaugeN ?? 60,
+      // 不传 tableGaugeN：由后端按当前模型的最高档取表。
+      // 原来写死 60 —— 换到新臂（20/40N）会直接报「不含 60N 表」。
+      ...(options.tableGaugeN != null ? { tableGaugeN: options.tableGaugeN } : {}),
     },
   });
+
 }
 
 /** 位置由 mm 给定、姿态由 roll/pitch/yaw(rad, ZYX) 给定的位姿下发参数。 */
@@ -104,12 +119,70 @@ export type TipPoseOptions = CurvatureCommandOptions;
  * @param positionMm 末端位置（mm）
  * @param rpyRad     末端姿态 roll/pitch/yaw（rad，ZYX 内旋）
  */
-export async function sendTipPoseCommand(
+/** `send_tip_pose_command` 的返回：快照 + **模型算出来的 6 路目标位移**。 */
+export interface TipPoseCommandResult {
+  snapshot: unknown;
+  /** 6 路肌腱目标位移（mm），顺序对应 `startAddress` 起的 6 个电机。 */
+  targetDisplacementMm: number[];
+  nearestDistance: number;
+}
+
+/**
+ * **按 6 路位移直接下发** ✓ —— 动作播放用这条路 ✓。
+ *
+ * 为什么不复用 `sendTipPoseCommand` ✗：播放的每一帧位移在播放开始时**已经批量算好**了
+ * （`preview_tip_pose_batch` ✓）。再按末端位姿查一次表 ✓ 是白花几百微秒 ✓，
+ * 而且会二次插值 → 轨迹和 3D 显示的形状对不上 ✗。
+ *
+ * 只发**最新一帧** ✓、绝不排队 ✓（和拖动实时跟随同一套策略 ✓）。
+ */
+export async function sendMultiMotorCommand(
+  positionsMm: number[],
+  options: { deviceId?: string; startAddress?: number } = {},
+): Promise<{ snapshot?: unknown; targetDisplacementMm?: number[] }> {
+  return invoke("send_multi_motor_command", {
+    request: {
+      deviceId: requireDeviceId(options.deviceId),
+      startAddress: options.startAddress ?? 1,
+      positionsMm,
+    },
+  });
+}
+
+/**
+ * **只查表、不下发** ✓ —— 返回 6 路目标位移 ✓。
+ *
+ * 用途：本机直发路径 ✓ —— 前端先拿到位移 ✓，再用 `directMultiMotor` 直接写串口 ✓，
+ * 免掉"后端查表 + 后端发送"里**发送那一段的往返与排队** ✓。
+ * （查表本身仍要后端，因为表在后端 ✓；要彻底本地化需要把表下发给前端 ✓）
+ */
+export async function previewTipPoseCommand(
   positionMm: [number, number, number],
   rpyRad: [number, number, number],
   options: TipPoseOptions,
 ) {
-  return invoke("send_tip_pose_command", {
+  return invoke<{ displacementMm: number[]; nearestDistance: number }>(
+    "preview_tip_pose_command",
+    {
+      request: {
+        deviceId: requireDeviceId(options.deviceId),
+        startAddress: options.startAddress ?? 1,
+        positionMm,
+        roll: rpyRad[0],
+        pitch: rpyRad[1],
+        yaw: rpyRad[2],
+        ...(options.tableGaugeN != null ? { tableGaugeN: options.tableGaugeN } : {}),
+      },
+    },
+  );
+}
+
+export async function sendTipPoseCommand(
+  positionMm: [number, number, number],
+  rpyRad: [number, number, number],
+  options: TipPoseOptions,
+): Promise<TipPoseCommandResult> {
+  const result = await invoke<TipPoseCommandResult>("send_tip_pose_command", {
     request: {
       deviceId: requireDeviceId(options.deviceId),
       startAddress: options.startAddress ?? 1,
@@ -117,9 +190,22 @@ export async function sendTipPoseCommand(
       roll: rpyRad[0],
       pitch: rpyRad[1],
       yaw: rpyRad[2],
-      tableGaugeN: options.tableGaugeN ?? 60,
+      // 不传 tableGaugeN：由后端按当前模型的最高档取表。
+      // 原来写死 60 —— 换到新臂（20/40N）会直接报「不含 60N 表」。
+      ...(options.tableGaugeN != null ? { tableGaugeN: options.tableGaugeN } : {}),
     },
   });
+
+  /**
+   * **把下发量喂给监控卡 / 曲线** ✓ —— 实时跟随（拖动 ✓）走的正是这条路 ✓，
+   * 原来返回值**没人用** ✗ → 目标位移曲线、速度曲线、电机概览**全没数据** ✗（本 bug ✓）。
+   */
+  if (Array.isArray(result?.targetDisplacementMm)) {
+    setCurrentDisplacement(result.targetDisplacementMm);
+    pushTargetHistory(result.targetDisplacementMm);
+  }
+
+  return result;
 }
 
 /** 表中某点对应的真实形状（12 段 κx/κy），供 3D 预览渲染。 */
@@ -154,7 +240,9 @@ export async function lookupTipPoseShape(
       roll: rpyRad[0],
       pitch: rpyRad[1],
       yaw: rpyRad[2],
-      tableGaugeN: options.tableGaugeN ?? 60,
+      // 不传 tableGaugeN：由后端按当前模型的最高档取表。
+      // 原来写死 60 —— 换到新臂（20/40N）会直接报「不含 60N 表」。
+      ...(options.tableGaugeN != null ? { tableGaugeN: options.tableGaugeN } : {}),
     },
   });
 }

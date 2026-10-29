@@ -43,6 +43,8 @@ static TABLE_60: &[u8] = include_bytes!("../assets/pose_table_60.bin");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoseTableKind {
+    /// 20 N 张力上限的表（新臂模型包才有，没有独立 asset）。
+    Limit20n,
     Limit40n,
     Limit60n,
 }
@@ -50,13 +52,28 @@ pub enum PoseTableKind {
 impl PoseTableKind {
     pub fn bytes(self) -> &'static [u8] {
         match self {
+            // 20N 只随模型包提供（K20/P20），没有独立 asset ✗ 返回空切片，
+            // 于是 `PoseTable::load(Limit20n)` 会明确报错，而不是悄悄用错表。
+            Self::Limit20n => &[],
             Self::Limit40n => TABLE_40,
             Self::Limit60n => TABLE_60,
         }
     }
 
+    /// 由张力上限（N）反查档位。未知档位返回 `None` —— 调用方应**报错**，
+    /// 不能像原来那样 `_ => Limit60n` 把任何值都兜到 60 档（实测就是这么错的）。
+    pub fn from_tension(tension: u8) -> Option<Self> {
+        match tension {
+            20 => Some(Self::Limit20n),
+            40 => Some(Self::Limit40n),
+            60 => Some(Self::Limit60n),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
+            Self::Limit20n => "20N",
             Self::Limit40n => "40N",
             Self::Limit60n => "60N",
         }
@@ -254,6 +271,7 @@ pub struct PoseShape {
 impl PoseTableKind {
     pub fn shape_bytes(self) -> &'static [u8] {
         match self {
+            Self::Limit20n => &[],
             Self::Limit40n => SHAPE_40,
             Self::Limit60n => SHAPE_60,
         }
@@ -261,6 +279,50 @@ impl PoseTableKind {
 }
 
 impl PoseTable {
+    /// **按驱动丝位移**找最近表点，返回该点的 12 节点曲率。
+    ///
+    /// 用途：让 3D 显示严格等于表。正向 SDM 是**另一套模型**（`κ = ΔL/(r·L)`），
+    /// 同一组位移反推出的形状和表能差 2 倍以上 —— 所以"显示和表一致"只能靠读表，
+    /// 不能靠调 SDM 的常数。
+    ///
+    /// 距离用**相对离散度归一化**后的欧氏距离，避免某根丝量程大就主导最近邻。
+    pub fn shape_nearest_by_displacement(
+        &self,
+        displacement_mm: [f64; N_DISPLACEMENTS],
+    ) -> Option<(&[f32], f64)> {
+        if self.displacements.is_empty() {
+            return None;
+        }
+        // 每根丝的离散度（表内范围），用来归一化
+        let mut scale = [1.0f64; N_DISPLACEMENTS];
+        for axis in 0..N_DISPLACEMENTS {
+            let mut lo = f64::MAX;
+            let mut hi = f64::MIN;
+            for row in &self.displacements {
+                lo = lo.min(row[axis]);
+                hi = hi.max(row[axis]);
+            }
+            let span = hi - lo;
+            if span > 1e-9 {
+                scale[axis] = span;
+            }
+        }
+        let mut best = 0usize;
+        let mut best_distance = f64::MAX;
+        for (index, row) in self.displacements.iter().enumerate() {
+            let mut sum = 0.0;
+            for axis in 0..N_DISPLACEMENTS {
+                let delta = (row[axis] - displacement_mm[axis]) / scale[axis];
+                sum += delta * delta;
+            }
+            if sum < best_distance {
+                best_distance = sum;
+                best = index;
+            }
+        }
+        Some((&self.shapes[best][..], best_distance.sqrt()))
+    }
+
     /// 位姿 → **该表点的真实形状**（0 阶：取最近表点）。
     ///
     /// 仅用于 3D 预览：预览显示的必须是表里真实存在的解，而不是前端拟合出来的

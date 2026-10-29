@@ -17,9 +17,11 @@ export interface LogFilterBarProps {
   selectedLevels: VisibleLogLevel[];
   query: string;
   scope: string;
-  scopes: string[];
+  scopes: Array<{ value: string; label: string }>;
   totalCount: number;
   visibleCount: number;
+  /** 已勾选的条数 ✓（左侧数字 ✓）*/
+  selectedCount?: number;
   onLevelsChange: (levels: VisibleLogLevel[]) => void;
   onQueryChange: (value: string) => void;
   onScopeChange: (value: string) => void;
@@ -36,6 +38,7 @@ export function LogFilterBar({
   scopes,
   totalCount,
   visibleCount,
+  selectedCount = 0,
   onLevelsChange,
   onQueryChange,
   onScopeChange,
@@ -69,7 +72,7 @@ export function LogFilterBar({
         <span className="sr-only">模块</span>
         <select value={scope} onChange={(event) => onScopeChange(event.target.value)}>
           <option value="">全部模块</option>
-          {scopes.map((item) => <option key={item} value={item}>{item}</option>)}
+          {scopes.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
         </select>
       </label>
 
@@ -100,7 +103,11 @@ export function LogFilterBar({
       </button>
 
       <div className="logs-count">
-        <span>显示 {visibleCount} / {totalCount} 条</span>
+        {/* **左侧就是已勾选数量** ✓（选中时高亮 ✓，没选中时淡一点 ✓）*/}
+        <span className={selectedCount > 0 ? "is-selected" : undefined}>
+          已选 <b>{selectedCount}</b> 条
+        </span>
+        <span className="logs-count-dim">显示 {visibleCount} / {totalCount} 条</span>
       </div>
     </div>
   );

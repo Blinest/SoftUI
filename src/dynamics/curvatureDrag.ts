@@ -37,7 +37,7 @@ import type { BackboneOutput, CurvatureBasisSegment, CurvatureDistribution } fro
 import {
   buildBackboneFromCurvatureDistribution,
   mapSvcPointToThreeMm,
-  modelCurvatureLimit,
+  modelCurvatureLimitForDirection,
   TOTAL_LENGTH_MM,
 } from "./svcModel";
 import { rpyToMat, rotationResidual, tipPoseOfDistribution } from "../robot/pose3d";
@@ -161,8 +161,13 @@ function minimumCurvatureBasis(influence: readonly number[]): number[] {
  */
 function defaultLimits(base: CurvatureDistribution): number[] {
   const observed = base.segments.reduce((max, segment) => Math.max(max, segment.kappaAbsPerM), 0);
-  const limit = Math.min(Math.max(observed + 0.5, 0.5), modelCurvatureLimit());
-  return base.segments.map(() => limit);
+  const headroom = Math.max(observed + 0.5, 0.5);
+  // **每段按自己的方向**取上限 ✓ —— 原来所有段一律用全局最小值 ✗，
+  // 表现就是"往宽的方位拖也弯不动"✗。方向口径与 pose3d 一致：atan2(-kx, ky) ✓。
+  return base.segments.map((segment) => {
+    const phi = Math.atan2(-segment.kxPerM, segment.kyPerM);
+    return Math.min(headroom, modelCurvatureLimitForDirection(phi));
+  });
 }
 
 /* ── 分布构造 ── */

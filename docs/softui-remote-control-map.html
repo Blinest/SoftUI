@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>远程控制实现思路 · 一主多从中继架构</title>
+<style>
+  :root{
+    --ink:#0f172a; --ink2:#334155; --muted:#64748b; --faint:#94a3b8;
+    --line:#e2e8f0; --line2:#cbd5e1; --paper:#fff; --bg:#f5f6f8;
+    --blue:#1d4ed8; --blue-bg:#eff4ff; --blue-line:#c9d8fd;
+    --teal:#0f766e; --teal-bg:#eefbf8; --teal-line:#b8e5dd;
+    --amber:#b45309; --amber-bg:#fff9ee; --amber-line:#f2dcb2;
+    --red:#b42318; --red-bg:#fef4f3; --red-line:#f4cbc6;
+    --violet:#5b21b6; --violet-bg:#f6f2ff; --violet-line:#ded2fb;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg);color:var(--ink);padding:34px 20px 56px;
+    font:14px/1.6 "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .sheet{max-width:1240px;margin:0 auto;background:var(--paper);border:1px solid var(--line);
+    border-radius:16px;padding:30px 34px 30px;box-shadow:0 12px 40px rgba(15,23,42,.07)}
+  header{border-bottom:1.5px solid var(--ink);padding-bottom:12px;margin-bottom:8px}
+  h1{font-size:21px;font-weight:700;letter-spacing:-.2px}
+  .sub{margin-top:5px;font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+  .lead{margin:12px 0 18px;font-size:13px;color:var(--ink2);max-width:96ch}
+  .lead b{color:var(--blue)}
+
+  /* ── 画布 ── */
+  .stage{position:relative;width:1170px;height:470px;margin:0 auto}
+  .node{position:absolute;border-radius:12px;border:1px solid var(--line2);
+    background:#fbfcfd;padding:12px 14px}
+  .node h3{font-size:13px;font-weight:650;display:flex;align-items:center;gap:7px}
+  .node h3 .tag{font-family:var(--mono);font-size:9.5px;font-weight:500;
+    color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:0 5px;letter-spacing:.3px}
+  .node p{margin-top:6px;font-size:11.5px;color:var(--ink2);line-height:1.6}
+  .node ul{margin:6px 0 0;padding-left:14px;font-size:11.3px;color:var(--ink2);line-height:1.65}
+  .node code{font-family:var(--mono);font-size:10.5px;background:#f1f5f9;border:1px solid var(--line);
+    border-radius:4px;padding:0 4px;color:#1e293b;white-space:nowrap}
+
+  .node.remote{left:0;top:150px;width:250px;border-color:var(--violet-line);background:var(--violet-bg)}
+  .node.server{left:400px;top:120px;width:330px;border-color:var(--blue-line);background:var(--blue-bg)}
+  .node.master{left:880px;top:120px;width:288px;border-color:var(--teal-line);background:var(--teal-bg)}
+  .node.mcu{left:880px;top:318px;width:288px;border-color:var(--amber-line);background:var(--amber-bg)}
+
+  /* SVG 覆盖层 */
+  svg.wires{position:absolute;inset:0;width:1170px;height:470px;pointer-events:none}
+  .wire{fill:none;stroke-width:1.6}
+  .wire.cmd{stroke:#5b21b6}
+  .wire.data{stroke:#0f766e}
+  .wire.ui{stroke:#1d4ed8;stroke-dasharray:5 4}
+  .wire.direct{stroke:#0f766e;stroke-width:2.4}
+  .wlabel{font-family:var(--mono);font-size:10px;fill:#475569;paint-order:stroke;
+    stroke:#fff;stroke-width:3px;stroke-linejoin:round}
+
+  /* ── 图例 ── */
+  .legend{display:flex;gap:20px;flex-wrap:wrap;margin:14px 0 0;font-size:11.5px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .legend i{display:inline-block;width:26px;height:0;border-top-width:2px;border-top-style:solid}
+  .legend .c1{border-color:#5b21b6}
+  .legend .c2{border-color:#0f766e}
+  .legend .c3{border-color:#1d4ed8;border-top-style:dashed}
+
+  /* ── 下方三块 ── */
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:22px}
+  .card{border:1px solid var(--line);border-radius:11px;padding:12px 14px;background:#fbfcfd}
+  .card h4{font-size:12.5px;font-weight:650;color:var(--ink);margin-bottom:6px;display:flex;gap:7px;align-items:center}
+  .card h4 .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+  .card p{font-size:11.5px;color:var(--ink2);line-height:1.6}
+  .card code{font-family:var(--mono);font-size:10.5px;background:#f1f5f9;border:1px solid var(--line);
+    border-radius:4px;padding:0 4px}
+
+  .bottom{display:grid;grid-template-columns:1.15fr 1fr;gap:14px;margin-top:16px}
+  .panel{border:1px solid var(--line);border-radius:11px;padding:12px 14px}
+  .panel h4{font-size:12px;font-family:var(--mono);letter-spacing:.5px;text-transform:uppercase;
+    color:var(--muted);margin-bottom:8px}
+  .panel ol{margin:0;padding-left:16px;font-size:11.5px;color:var(--ink2);line-height:1.75}
+  .panel ol li{margin:2px 0}
+  .panel.warn{border-color:var(--red-line);background:var(--red-bg)}
+  .panel.warn h4{color:var(--red)}
+  .panel.warn ol{color:#7f1d1d}
+  .panel.warn code{background:#fff;border-color:var(--red-line)}
+
+  footer{margin-top:18px;border-top:1px solid var(--line);padding-top:12px;
+    font-size:10.5px;color:var(--faint);font-family:var(--mono);line-height:1.7}
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <header>
+    <h1>远程控制 · 一主多从中继架构</h1>
+    <div class="sub">Web Serial 只能在打开的浏览器里用 → 天然主从；其余端靠后端中继</div>
+  </header>
+
+  <p class="lead">
+    核心前提：串口句柄属于<b>打开它的那个浏览器</b>。所以系统里只有一台「主端」能真正读写串口，
+    其余端（手机 / 另一台电脑）通过后端中继命令与数据。三条通道各自独立：命令下行、数据上行、UI 同步。
+  </p>
+
+  <div class="stage">
+    <!-- 节点 -->
+    <div class="node remote">
+      <h3>从端 <span class="tag">REMOTE</span></h3>
+      <p>手机 / 另一台电脑，<b>没有串口句柄</b>。</p>
+      <ul>
+        <li><code>isLocal() === false</code></li>
+        <li>命令必须经后端中继</li>
+        <li>画面靠拉取后端缓冲</li>
+      </ul>
+    </div>
+
+    <div class="node server">
+      <h3>后端 <span class="tag">NODE + RUST</span></h3>
+      <p>三条通道的中枢，全部是无状态转发：</p>
+      <ul>
+        <li><b>命令队列</b>：<code>tx buffer</code> 按端口排队</li>
+        <li><b>实时环</b>：<code>live_ring</code> 保留 240 帧</li>
+        <li><b>单槽广播</b>：<code>ui_publish / ui_wait</code></li>
+        <li><b>审计</b>：<code>control_frame_log</code>、会话录制</li>
+      </ul>
+    </div>
+
+    <div class="node master">
+      <h3>主端 <span class="tag">MASTER · 持串口</span></h3>
+      <p>插着设备的那台电脑，浏览器持有 <code>SerialPort</code>。</p>
+      <ul>
+        <li><b>本地解析</b>：字节不出浏览器</li>
+        <li><b>本地查表</b>：<code>vc_table_index</code> 190KB</li>
+        <li><b>直发</b>：<code>0x11</code> 帧直接写串口（ms 级）</li>
+        <li><code>isLocal() === true</code></li>
+      </ul>
+    </div>
+
+    <div class="node mcu">
+      <h3>串口 → 下位机 <span class="tag">DEVICE</span></h3>
+      <p>115200，V2 帧（<code>0x55</code>）。上行状态帧 5Hz，六电机 + 六张力通道。</p>
+    </div>
+
+    <!-- 连线 -->
+    <svg class="wires" viewBox="0 0 1170 470">
+      <!-- ① 命令下行：从端 → 后端 → 主端 → 串口 -->
+      <path class="wire cmd" d="M250 196 H400" />
+      <polygon points="400,196 392,192 392,200" fill="#5b21b6"/>
+      <text class="wlabel" x="258" y="188">① 命令下行 · send_*</text>
+
+      <path class="wire cmd" d="M730 196 H880" />
+      <polygon points="880,196 872,192 872,200" fill="#5b21b6"/>
+      <text class="wlabel" x="742" y="188">webserial_wait_tx · 300ms</text>
+
+      <path class="wire cmd" d="M1024 250 V318" />
+      <polygon points="1024,318 1020,310 1028,310" fill="#5b21b6"/>
+      <text class="wlabel" x="1032" y="288">writer.write()</text>
+
+      <!-- ② 数据上行：串口 → 主端 → 后端 → 从端 -->
+      <path class="wire data" d="M960 318 V250" />
+      <polygon points="960,250 956,258 964,258" fill="#0f766e"/>
+      <text class="wlabel" x="876" y="288">读字节</text>
+
+      <path class="wire data" d="M880 214 H730" />
+      <polygon points="730,214 738,210 738,218" fill="#0f766e"/>
+      <text class="wlabel" x="742" y="232">frame_ingest · 1Hz 留档</text>
+
+      <path class="wire data" d="M400 214 H250" />
+      <polygon points="250,214 258,210 258,218" fill="#0f766e"/>
+      <text class="wlabel" x="258" y="232">fetch_live_window</text>
+
+      <!-- ③ UI 同步：虚线双向 -->
+      <path class="wire ui" d="M250 170 H400" />
+      <path class="wire ui" d="M400 178 H250" />
+      <text class="wlabel" x="258" y="164">③ ui_publish / ui_wait（长轮询）</text>
+
+      <!-- 主端直发旁路 -->
+      <path class="wire direct" d="M1088 250 V318" />
+      <polygon points="1088,318 1083,309 1093,309" fill="#0f766e"/>
+      <text class="wlabel" x="1096" y="288">直发 ms</text>
+    </svg>
+  </div>
+
+  <div class="legend">
+    <span><i class="c1"></i>命令下行（从端 → 主端 → 串口）</span>
+    <span><i class="c2"></i>数据上行（串口 → 主端 → 后端 → 从端）</span>
+    <span><i class="c3"></i>UI 同步（双向单槽广播）</span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h4><span class="dot" style="background:#5b21b6"></span>① 命令下行</h4>
+      <p>从端点按钮 → 后端编码成帧 → 压进该端口的 tx 队列 → 主端长轮询取走 → 写串口。<b>主端自己不走这条路</b>：本地查表算完位移直接写串口。</p>
+    </div>
+    <div class="card">
+      <h4><span class="dot" style="background:#0f766e"></span>② 数据上行</h4>
+      <p>主端读字节并在浏览器内解析 → 环形缓冲 → 1Hz 上报后端留档 → 从端拉窗口渲染。主端自己用本地缓冲，零往返。</p>
+    </div>
+    <div class="card">
+      <h4><span class="dot" style="background:#1d4ed8"></span>③ UI 同步</h4>
+      <p>拖动目标、末端位姿、目标位移、引擎开关都写进单槽 → <code>ui_wait</code> 有更新立即返回。应用远端值时不回发，避免回环。</p>
+    </div>
+  </div>
+
+  <div class="bottom">
+    <div class="panel">
+      <h4>时序举例 · 手机拖动</h4>
+      <ol>
+        <li>手机拖手柄 → 本地算目标分布</li>
+        <li><code>ui_publish("drag", 分布)</code> → 电脑端 3D 立即跟着动</li>
+        <li>若开「实时跟随」→ 走命令下行 → 主端拉取 → 写串口</li>
+        <li>主端串口数据 → 本地解析 → 1Hz 上报 → 手机拉窗口 → 曲线更新</li>
+      </ol>
+    </div>
+    <div class="panel warn">
+      <h4>瓶颈与演进</h4>
+      <ol>
+        <li>从端指令中继延迟 ≥300ms（长轮询超时）</li>
+        <li>多条 HTTP 轮询抢连接池 → 偶发排队十几秒</li>
+        <li>根治：三条轮询合并成<b>一条 WebSocket</b></li>
+        <li>下行 push（&lt;10ms）、上行广播（≪100ms）、UI 同连接</li>
+      </ol>
+    </div>
+  </div>
+
+  <footer>
+    代码位置：serve/tauri-shim.js（isLocal / webserial_wait_tx / frame_ingest / ui_publish / ui_wait）· src-tauri/src/lib.rs（ui_publish / ui_wait / webserial_open / control_frame_log）· src/pages/WorkspacePage.tsx（拖动泵 / 播放泵 / 直发）
+  </footer>
+
+</div>
+</body>
+</html>

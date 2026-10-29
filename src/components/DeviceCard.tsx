@@ -16,6 +16,8 @@ function stateTone(state: string): "ok" | "info" | "warn" | "error" | "neutral" 
     case "ready":
     case "enabled":
       return "ok";
+    case "disabled":
+      return "neutral";
     case "connecting":
     case "handshaking":
       return "info";
@@ -34,7 +36,8 @@ function stateLabel(state: string): string {
     case "connecting": return "连接中";
     case "handshaking": return "握手中";
     case "ready": return "就绪";
-    case "enabled": return "已使能";
+    case "enabled": return "服务器已同步";
+    case "disabled": return "已同步失能";
     case "emergencystopped": return "紧急停止";
     case "reconnecting": return "重连中";
     case "error": return "错误";

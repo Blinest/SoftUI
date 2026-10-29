@@ -17,7 +17,9 @@ export type LayoutPage =
   | "dashboard"
   | "workspace-monitor"
   | "workspace-manual"
-  | "workspace-automatic";
+  | "workspace-automatic"
+  /** 后台管理页：每栏一张卡，可拖动/缩放 ✓（**每个管理员各自一份** ✓）*/
+  | "admin";
 
 export interface CardPlacement {
   id: string;
@@ -26,7 +28,11 @@ export interface CardPlacement {
 }
 
 /** 布局数据结构版本。卡片集合有增删时递增，见 state/layoutStore.ts。 */
-export type LayoutSchemaVersion = 3;
+/**
+ * 布局数据结构版本（**卡片集合有增减时必须递增** ✓）
+ * v3 → v4：后台新增 `registration` 卡片 ✓
+ */
+export type LayoutSchemaVersion = 5;
 
 export interface PageLayout {
   schemaVersion: LayoutSchemaVersion;
@@ -54,18 +60,22 @@ export type MonitorCardId =
   | "armCharts"
   | "recentAlerts";
 
-/** 设备工作台「手动控制」标签的卡片。 */
+/** 设备工作台「控制」标签的卡片。 */
 export type ManualCardId =
-  | "modelPackage"
   | "curvatureDrag"
   | "motorControl"
-  | "sensorMonitor";
+  | "systemControl";
 
-/** 设备工作台「自动控制」标签的卡片。 */
+/** 设备工作台「参数调整」标签的卡片。 */
 export type AutomaticCardId =
-  | "systemControl"
+  | "modelPackage"
+  | "sensorMonitor"
   | "pidControl"
-  | "cycleLife";
+  | "cycleLife"
+  /** 策略编排：按工况自动切换模型 ✓ */
+  | "policyRules"
+  /** 动作库：拖动记录末端点 → 存成动作 ✓ */
+  | "motionLibrary";
 
 export type PageKey =
   | "Dashboard"
@@ -110,11 +120,19 @@ export interface MotorState {
   targetPositionMm: number;
 }
 
+/** 一路压力通道（**只有两个数**，不是三轴传感器）。
+ *
+ * 固件口径：`x` = **实际值**（未经滤波的读数），`y` = **滤波值**；每路 4 字节。
+ * 旧固件每路 6 字节（多一个保留位），解析器两种步长都接受。
+ *
+ * ⚠️ 这与指令集文档 §5.1 的写法相反（文档写 x=滤波、y=原始），以固件实际报文为准。
+ */
 export interface SensorState {
   id: number;
-  raw: [number, number, number];
-  filtered: [number, number, number];
-  alias: [string, string, string];
+  /** 实际值：未经滤波的读数。 */
+  rawValue: number;
+  /** 滤波值。 */
+  filteredValue: number;
   unit: string;
   quality: FrameQuality;
 }
@@ -140,7 +158,8 @@ export interface MotorDynamicsState {
 
 export interface SensorDynamicsState {
   id: number;
-  forceN: [number, number, number];
+  /** 滤波 + 通道平衡后的张力（N）。一路通道只有一个值，不再分轴。 */
+  forceN: number;
 }
 
 export interface DynamicsInput {
@@ -225,6 +244,13 @@ export interface SerialPortDescriptor {
   vid?: number | null;
   pid?: number | null;
   likelyAvailable: boolean;
+  /**
+   * 是否为用户**刚在浏览器端口选择框里选中**的那个。
+   *
+   * 浏览器那层弹窗是显示系统端口名（COM3/COM5）的，而网页本身拿不到 ——
+   * 所以这一次选择是"哪一个才是我的设备"的唯一可靠依据，界面上要据此预选。
+   */
+  picked?: boolean;
 }
 
 export interface DeviceConnectionRecord {

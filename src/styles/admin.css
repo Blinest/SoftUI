@@ -114,27 +114,29 @@
 .admin-body {
   display: grid;
   gap: 14px;
-  padding: 16px 18px 32px;
+  padding: 12px 10px 32px;   /* 左右 18px → 10px ✓（原来太宽 ✗）*/
   max-width: 1180px;
   margin: 0 auto;
+  /* CardGrid 量的是「栅格顶边 → 这个容器的底边」。后台是整页滚动 ✓，
+     所以这里给一个**按视口算的有界高度** ✓ —— 否则行高会被撑到上限 ✗。 */
+  min-height: 200px;   /* 概览卡只要 200px 高 ✓（行高 = 可用高度 ✓）*/
 }
 
 /* ── 概览 ── */
 .admin-stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 1px;
-  overflow: hidden;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-card);
-  background: var(--border-subtle);
+  gap: 12px;
 }
 
 .admin-stat {
   display: grid;
   gap: 4px;
-  padding: 10px 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
   background: var(--surface-panel);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 6px 18px rgba(0, 0, 0, 0.06);
 }
 
 .admin-stat span {
@@ -151,13 +153,26 @@
 }
 
 /* ── 面板 ── */
+/* 每个面板都是一张**独立卡片** ✓（原来是紧贴的分块，边界不明显 ✗）。
+ * 层次：底色 → 1px 描边 → 柔和投影 → 悬停时投影加深（轻微"抬起"✓）。 */
 .admin-panel {
   display: grid;
-  gap: 10px;
-  padding: 12px;
+  gap: 12px;
+  padding: 16px 18px;
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-card);
+  border-radius: 14px;
   background: var(--surface-panel);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.08);
+  transition: box-shadow 160ms ease, transform 160ms ease;
+}
+
+.admin-panel:hover {
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.08),
+    0 14px 32px rgba(0, 0, 0, 0.12);
+  transform: translateY(-1px);
 }
 
 .admin-panel-head {
@@ -434,4 +449,810 @@
 
 .admin-device-row + .admin-device-row {
   border-top: 1px solid var(--border-subtle);
+}
+
+/* ── 后台卡片外观 ─────────────────────────────────────────────────────
+ * 卡片由 CardGrid 渲染成 `.feature-card.tilt-card` ✓，外观本应来自 layouts.css 的
+ * `.tilt-card` ✗ —— 但后台实测 `background-image: none`（变量没生效 ✗）。
+ * 这里**显式补一遍**，并给每个变量带回退 ✓，这样无论 tokens.css 是否作用到
+ * 后台，卡片都有边框、圆角、底色与投影 ✓。
+ * ──────────────────────────────────────────────────────────────────── */
+.admin-body .feature-card.tilt-card {
+  background-color: var(--surface-panel);
+  background-image: none;
+  border: 1px solid var(--glass-card-border, var(--border-default));
+  border-radius: var(--radius-card, 12px);
+  box-shadow:
+    inset 0 1px 0 var(--glass-card-highlight, rgba(255, 255, 255, 0.06)),
+    0 8px 24px var(--glass-card-shadow, rgba(0, 0, 0, 0.28));
+  /* 内容不能溢出，但**手柄要露出来** ✗ —— 用 clip-path 代替 overflow:hidden */
+  overflow: visible;
+}
+
+/* 内容区自己裁切，保证手柄不被内容盖住 ✓ */
+.admin-body .feature-card.tilt-card > .feature-card-body,
+.admin-body .feature-card.tilt-card > .admin-card-body {
+  overflow: auto;
+  border-radius: inherit;
+}
+
+/* ── 卡片标题栏与手柄（写在后台自己的 CSS 里 ✓）────────────────────────
+ * 原因：`layouts.css` 的规则在后台**没有生效** ✗（同一个现象：变量也没生效 ✓）。
+ * 后台加载的是独立 CSS chunk ✓，这里用**同样带 .admin-body 前缀**的选择器
+ * 保证优先级更高 ✓，不依赖加载顺序 ✓。
+ * ──────────────────────────────────────────────────────────────────── */
+
+/* 拖拽手柄：独占第一行 ✓
+ * 用 !important —— 之前普通声明被别的规则压过 ✗（layouts.css 不进后台，但
+ * 组件内联或其它 chunk 的规则仍可能胜出 ✓）。 */
+.admin-body .feature-card-grip-handle {
+  order: -1 !important;
+  flex: 0 0 100% !important;
+  width: 100% !important;
+  height: 14px;
+  margin-bottom: 2px;
+  cursor: grab;
+}
+
+/* 图标与标题必须在同一行 ✓ */
+.admin-body .feature-card-header > div {
+  /* 手柄 + 图标 + 标题 **同一行** ✓ */
+  display: flex !important;
+  align-items: center;
+  flex-wrap: nowrap !important;
+  gap: 6px;
+  width: 100%;
+  padding: 0;
+  border-bottom: 0;    /* 线统一交给 header ✓，这里不再画 ✗ */
+}
+
+.admin-body .feature-card-grip-handle {
+  order: 0;
+  flex: 0 0 auto !important;
+  width: 20px !important;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+}
+
+/* 握把图标本身也是 20px 高 ✓ */
+.admin-body .feature-card-grip {
+  height: 20px;
+  width: auto;
+}
+
+.admin-body .feature-card-title-icon {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+.admin-body .feature-card-header > div > h2 {
+  /* 标题不再自己画线 ✗（线挪到整行下方 ✓）*/
+  border-top: 0;
+  padding-top: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* 缩放手柄：写死可见样式 ✓（不依赖任何变量 ✗）*/
+.admin-body .card-resize-handle {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  z-index: 9;
+  width: 16px;
+  height: 16px;
+  /* 不要边框、不要底色 ✗ —— 只要两条细斜线 ✓ */
+  border: 0;
+  border-radius: 0;
+  background-color: transparent;
+  background-image: linear-gradient(
+    135deg,
+    transparent 0 46%,
+    rgba(226, 232, 240, 0.75) 46% 49%,
+    transparent 49% 62%,
+    rgba(226, 232, 240, 0.75) 62% 65%,
+    transparent 65% 100%
+  );
+  cursor: nwse-resize;
+  opacity: 0.8;
+}
+
+.admin-body .card-resize-handle:hover {
+  opacity: 1;
+  background-color: transparent;
+}
+
+.admin-body .card-resize-handle:hover {
+  background-color: var(--border-default);
+}
+
+/* ── 卡片拖动/让位动画（补齐 front 的那套 ✓）────────────────────────────
+ * 前台靠 layouts.css 里的过渡实现；后台不加载那个文件 ✗，所以这里复制一份。
+ * 拖动中的卡片**跟手**（无过渡 ✓），其余卡片**滑动让位**（有过渡 ✓）。
+ * ──────────────────────────────────────────────────────────────────── */
+.admin-body .feature-card:not(.is-dragging) {
+  transition:
+    translate 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    width 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    height 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 160ms ease;
+}
+
+/* 被拖的那张要跟手：关掉过渡 ✓ */
+body.card-dragging .admin-body .feature-card.is-dragging,
+.admin-body .feature-card.is-dragging {
+  transition: none !important;
+  z-index: 30;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35) !important;
+  cursor: grabbing;
+}
+
+/* 缩放中也跟手 ✓ */
+.admin-body.is-resizing .feature-card {
+  transition: none;
+}
+
+/* ── 缩放预览 / 拖动落点（layouts.css 里的那套在后台不生效 ✗）──────────── */
+.admin-body .card-resize-preview {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 25;
+  box-sizing: border-box;   /* padding/border 不能把框撑大 ✓ */
+  transform-origin: 0 0;    /* translate 以左上角为基准 ✓ */
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 6px;
+  border: 2px solid var(--focus-ring);
+  border-radius: var(--radius-card, 12px);
+  background: color-mix(in srgb, var(--focus-ring) 18%, var(--surface-panel));
+  box-shadow: 0 0 0 9999px rgb(8 20 29 / 18%);
+  pointer-events: none;
+  transition: width 110ms ease, height 110ms ease;
+}
+
+.admin-body .card-resize-preview span {
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--focus-ring);
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* 拖动落点指示器（同样只在 layouts.css 里有 ✗）*/
+.admin-body .card-drop-preview {
+  position: absolute;
+  z-index: 24;
+  border: 1px dashed var(--focus-ring);
+  border-radius: var(--radius-card, 12px);
+  background: color-mix(in srgb, var(--focus-ring) 10%, transparent);
+  pointer-events: none;
+  transition: translate 180ms cubic-bezier(0.22, 1, 0.36, 1), width 180ms, height 180ms;
+}
+
+/* ── 栅格定位（layouts.css 里的 `.card-grid` / `.feature-card` 规则后台拿不到 ✗）
+ * 后果非常隐蔽：
+ *   · `.feature-card` 不是 absolute → 卡片回到**文档流**里，全部竖着堆 ✗
+ *   · `.card-grid` 不是 relative → 缩放预览框锚到了**页面级定位祖先** ✗
+ *     （实测偏移量正好等于 admin-header 的高度 60px ✓ —— 这就是证据 ✓）
+ * ──────────────────────────────────────────────────────────────────── */
+.admin-body .card-grid {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+}
+
+.admin-body .feature-card {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+/* 概览卡：上下留白 + 图标左边距，和下面的「访问来源」对齐 ✓ */
+.admin-body .admin-stats {
+  padding: 4px 2px;
+}
+
+.admin-body .feature-card-title-icon {
+  margin-left: 2px;
+  margin-right: 6px;
+}
+
+.admin-body .feature-card-header {
+  /* 上下 padding 加大到 14px ✓（8px 太挤 ✗），左右保持 10px ✓ */
+  padding: 14px 10px;
+  /* 外边距与内边距保持一致 ✓ */
+  margin: 0 0 14px;
+  /* 标题栏自己也走 flex ✓ —— 否则 `> div` 与 `.feature-card-action` 会叠成两行 ✗ */
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  /* 唯一的一条分隔线 ✓ —— 挂在整个标题栏下方 ✓ */
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+/* 后台卡片没有标题栏按钮（action 为 null）→ 收起这个空容器 ✓，
+   否则它占一行、再多出一条线 ✗ */
+.admin-body .feature-card-action:empty {
+  display: none;
+}
+
+.admin-body .feature-card-action {
+  display: none;   /* 后台目前所有卡片的 action 都是空 ✓ */
+}
+
+/* 卡片内容区留白 ✓ */
+.admin-body .admin-card-content {
+  /* 和卡片内容区**同一套内边距** ✓ ——
+     之前是"卡中卡"✗：外面一层 10px ✓，里面又 10px ✓，内容缩进 20px ✓；
+     改成 0 又太贴边 ✗ —— 取**一层**的量 ✓。 */
+  padding: 12px 14px;
+  overflow: auto;
+}
+
+/* 卡片内容里的二级小标题（例如「待审批注册（2）」）✓ */
+.admin-body .admin-card-section-title {
+  margin: 4px 0 8px;
+  color: var(--text-secondary, #94a3b8);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* 账号行的「操作」下拉 ✓ —— 5 个按钮收成一个 ✓ */
+.admin-body .admin-row-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+/* 「操作」按钮：扁平描边，悬停变浅 ✓ */
+.admin-body .admin-row-menu > summary {
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 30px;            /* 与设备上限输入框同高 ✓（原来 4px padding 显得矮 ✗） */
+  min-width: 64px;
+  padding: 0 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary, #cbd5e1);
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: border-color 140ms ease, color 140ms ease;
+}
+
+.admin-body .admin-row-menu > summary:hover {
+  border-color: var(--focus-ring);
+  color: var(--text-primary);
+}
+
+.admin-body .admin-row-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.admin-body .admin-row-menu > summary::after {
+  content: "⌄";
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.admin-body .admin-row-menu[open] > summary::after {
+  content: "⌃";
+}
+
+/* 展开的菜单**浮在行下方** ✓（绝对定位 → 不再撑高 admin-row ✗）*/
+.admin-body .admin-row-menu[open] > button {
+  position: absolute;
+  right: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 148px;
+  margin: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border-default);
+  background: var(--surface-panel);
+  color: var(--text-primary);
+  font-size: 12px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+/* 第一项紧贴按钮下方 ✓，其余依次排开 ✓ */
+.admin-body .admin-row-menu[open] > button:nth-of-type(1) { top: calc(100% + 4px); border-radius: 8px 8px 0 0; }
+.admin-body .admin-row-menu[open] > button:nth-of-type(2) { top: calc(100% + 4px + 31px); border-top: 0; }
+.admin-body .admin-row-menu[open] > button:nth-of-type(3) { top: calc(100% + 4px + 62px); border-top: 0; }
+.admin-body .admin-row-menu[open] > button:nth-of-type(4) { top: calc(100% + 4px + 93px); border-top: 0; border-radius: 0 0 8px 8px; }
+.admin-body .admin-row-menu[open] > button:nth-of-type(5) { top: calc(100% + 4px + 93px); border-top: 0; border-radius: 0 0 8px 8px; }
+
+.admin-body .admin-row-menu[open] > button:hover {
+  background: var(--surface-page);
+}
+
+.admin-body .admin-row-menu[open] > button.danger {
+  color: #ff6b6b;
+}
+
+/* 按钮禁用态 ✓
+ *
+ * **不要用 opacity** ✗ —— 0.45 的不透明度会把已经偏暗的 muted 字再压一遍 ✓，
+ * 深色主题下实测对比度只有 ~2:1 ✓，基本看不清 ✗（本次 bug ✓）。
+ * 改成：**只变文字色 + 变边框/底色** ✓，字本身保持不透明 ✓。
+ */
+.admin-body .admin-btn:disabled,
+.admin-body .admin-row-menu > button:disabled {
+  opacity: 1;
+  color: var(--text-disabled, var(--text-muted)) !important;
+  border-color: var(--border-subtle);
+  background: transparent;
+  cursor: not-allowed;
+}
+
+/* ── 重置密码弹窗 ✓ ───────────────────────────────────────────────── */
+.admin-body .admin-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 12, 18, 0.62);
+  backdrop-filter: blur(2px);
+}
+
+.admin-body .admin-modal {
+  width: min(360px, calc(100vw - 32px));
+  display: grid;
+  gap: 10px;
+  padding: 18px 18px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  background: var(--surface-panel);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.admin-body .admin-modal h2 {
+  margin: 0 0 2px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.admin-body .admin-modal label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary, #94a3b8);
+}
+
+.admin-body .admin-modal input {
+  padding: 7px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.admin-body .admin-modal .admin-hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.admin-body .admin-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+/* 概览卡里的「注册策略」下拉 ✓（替代原来的三个按钮 ✗） */
+.admin-body .admin-mode-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary, #94a3b8);
+}
+
+.admin-body .admin-mode-select > span {
+  white-space: nowrap;
+}
+
+.admin-body .admin-mode-select > select {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* 弹窗挂到 body 后不再受 .admin-body 前缀限制 ✓ —— 补一份全局规则 ✓ */
+.admin-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 12, 18, 0.62);
+  backdrop-filter: blur(2px);
+}
+
+.admin-modal {
+  width: min(360px, calc(100vw - 32px));
+  display: grid;
+  gap: 10px;
+  padding: 18px 18px 14px;
+  border: 1px solid var(--border-default);
+  border-radius: 14px;
+  background: var(--surface-panel);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.admin-modal h2 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+.admin-modal label { display: grid; gap: 4px; font-size: 12px; color: var(--text-secondary, #94a3b8); }
+.admin-modal input {
+  padding: 7px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.admin-modal .admin-hint { margin: 0; font-size: 11px; color: var(--text-muted); }
+.admin-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+/* 注册策略下拉（放进 admin-stat 里 ✓）—— 宽度不超过格子，字号与 strong 一致 ✓ */
+.admin-body .admin-stat > .admin-stat-select {
+  width: 100%;
+  max-width: 100%;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border-default);
+  border-radius: 6px;
+  background: var(--surface-page);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* 下拉里的操作项：**实底** ✓（不要透明 ✗），禁用时只把文字变灰 ✓ */
+.admin-body .admin-row-menu[open] > button {
+  background: var(--surface-panel);
+}
+
+.admin-body .admin-row-menu[open] > button:disabled {
+  background: var(--surface-panel);
+  color: var(--text-muted);
+  opacity: 1;               /* 不整体变淡 ✓，只灰字 ✓ */
+  cursor: not-allowed;
+}
+
+/* ── 待审批改动（动作库 / 策略编排）✓ ─────────────────────────── */
+.admin-approvals {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+  display: grid;
+  gap: 8px;
+}
+
+.admin-approvals-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.admin-approvals-count {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.admin-approvals-empty { margin: 0; color: var(--text-muted); font-size: 11px; }
+
+.admin-approvals-list { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+
+.admin-approvals-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+}
+
+.admin-approvals-main { display: grid; gap: 2px; min-width: 0; }
+.admin-approvals-title { font-size: 12px; color: var(--text-primary); }
+.admin-approvals-meta { font-size: 10px; color: var(--text-muted); }
+.admin-approvals-actions { display: flex; gap: 6px; }
+
+.admin-stat-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 400;
+}
+
+/* 账号操作栏里的待审批改动 ✓ */
+.admin-approvals-inline-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.admin-approvals-inline-head em { font-style: normal; color: #ffd166; }
+
+.admin-approvals-inline-item {
+  display: grid;
+  gap: 5px;
+  padding: 7px 9px;
+  border: 1px solid color-mix(in srgb, #ffd166 30%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, #ffd166 7%, transparent);
+}
+
+.admin-approvals-inline-main {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.admin-approvals-inline-main > span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.admin-approvals-inline-main em {
+  font-style: normal;
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.admin-approvals-inline-actions { display: flex; gap: 6px; }
+
+/* 这两个类**原来没有样式** ✗ —— 用的是浏览器默认按钮 ✓（又大又圆 ✓），
+   这里给它们真正的小尺寸 ✓ */
+.admin-approvals-inline .admin-primary-btn,
+.admin-approvals-inline .admin-ghost-btn {
+  padding: 3px 10px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.admin-approvals-inline .admin-primary-btn {
+  border: 1px solid color-mix(in srgb, #4ade80 55%, transparent);
+  background: color-mix(in srgb, #4ade80 18%, transparent);
+  color: #4ade80;
+}
+
+.admin-approvals-inline .admin-ghost-btn {
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.admin-approvals-inline .admin-primary-btn:hover { background: color-mix(in srgb, #4ade80 28%, transparent); }
+.admin-approvals-inline .admin-ghost-btn:hover { color: var(--text-primary); }
+
+/* 行内「待审批」折叠条 ✓ —— 默认收起 ✓，不影响行高 ✓ */
+.admin-approvals-fold {
+  position: relative;          /* 展开内容用**绝对定位浮层** ✓ */
+  grid-column: 1 / -1;
+  border: 1px solid color-mix(in srgb, #ffd166 30%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, #ffd166 6%, transparent);
+  padding: 0 9px;
+}
+
+/* 行本身不能裁切浮层 ✓（原来是 overflow:hidden / auto 就会剪掉 ✗）*/
+.admin-row { overflow: visible; }
+
+.admin-approvals-fold > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 0;
+  color: #ffd166;
+  font-size: 11px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.admin-approvals-fold > summary::-webkit-details-marker { display: none; }
+.admin-approvals-fold > summary::after { content: " ⌄"; margin-left: auto; opacity: .7; }
+.admin-approvals-fold[open] > summary::after { content: " ⌃"; }
+.admin-approvals-fold > summary em {
+  font-style: normal;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #ffd166 22%, transparent);
+  font-size: 10px;
+}
+
+/* 展开后的内容 ✓ */
+.admin-approvals-inline {
+  /* **浮层展开** ✓ —— 不撑高卡片 ✓ */
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  /* 不写 right:0 ✗ —— 折叠条的宽度可能只有几十像素 ✓，
+     那样浮层会被压到同样窄 ✓ → 按钮挤出去看不见 ✗ */
+  /* 固定宽度 ✓ —— 不再依赖父元素 ✓（折叠条只有几十像素 ✗）*/
+  width: 620px;
+  min-width: 620px;
+  max-width: 94vw;
+  z-index: 30;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, #ffd166 40%, transparent);
+  border-radius: 10px;
+  background: var(--surface-panel, #161b22);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+  max-height: 260px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* 滚动条压细一点 ✓ */
+.admin-approvals-inline::-webkit-scrollbar { width: 6px; }
+.admin-approvals-inline::-webkit-scrollbar-thumb {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--text-muted) 45%, transparent);
+}
+
+/* 待审批触发按钮 ✓（行内，小号）*/
+.admin-approvals-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, #ffd166 45%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, #ffd166 10%, transparent);
+  color: #ffd166;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.admin-approvals-trigger em {
+  font-style: normal;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, #ffd166 25%, transparent);
+  font-size: 10px;
+}
+
+/* 审批弹窗 ✓ —— 宽版 + 列表 */
+.admin-modal-wide { max-width: 620px; width: min(620px, 92vw); }
+
+.admin-approval-modal-list {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 4px;
+  padding: 0;
+  list-style: none;
+  max-height: 52vh;
+  overflow-y: auto;
+}
+
+.admin-approval-modal-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 9px;
+}
+
+.admin-approval-modal-main { display: grid; gap: 2px; min-width: 0; }
+.admin-approval-modal-main strong { font-size: 12px; color: var(--text-primary); }
+.admin-approval-modal-main span { font-size: 11px; color: var(--text-secondary); line-height: 1.6; white-space: normal; }
+.admin-approval-modal-main em { font-style: normal; font-size: 10px; color: var(--text-muted); }
+.admin-approval-modal-actions { display: flex; gap: 6px; }
+
+.admin-approval-modal-actions .admin-primary-btn,
+.admin-approval-modal-actions .admin-ghost-btn,
+.admin-modal-actions .admin-ghost-btn {
+  padding: 4px 12px;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.admin-approval-modal-actions .admin-primary-btn {
+  border: 1px solid color-mix(in srgb, #4ade80 55%, transparent);
+  background: color-mix(in srgb, #4ade80 18%, transparent);
+  color: #4ade80;
+}
+
+.admin-approval-modal-actions .admin-ghost-btn,
+.admin-modal-actions .admin-ghost-btn {
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+/* 卡片内容区里的按钮 ✓ —— 统一用 token ✓（之前「全部踢下线」在深色下偏暗 ✗）*/
+.admin-body .admin-card-content .admin-btn {
+  color: var(--text-primary);
+  background: var(--button-default-bg);
+  border-color: var(--button-default-border);
+}
+
+.admin-body .admin-card-content .admin-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--focus-ring);
+}
+
+.admin-body .admin-card-content .admin-btn:disabled {
+  color: var(--text-disabled, var(--text-muted));
+  background: var(--button-disabled-bg);
+  border-color: var(--button-disabled-border, var(--border-subtle));
+}
+
+.admin-body .admin-card-content .admin-btn.danger {
+  color: var(--action-danger);
 }

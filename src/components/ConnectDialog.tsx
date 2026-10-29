@@ -13,6 +13,14 @@ interface ConnectDialogProps {
   /** 保存 / 删除连接配置需要 manageSettings（维护员及以上）。 */
   canSaveProfiles: boolean;
   onRefreshPorts: () => void;
+  /**
+   * **强制弹出浏览器端口选择框**（更换 / 添加设备）。
+   *
+   * 没有它，"扫描"永远只列出已授权过的旧端口 —— 想换设备根本选不到新的。
+   */
+  onPickPort?: () => void;
+  /** 打开时预选的端口（从「串口发现」点一行进来时用）。 */
+  preselectPort?: string | null;
   onClose: () => void;
 }
 
@@ -33,6 +41,8 @@ export default function ConnectDialog({
   onDeleteProfile,
   canSaveProfiles,
   onRefreshPorts,
+  onPickPort,
+  preselectPort,
   onClose,
 }: ConnectDialogProps) {
   const [portMode, setPortMode] = useState<PortMode>("scan");
@@ -59,6 +69,36 @@ export default function ConnectDialog({
       setProfileName("");
     }
   }, [open]);
+
+  /**
+   * 自动选中"刚在浏览器端口选择框里选中的那个"。
+   *
+   * 必须放在上面那个重置 effect **之后**：重置会先把选择清空，这里再把它指到
+   * 弹出框里选的那一条。否则用户刚在弹窗里选好设备，回到这里还要在几条同名条目
+   * （两个 CH340 长得一模一样）里再猜一次 —— 那正是"连上却发现不是自己设备"的来源。
+   */
+  // 打开对话框时自动拉一次已授权端口列表（forcePick=false ⇒ **不会**弹窗）。
+  // 「刷新串口」按钮删掉之后，这是列表的唯一来源；要用新设备就走「连接新设备」。
+  useEffect(() => {
+    if (!open) return;
+    onRefreshPorts();
+    // 只在打开时拉一次：ports 变化不该触发重新枚举
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const picked = ports.find((item) => item.picked);
+    if (picked) setSelectedPort(picked.portName);
+  }, [open, ports]);
+
+  // 用户从「串口发现」点某一行进来：直接选中那一条（**放在最后**，
+  // 这样它优先于"刚在浏览器弹窗里选中"的默认预选）。
+  useEffect(() => {
+    if (!open || !preselectPort) return;
+    setSelectedPort(preselectPort);
+    setPortMode("scan");
+  }, [open, preselectPort]);
 
   const getResolvedPort = useCallback(() => {
     return portMode === "scan" ? selectedPort : manualPort.trim();
@@ -171,14 +211,20 @@ export default function ConnectDialog({
                   </option>
                 ))}
               </select>
-              <button
-                type="button"
-                className="ghost-btn-sm"
-                onClick={onRefreshPorts}
-                title="刷新串口"
-              >
-                <RefreshCw size={14} />
-              </button>
+              {onPickPort ? (
+                <button
+                  type="button"
+                  className="ghost-btn-sm"
+                  onClick={() => onPickPort()}
+                  title="弹出浏览器的端口选择框，选择要连接的新设备"
+                >
+                  连接新设备
+                </button>
+              ) : (
+                <button type="button" className="ghost-btn-sm" onClick={() => onRefreshPorts()} title="刷新串口列表">
+                  <RefreshCw size={14} />
+                </button>
+              )}
             </div>
           ) : (
             <input

@@ -1,8 +1,4 @@
-import {
-
-  CircleGauge, Save, SlidersHorizontal, Table2,
-
-} from "lucide-react";
+import { AlertTriangle, CircleGauge, SlidersHorizontal } from "lucide-react";
 
 
 
@@ -14,7 +10,7 @@ import type { WorkspaceCardMeta } from "../components/WorkspaceCard";
 
 /**
 
- * 「手动控制」页的卡片注册表。
+ * 「控制」页的卡片注册表。
 
  *
 
@@ -26,14 +22,14 @@ import type { WorkspaceCardMeta } from "../components/WorkspaceCard";
 
 export const manualCardRegistry: Record<ManualCardId, WorkspaceCardMeta> = {
 
-  modelPackage: { title: "模型包", icon: Save },
 
-  curvatureDrag: { title: "末端位姿控制", icon: CircleGauge },
+  curvatureDrag: { title: "臂体控制", icon: CircleGauge },
 
 
   motorControl: { title: "电机控制", icon: SlidersHorizontal },
 
-  sensorMonitor: { title: "压力数据监控 / 校准", icon: Table2 },
+  /** 系统操作权限（含急停）—— 从「参数调整」搬来，安全卡片跟着操作走 ✓ */
+  systemControl: { title: "系统操作权限", icon: AlertTriangle },
 
 };
 

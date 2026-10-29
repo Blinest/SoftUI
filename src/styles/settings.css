@@ -1,12 +1,17 @@
 /* 设置页：左侧分类导航 + 右侧单分类内容。 */
 
 .settings-navigation-tabs {
+  /* 滑块的定位参照 */
+  position: relative;
   display: grid;
   gap: 3px;
   min-width: 0;
 }
 
 .settings-nav-item {
+  /* 位置化的菜单项才盖得住绝对定位的滑块 */
+  position: relative;
+  z-index: 1;
   display: block;
   width: 100%;
   min-width: 0;
@@ -18,18 +23,24 @@
   color: var(--text-secondary);
   font-size: 13px;
   text-align: left;
+  /* 移动端点击时浏览器会糊一层半透明黑（tap highlight），正好压掉玻璃底。
+     按下反馈改由胶囊的柔光提供，这里把它关掉。 */
+  -webkit-tap-highlight-color: transparent;
 }
 
-.settings-nav-item:hover {
+/* 同 shell.css：悬停底色只给**非当前项**。
+ * 点一个非当前项之后它变成当前项、指针却还在上面，底色会继续盖住玻璃胶囊；
+ * 深色主题下 --surface-page（#171f25）几乎是黑的，看起来就是"点击后被黑色覆盖"。 */
+.settings-nav-item:hover:not(.is-active) {
   background: var(--surface-page);
   color: var(--text-primary);
 }
 
+/* 选中态刻意**不画 background / border**（改由 .nav-sliding-indicator 承担），
+   也刻意去掉原来的 font-weight: 600 —— 加粗会让文字重新排版、每个字的宽度跳一下，
+   那正是"文字不稳定"的来源；选中感由滑块 + 文字颜色表达。 */
 .settings-nav-item.is-active {
-  border-color: var(--border-default);
-  background: var(--surface-page);
   color: var(--text-primary);
-  font-weight: 600;
 }
 
 .settings-actions-label {

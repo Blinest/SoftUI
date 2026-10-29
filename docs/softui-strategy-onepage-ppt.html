@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>智能策略编排链路 · One-Page</title>
+<style>
+  :root{
+    --ink:#101828; --ink2:#344054; --muted:#667085; --faint:#98a2b3;
+    --line:#e4e7ec; --line2:#d0d5dd; --paper:#ffffff; --bg:#f4f5f7;
+    --blue:#1d4ed8; --teal:#0e7c6b; --amber:#b54708;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg); display:grid; place-items:center; overflow:hidden;
+    font:14px/1.5 "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    color:var(--ink); -webkit-font-smoothing:antialiased;
+  }
+  #stage{width:1280px;height:720px;transform-origin:center center;
+    background:var(--paper); position:relative; overflow:hidden;
+    box-shadow:0 18px 60px rgba(16,24,40,.16);}
+  .page{position:absolute;inset:0;padding:34px 44px 0;display:flex;flex-direction:column}
+
+  /* ── header ── */
+  header{display:flex;align-items:flex-start;justify-content:space-between;
+    padding-bottom:14px;border-bottom:1.5px solid var(--ink)}
+  .title h1{font-size:24px;font-weight:700;letter-spacing:-.2px}
+  .title p{margin-top:5px;font-size:12px;color:var(--muted);font-family:var(--mono);
+    letter-spacing:.2px}
+  .stamp{text-align:right;font-family:var(--mono);font-size:10.5px;color:var(--faint);
+    line-height:1.7;white-space:nowrap}
+
+  /* ── pipeline ── */
+  .pipe{display:grid;grid-template-columns:repeat(5,1fr);gap:0;margin:16px 0 4px}
+  .stg{padding:9px 13px 11px;border-left:1px solid var(--line2);position:relative}
+  .stg:first-child{border-left:none;padding-left:0}
+  .stg .idx{font-family:var(--mono);font-size:10px;color:var(--teal);letter-spacing:1px}
+  .stg .nm{font-size:13.5px;font-weight:650;margin:2px 0 3px;letter-spacing:-.1px}
+  .stg .en{font-family:var(--mono);font-size:9.5px;color:var(--faint);letter-spacing:.4px;
+    text-transform:uppercase}
+  .stg .ds{font-size:11.5px;color:var(--ink2);margin-top:6px;line-height:1.55}
+
+  /* ── body ── */
+  .body{display:grid;grid-template-columns:1fr 1fr 1.06fr;gap:0;flex:1;margin-top:10px;
+    border-top:1px solid var(--line)}
+  .col{padding:12px 19px 0;border-left:1px solid var(--line)}
+  .col:first-child{border-left:none;padding-left:0}
+  .col:last-child{padding-right:0}
+  .col h2{font-size:12.5px;font-weight:700;color:var(--ink);letter-spacing:.2px;
+    display:flex;align-items:center;gap:8px;margin-bottom:9px}
+  .col h2::after{content:"";flex:1;height:1px;background:var(--line)}
+  .col h2 em{font-style:normal;font-family:var(--mono);font-size:9.5px;color:var(--faint);
+    font-weight:400;letter-spacing:.4px}
+  dl{margin:0}
+  dt{font-size:11.5px;font-weight:650;color:var(--blue);margin-top:8px}
+  dt:first-child{margin-top:0}
+  dd{font-size:11.3px;color:var(--ink2);line-height:1.54;margin-top:2px}
+  code{font-family:var(--mono);font-size:10.5px;background:#f2f4f7;border:1px solid var(--line);
+    border-radius:3px;padding:0 4px;color:#1d2939;white-space:nowrap}
+  b{font-weight:650;color:var(--ink)}
+
+  /* ── footer ── */
+  footer{margin-top:auto;border-top:1.5px solid var(--ink);padding:9px 0 12px;
+    display:flex;align-items:flex-end;justify-content:space-between;gap:24px}
+  .inv{display:grid;grid-template-columns:repeat(3,1fr);gap:26px;flex:1}
+  .inv div .k{font-family:var(--mono);font-size:9.5px;color:var(--teal);letter-spacing:1px}
+  .inv div .v{font-size:11.5px;color:var(--ink2);line-height:1.55;margin-top:2px}
+  .data{text-align:right;font-family:var(--mono);font-size:10px;color:var(--faint);
+    line-height:1.75;white-space:nowrap}
+  .data b{color:var(--ink);font-weight:600}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="page">
+
+    <header>
+      <div class="title">
+        <h1>智能策略编排链路</h1>
+        <p>Natural Language Intent → Policy IR → Model-Based Motion Planning → Deterministic Dispatch</p>
+      </div>
+      <div class="stamp">
+        SOFTUI · TDCR PLATFORM<br />
+        ARCHITECTURE SUMMARY · v1.0
+      </div>
+    </header>
+
+    <div class="pipe">
+      <div class="stg">
+        <div class="idx">01</div>
+        <div class="nm">意图解析</div>
+        <div class="en">Intent Resolution</div>
+        <div class="ds">自然语言 + 现场资产上下文，经 LLM 生成策略 IR；模型仅作编译，不直控执行器。</div>
+      </div>
+      <div class="stg">
+        <div class="idx">02</div>
+        <div class="nm">语义编译</div>
+        <div class="en">Semantic Compilation</div>
+        <div class="ds">实体对齐至动作库 / 模型库真实 ID；时序装配与约束求解，产物可复核、可回滚。</div>
+      </div>
+      <div class="stg">
+        <div class="idx">03</div>
+        <div class="nm">轨迹规划</div>
+        <div class="en">Motion Planning</div>
+        <div class="ds">表驱动逆运动学：邻域加权反查 → 曲率分量平滑 → 积分回算校验。</div>
+      </div>
+      <div class="stg">
+        <div class="idx">04</div>
+        <div class="nm">确定性执行</div>
+        <div class="en">Deterministic Dispatch</div>
+        <div class="ds">以播放时钟为唯一时间基准，按时刻插值输出六路绝对位移帧。</div>
+      </div>
+      <div class="stg">
+        <div class="idx">05</div>
+        <div class="nm">联锁与观测</div>
+        <div class="en">Interlock &amp; Observability</div>
+        <div class="ds">四重联锁、控制帧审计、实测/理论双轨曲线，执行态与显示态同源。</div>
+      </div>
+    </div>
+
+    <div class="body">
+
+      <div class="col">
+        <h2>策略 IR <em>POLICY IR</em></h2>
+        <dl>
+          <dt>方案对象</dt>
+          <dd><code>schemes[{ rules[], timeline[], interrupts[] }]</code>，与手写编排共用同一执行引擎。</dd>
+
+          <dt>规则集 Rules</dt>
+          <dd>周期型与张力型两类；引擎固定 1 s 节拍判定，周期规则以触发标记去重，张力规则维护滑动窗口抑制噪声误触发。</dd>
+
+          <dt>时间线 Timeline</dt>
+          <dd>片段串行队列：<code>action</code> / <code>switch-model</code> / <code>wait</code>，逐段独立时长、顺序推进。</dd>
+
+          <dt>中断表 Interrupts</dt>
+          <dd>跨阈值触发 → 挂起当前进度 → 执行补偿片段 → 按原进度恢复；无恢复策略时驻留安全姿态。</dd>
+
+          <dt>治理通道</dt>
+          <dd>按角色能力位分流：管理员直传生效，操作员进入待审队列；空改动不生成审批单。</dd>
+        </dl>
+      </div>
+
+      <div class="col">
+        <h2>模型驱动规划 <em>MODEL-DRIVEN PLANNING</em></h2>
+        <dl>
+          <dt>物理基准</dt>
+          <dd>模型包 <code>TDCRMOD1</code> 五段：<code>KTB1</code> 张力/位移、<code>PTB1</code> 骨架点、<code>KSB1</code> 弧长网格、<code>KKB1</code> 曲率矢量、<code>META</code> 元信息；在线只读常量表。</dd>
+
+          <dt>逆解策略</dt>
+          <dd>末端位姿 → 近邻 <code>K=10</code>，距离倒数平方加权输出六路位移；邻距超域即判不可达，不做近似下发。</dd>
+
+          <dt>规划流程</dt>
+          <dd>等弧长重采样 → 逐点反查 → <code>κx / κy</code> 分量平滑（避免方向角过零翻转）→ 积分回算末端比对。</dd>
+
+          <dt>可行性裁决</dt>
+          <dd>任一点不可达或最大偏差超容差（默认 2 mm）即判该模型不可行；多模型求解矩阵按（模型 × 容差 × 点数）签名缓存。</dd>
+        </dl>
+      </div>
+
+      <div class="col">
+        <h2>确定性执行 <em>DISPATCH</em></h2>
+        <dl>
+          <dt>时间基准</dt>
+          <dd><code>progress = elapsed / total</code> 取自播放时钟，暂停即停、恢复即续；不依赖渲染帧号，掉帧不引起轨迹漂移。</dd>
+
+          <dt>下发节拍</dt>
+          <dd>固定 120 ms 一拍，按时刻在位移序列线性插值，输出绝对位移（后帧覆盖前帧）；结束补发终点帧锁定规划终点。</dd>
+
+          <dt>协议与通道</dt>
+          <dd>多电机同步位移帧 <code>0x04</code>，六路带符号毫米值，单通道仅保留最新目标，不排队、不背压。</dd>
+
+          <dt>四重联锁</dt>
+          <dd>① <code>SendMotionCommand</code> 能力位 ② 使能 / 急停短路 ③ 可及性阈值拒绝 ④ 连续失败自动停跟随。</dd>
+
+          <dt>孪生同步</dt>
+          <dd>曲率分布经两跳注入直达渲染循环；目标与实测各自独立阻尼，理论曲线由指令反推，与实测并列对照。</dd>
+        </dl>
+      </div>
+
+    </div>
+
+    <footer>
+      <div class="inv">
+        <div>
+          <div class="k">INVARIANT 01</div>
+          <div class="v">时间基准唯一 —— 播放时钟，而非渲染帧率</div>
+        </div>
+        <div>
+          <div class="k">INVARIANT 02</div>
+          <div class="v">物理事实唯一 —— 模型包，前端不做解析近似</div>
+        </div>
+        <div>
+          <div class="k">INVARIANT 03</div>
+          <div class="v">执行态来源唯一 —— 单实例 + 统一收尾路径</div>
+        </div>
+      </div>
+      <div class="data">
+        <b>1031</b> table samples · <b>61</b> curvature nodes · <b>6</b> motor channels<br />
+        <b>120</b> ms dispatch tick · <b>2</b> mm tolerance · <b>1</b> s engine tick
+      </div>
+    </footer>
+
+  </div>
+</div>
+
+<script>
+(function(){
+  var stage = document.getElementById('stage');
+  function fit(){
+    var s = Math.min(window.innerWidth / 1280, window.innerHeight / 720);
+    stage.style.transform = 'scale(' + s + ')';
+  }
+  window.addEventListener('resize', fit);
+  fit();
+})();
+</script>
+</body>
+</html>

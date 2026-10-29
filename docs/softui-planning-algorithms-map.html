@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>可行性评估与轨迹规划 · 算法链路</title>
+<style>
+  :root{
+    --ink:#0f172a; --ink2:#334155; --muted:#64748b; --faint:#94a3b8;
+    --line:#e2e8f0; --line2:#cbd5e1; --paper:#fff; --bg:#f5f6f8;
+    --blue:#1d4ed8; --blue-bg:#eff4ff; --blue-line:#c9d8fd;
+    --teal:#0f766e; --teal-bg:#eefbf8; --teal-line:#b8e5dd;
+    --amber:#b45309; --amber-bg:#fff9ee; --amber-line:#f2dcb2;
+    --red:#b42318; --red-bg:#fef4f3; --red-line:#f4cbc6;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg);color:var(--ink);padding:36px 22px 60px;
+    font:14px/1.6 "PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .sheet{max-width:1200px;margin:0 auto;background:var(--paper);border:1px solid var(--line);
+    border-radius:16px;padding:32px 36px 34px;box-shadow:0 12px 40px rgba(15,23,42,.07)}
+
+  header{border-bottom:1.5px solid var(--ink);padding-bottom:13px}
+  h1{font-size:21px;font-weight:700;letter-spacing:-.2px}
+  .sub{margin-top:5px;font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+  .io{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 20px;font-size:11.5px}
+  .io span{border:1px solid var(--line2);border-radius:6px;padding:3px 9px;color:var(--ink2);
+    background:#fafbfc;font-family:var(--mono);font-size:10.5px}
+  .io span b{color:var(--blue);font-weight:600}
+
+  .grid{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:34px}
+
+  /* 分区标题 */
+  .part{
+    display:flex;align-items:center;gap:10px;margin:4px 0 12px;
+    padding:8px 12px;border-radius:9px;font-size:12.5px;font-weight:650;
+  }
+  .part small{font-family:var(--mono);font-size:9.5px;font-weight:500;letter-spacing:.5px;opacity:.75}
+  .part.pa{background:var(--amber-bg);border:1px solid var(--amber-line);color:var(--amber)}
+  .part.pb{background:var(--teal-bg);border:1px solid var(--teal-line);color:var(--teal)}
+
+  /* 算法节点 */
+  .algo{display:grid;grid-template-columns:34px 1fr;gap:12px;position:relative}
+  .algo .n{width:26px;height:24px;border-radius:6px;display:grid;place-items:center;
+    font-family:var(--mono);font-size:10px;font-weight:600;margin-top:4px;
+    background:var(--teal-bg);color:var(--teal);border:1px solid var(--teal-line)}
+  .algo.pa .n{background:var(--amber-bg);color:var(--amber);border-color:var(--amber-line)}
+  .algo .box{border:1px solid var(--line);border-radius:10px;padding:11px 13px;background:#fff}
+  .algo.pa .box{border-color:var(--amber-line)}
+  .algo h3{font-size:13px;font-weight:650;display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+  .algo h3 .en{font-family:var(--mono);font-size:9.5px;font-weight:500;color:var(--faint);letter-spacing:.2px}
+  .algo .eq{margin-top:7px;font-family:var(--mono);font-size:11px;color:#1e293b;
+    background:#f8fafc;border:1px solid var(--line);border-left:3px solid var(--teal-line);
+    border-radius:5px;padding:6px 9px;line-height:1.7;white-space:pre-wrap}
+  .algo.pa .eq{border-left-color:var(--amber-line);background:#fffdf8}
+  .algo p{margin-top:7px;font-size:12.2px;color:var(--ink2);line-height:1.6}
+  .algo .why{margin-top:6px;font-size:11.3px;color:var(--muted);line-height:1.55}
+  .algo .why b{color:var(--amber)}
+
+  .arrow{height:16px;margin-left:12px;position:relative}
+  .arrow::before{content:"";position:absolute;left:0;top:0;bottom:6px;width:1px;background:var(--line2)}
+  .arrow::after{content:"";position:absolute;left:-3px;bottom:0;width:7px;height:7px;
+    border-right:1px solid var(--line2);border-bottom:1px solid var(--line2);transform:rotate(45deg)}
+
+  /* 门禁 */
+  .gate{margin:14px 0;border:1px solid var(--amber-line);background:var(--amber-bg);
+    border-radius:10px;padding:11px 14px;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center}
+  .gate h3{font-size:12.5px;color:var(--amber);font-weight:650}
+  .gate p{font-size:11.5px;color:#7c4a08;margin-top:3px;line-height:1.55}
+  .gate .verdict{font-family:var(--mono);font-size:10.5px;color:var(--amber);text-align:right;line-height:1.7}
+
+  .divider{height:1px;background:var(--line);margin:22px 0 18px}
+
+  /* 旁注 */
+  .note{border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-bottom:12px;background:#fbfcfd}
+  .note h4{font-size:11px;letter-spacing:.4px;color:var(--teal);margin-bottom:7px;
+    font-family:var(--mono);text-transform:uppercase}
+  .note ul{list-style:none;font-size:11.3px;color:var(--ink2);line-height:1.6}
+  .note li{position:relative;padding-left:13px;margin:4px 0}
+  .note li::before{content:"";position:absolute;left:3px;top:8px;width:4px;height:4px;
+    border-radius:50%;background:var(--line2)}
+  .note.warn{border-color:var(--red-line);background:var(--red-bg)}
+  .note.warn h4{color:var(--red)}
+  .note.warn li{color:#7f1d1d}
+  code{font-family:var(--mono);font-size:10.8px;background:#f1f5f9;border:1px solid var(--line);
+    border-radius:4px;padding:0 4px;color:#1e293b;white-space:nowrap}
+
+  /* 术语对照 */
+  .glossary{margin-top:14px;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .glossary table{width:100%;border-collapse:collapse;font-size:11.3px}
+  .glossary th{background:#f8fafc;text-align:left;padding:7px 10px;color:var(--muted);
+    font-weight:600;font-size:10.5px;letter-spacing:.3px;border-bottom:1px solid var(--line)}
+  .glossary td{padding:6px 10px;border-bottom:1px solid #f1f5f9;color:var(--ink2)}
+  .glossary tr:last-child td{border-bottom:none}
+  .glossary td:first-child{color:var(--faint);text-decoration:line-through}
+
+  footer{margin-top:20px;border-top:1px solid var(--line);padding-top:13px;
+    font-size:11px;color:var(--faint);font-family:var(--mono);line-height:1.75}
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <header>
+    <h1>可行性评估与轨迹规划 · 算法链路</h1>
+    <div class="sub">Feasibility Assessment  →  Trajectory Planning  ·  motionPlan.ts / svcModel.ts / vctable.rs</div>
+  </header>
+
+  <div class="io">
+    <span><b>IN</b> 示教点 {x,y,z} mm（three 系）</span>
+    <span><b>IN</b> 模型库 / TDCRMOD1 表 · N=1031 · 61 节点</span>
+    <span><b>OUT·A</b> feasible / maxDeviation / unreachable / reason</span>
+    <span><b>OUT·B</b> samples[] · durationMs</span>
+  </div>
+
+  <div class="grid">
+
+    <div class="chain">
+
+      <!-- ══════ PART A ══════ -->
+      <div class="part pa">
+        第一部分 · 可行性评估
+        <small>FEASIBILITY ASSESSMENT</small>
+      </div>
+
+      <div class="algo pa">
+        <div class="n">A1</div>
+        <div class="box">
+          <h3>模型集遍历与逐模型求解 <span class="en">model-set enumeration</span></h3>
+          <div class="eq">for model ∈ library:  plan = solve(model, points, tolerance)</div>
+          <p>对模型库中每个模型分别求解轨迹，得到各自的可达性与误差指标。库里有几个模型就生成几份评估结果。</p>
+          <div class="why"><b>指标来源</b>：偏差与饱和在 B2–B6 的求解管道中同步算得（同一函数 <code>planMotion</code>），A 部分负责**判定与归因**，不重复计算。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo pa">
+        <div class="n">A2</div>
+        <div class="box">
+          <h3>末端偏差评估 <span class="en">end-effector deviation metric</span></h3>
+          <div class="eq">e_i = ‖ p_rebuild(s_i) − p_target(s_i) ‖₂
+E_max = max_i e_i</div>
+          <p>把平滑后的曲率序列经正运动学重建，与等距重采样得到的目标点逐点比对，取全程最大偏差作为该项指标。</p>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo pa">
+        <div class="n">A3</div>
+        <div class="box">
+          <h3>曲率约束饱和检测 <span class="en">curvature saturation check</span></h3>
+          <div class="eq">saturated_i = |κ_i| &gt; κ_limit      κ_limit = mean(kappaLimitByDirection[0..7])</div>
+          <p>逐段检查曲率是否触及模型允许上限，超限段打饱和标记。饱和本身不判失败，作为“已到能力边界”的附加信息输出。</p>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo pa">
+        <div class="n">A4</div>
+        <div class="box">
+          <h3>容差接受判据 <span class="en">tolerance acceptance criterion</span></h3>
+          <div class="eq">feasible = (unreachable = ∅) ∧ (E_max ≤ ε + δ)      ε = 2 mm, δ = 0.05 mm</div>
+          <p>两条同时满足才算可行：无不可达采样点、最大偏差在容差内。<code>δ</code> 只为抵消浮点比较误差，不构成额外放宽。</p>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo pa">
+        <div class="n">A5</div>
+        <div class="box">
+          <h3>失败归因 <span class="en">failure attribution</span></h3>
+          <div class="eq">E_max &gt; 5ε  →  超可达域（臂长 / 曲率不足）
+otherwise    →  精度超差</div>
+          <p>把“不可行”细分成两类可执行的原因，直接决定操作员该改轨迹还是改模型。</p>
+        </div>
+      </div>
+
+      <!-- 门禁 -->
+      <div class="gate">
+        <div>
+          <h3>判定门禁 · Feasibility Gate</h3>
+          <p>可行性评估未通过的模型<b>不进入</b>轨迹规划输出，也不会被下发。可行模型才携带其规划结果进入第二部分。</p>
+        </div>
+        <div class="verdict">feasible = true →<br />下行<br />feasible = false →<br />返回原因</div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- ══════ PART B ══════ -->
+      <div class="part pb">
+        第二部分 · 轨迹规划
+        <small>TRAJECTORY PLANNING</small>
+      </div>
+
+      <div class="algo">
+        <div class="n">B1</div>
+        <div class="box">
+          <h3>C¹ 连续样条插值 <span class="en">Catmull-Rom spline interpolation</span></h3>
+          <div class="eq">P(t) = ½[ 2P₁ + (−P₀+P₂)t + (2P₀−5P₁+4P₂−P₃)t² + (−P₀+3P₁−3P₂+P₃)t³ ]</div>
+          <p>将离散示教点插值为 C¹ 连续曲线。该样条为**插值型**（曲线过控制点），切向量由相邻点差分自动给出，无需附加边界条件。</p>
+          <div class="why"><b>对比折线</b>：折线在节点处切向不连续，逆运动学求解会在该处产生曲率尖峰与饱和误判。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo">
+        <div class="n">B2</div>
+        <div class="box">
+          <h3>弧长参数化与等距重采样 <span class="en">arc-length parameterization &amp; uniform resampling</span></h3>
+          <div class="eq">s_{i+1} = s_i + Δs            Δs = 2 mm
+trajectory length  L = Σ Δs_i</div>
+          <p>以**弧长**为自然参数重新参数化曲线，再按恒定 Δs 采样，得到几何分布均匀的目标点列，同时给出路径总长 L。</p>
+          <div class="why"><b>为何不用参数 t 均匀采样</b>：Catmull-Rom 的参数化不均匀，按 t 等分会使高曲率区采样过密、直段过疏，逆解密度失真。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo">
+        <div class="n">B3</div>
+        <div class="box">
+          <h3>查表插值逆运动学 <span class="en">table-lookup inverse kinematics (IDW)</span></h3>
+          <div class="eq">d_j = ‖ tip(sample_j) − p_i ‖,     j = 1..N
+w_j = 1 / (d_j + 1)²,   w̃_j = w_j / Σw
+Δl_i = Σ_j w̃_j · Δl_j                (6 维度, K = 10)
+初值 ← 上一点解（warm start）</div>
+          <p>以末端位置为索引在离线求解表上做**反距离加权插值（IDW, K 近邻）**，输出六路驱动丝位移与对应的曲率场。采用逐点热启动以维持解支连续。</p>
+          <div class="why"><b>K 的取值依据</b>：K=4 时近邻集合切换导致权重和不连续，Δl 阶跃 1.6 mm；K=10 将其分摊至约 10%，阶跃降至 0.4 mm。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo">
+        <div class="n">B4</div>
+        <div class="box">
+          <h3>曲率场降采样 <span class="en">curvature-field downsampling (61 → 12)</span></h3>
+          <div class="eq">slot k ∈ [0,11] → s_k = (k + 0.5)/12 · L
+节点线性插值，端点对齐（endpoint-aligned）</div>
+          <p>表内曲率场为 61 节点矢量 (κx, κy, |κ|)，控制层需要 12 段。按段中点抽取节点并线性插值，完成降维。</p>
+          <div class="why"><b>端点对齐</b>：等距抽样会使首末段仅覆盖半个节点间距，重建形状系统性偏短。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo">
+        <div class="n">B5</div>
+        <div class="box">
+          <h3>曲率序列低通滤波 <span class="en">low-pass filtering of curvature series</span></h3>
+          <div class="eq">κ[i] ← ( κ[i−1] + 2κ[i] + κ[i+1] ) / 4       ×2 passes
+对 (κx, κy) 分量独立滤波</div>
+          <p>二项式核 <code>[1,2,1]/4</code>（等价两次 <code>[1,1]/2</code> 卷积）构成一阶低通，两遍叠加扩大等效窗口，抑制近邻切换引起的阶跃。</p>
+          <div class="why"><b>为何按分量而非 (|κ|, φ)</b>：对方向角 φ 滤波会在 ±π 处发生绕回，重建时臂体朝反向弯曲；分量域无此奇异性。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo">
+        <div class="n">B6</div>
+        <div class="box">
+          <h3>分段常曲率正运动学 <span class="en">piecewise-constant-curvature forward kinematics</span></h3>
+          <div class="eq">κ ≠ 0:  x = (1 − cos κs)/κ,   y = sin κs / κ
+H ← H · T(κ, φ, ds)                 6 substeps / segment
+p ← H · [x, y, 0, 1]ᵀ              12 × 6 = 72 积分点</div>
+          <p>按 PCC 假设在段内解析求解，再以 4×4 齐次变换矩阵逐段连乘至基座系；子步划分使段边界曲率突变在几何上连续过渡。</p>
+          <div class="why"><b>模型简化</b>：真实 Cosserat 解中 κ(s) 连续变化，此处段内视为常数，是重建误差的主要来源。</div>
+        </div>
+      </div>
+      <div class="arrow"></div>
+
+      <div class="algo">
+        <div class="n">B7</div>
+        <div class="box">
+          <h3>轨迹参数化与输出 <span class="en">trajectory parameterization</span></h3>
+          <div class="eq">durationMs = round( L / v · 1000 )        v = 20 mm/s
+output: samples[{ kx[], ky[], x, y, z }], durationMs</div>
+          <p>以恒定末端速度把几何路径映射为时间序列，输出执行层直接使用的采样点与总时长。</p>
+          <div class="why"><b>注意</b>：此处 v 是**规划名义速度**，与驱动器实际可达速度无关，两者不匹配时的表现见右下“已知失配”。</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 旁注 -->
+    <aside>
+      <div class="note">
+        <h4>数据源 · TDCRMOD1</h4>
+        <ul>
+          <li><code>KTB1</code> tau(6) + Δl_mm(6)</li>
+          <li><code>PTB1</code> 4 骨架点 × 3（svc，米）</li>
+          <li><code>KSB1</code> 弧长网格 61 节点</li>
+          <li><code>KKB1</code> 曲率矢量 61 × 3</li>
+          <li><code>META</code> N=1031 / τ_max / κ_peak</li>
+        </ul>
+      </div>
+
+      <div class="note">
+        <h4>关键参数</h4>
+        <ul>
+          <li>重采样步长 <code>Δs = 2 mm</code></li>
+          <li>近邻数 <code>K = 10</code></li>
+          <li>权重 <code>1/(d+1)²</code></li>
+          <li>滤波核 <code>[1,2,1]/4</code> × 2</li>
+          <li>积分子步 <code>6 / segment</code></li>
+          <li>容差 <code>ε = 2 mm</code></li>
+          <li>名义末端速度 <code>v = 20 mm/s</code></li>
+        </ul>
+      </div>
+
+      <div class="note warn">
+        <h4>模型近似（精度边界）</h4>
+        <ul>
+          <li>段内 κ 恒定（PCC），连续曲率被阶梯化</li>
+          <li>IK 仅以末端位置为索引，不含姿态约束</li>
+          <li>滤波各向同性，真实尖转折被一并削弱</li>
+        </ul>
+      </div>
+
+      <div class="note warn">
+        <h4>已知失配</h4>
+        <ul>
+          <li>规划名义速度 20 mm/s，实测驱动可达 2 mm/s</li>
+          <li>比值约 1:10，导致行程完成度仅 38%~82%</li>
+          <li>需统一速度标定或改速度前馈下发</li>
+        </ul>
+      </div>
+
+      <div class="note">
+        <h4>两部分的耦合方式</h4>
+        <ul>
+          <li>代码中 A、B 共用求解管道（<code>planMotion</code>）</li>
+          <li>A 输出判定，B 输出轨迹，不重复计算</li>
+          <li>门禁失败时轨迹<b>不产出</b>、不下发</li>
+        </ul>
+      </div>
+    </aside>
+
+  </div>
+
+  <!-- 术语对照 -->
+  <div class="glossary">
+    <table>
+      <tr><th>原表述</th><th>学术表述</th><th>英文对应</th></tr>
+      <tr><td>路径光顺</td><td>C¹ 连续样条插值</td><td>Catmull-Rom spline interpolation</td></tr>
+      <tr><td>等弧长重采样</td><td>弧长参数化与等距重采样</td><td>arc-length parameterization &amp; uniform resampling</td></tr>
+      <tr><td>表驱动逆解</td><td>查表插值逆运动学（反距离加权）</td><td>table-lookup IK with inverse distance weighting</td></tr>
+      <tr><td>61 个曲率点 / 12 段</td><td>曲率场降采样</td><td>curvature-field downsampling</td></tr>
+      <tr><td>κx/κy 分离平滑</td><td>曲率序列分量域低通滤波</td><td>low-pass filtering of curvature series</td></tr>
+      <tr><td>积分重建末端</td><td>分段常曲率正运动学重建</td><td>piecewise-constant-curvature forward kinematics</td></tr>
+      <tr><td>偏差 &gt; 2mm 超差</td><td>容差接受判据 / 末端偏差度量</td><td>tolerance acceptance criterion</td></tr>
+      <tr><td>阈值不动、vc 判定</td><td>曲率约束饱和检测</td><td>curvature saturation detection</td></tr>
+    </table>
+  </div>
+
+  <footer>
+    代码位置：motionPlan.ts（<code>planForAllModels</code> / <code>planMotion</code> / <code>catmullRom</code> / <code>resampleByArcLength</code> / <code>smoothSeries</code>）· svcModel.ts（<code>buildBackboneFromCurvatureDistribution</code> / <code>svcPose</code>）· vctable.rs（<code>interpolate_by_tip_mm</code> / <code>shape_12x2</code>）
+  </footer>
+
+</div>
+</body>
+</html>

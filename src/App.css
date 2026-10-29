@@ -34,7 +34,7 @@ body {
   align-items: center;
   justify-content: center;
   height: 100%;
-  color: #8899aa;
+  color: var(--text-secondary);
   font-size: 14px;
   padding: 40px;
 }
@@ -155,8 +155,11 @@ button,
 .panel,
 .stat-card {
   border-radius: 8px;
-  border: 1px solid var(--surface-overlay);
-  background: rgba(21, 29, 38, 0.96);
+  /* 这里原来是硬编码的 rgba(21, 29, 38, 0.96)（深色）。它只对深色主题成立，
+     浅色主题下整块就是黑的 —— 「会话与记录」页左栏那几个统计面板正好踩在这条上。
+     边框同理：原来拿 --surface-overlay 当描边，浅色主题下那是白色，等于没有边。 */
+  border: 1px solid var(--border-default);
+  background: var(--surface-panel);
 }
 
 
@@ -170,7 +173,8 @@ button,
   font-size: 0.72rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: rgba(231, 238, 247, 0.54);
+  /* 原来是给深色底写的浅色字，浅色主题下几乎看不见。 */
+  color: var(--text-muted);
 }
 
 
@@ -1753,10 +1757,13 @@ button,
 
 .timeline {
   display: grid;
-  gap: 12px;
+  /* 12px 太散 ✗ —— 进度条和时间读数是一组，8px 刚好 ✓ */
+  gap: 8px;
 }
 
 .timeline-bar {
+  /* 和卡片内其它文字**左右对齐** ✓ —— 原来贴边 ✗，看起来比标题还宽 ✗ */
+  margin: 0 12px;
   height: 10px;
   border-radius: 999px;
   background: var(--surface-overlay);
@@ -1770,9 +1777,14 @@ button,
 
 .timeline-meta {
   display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  color: rgba(231, 238, 247, 0.62);
+  /* `space-between` 把三个读数**拉到两端** ✗ —— 中间隔一大片空白 ✗；
+     改成**靠左紧凑** ✓，读数之间 10px ✓ */
+  justify-content: flex-start;
+  align-items: baseline;
+  margin: 0 12px;
+  gap: 10px;
+  /* 同上：原来是深色底专用的浅色字，浅色主题下白底白字，对比度几乎为零。 */
+  color: var(--text-secondary);
 }
 
 
@@ -1810,9 +1822,16 @@ button,
 
 
 .mini-info {
-  margin-top: 12px;
+  /* 和进度条同一套左右边距 ✓ */
+  margin: 8px 12px 0;
   font-size: 0.85rem;
-  color: rgba(231, 238, 247, 0.64);
+  /* 同上：原来是深色底专用的浅色字。 */
+  color: var(--text-secondary);
+}
+
+/* 「当前会话：xxx」里的会话名要跟说明文字拉开层次，否则整行一样淡。 */
+.mini-info strong {
+  color: var(--text-primary);
 }
 
 
@@ -2225,6 +2244,8 @@ button,
 }
 
 .connect-dialog {
+  /* 弹窗挂在 body 下 ✓，继承不到页面的文字色 ✗ → 必须显式给 ✓ */
+  color: var(--text-primary);
   width: min(520px, 92vw);
   max-height: 85vh;
   overflow-y: auto;
@@ -2259,9 +2280,22 @@ button,
   gap: 8px;
 }
 
+.connect-dialog h2,
+.connect-dialog label,
+.connect-dialog span,
+.connect-dialog p {
+  color: var(--text-primary);
+}
+
+.connect-dialog .connect-hint,
+.connect-dialog [class*="hint"] {
+  color: var(--text-muted);
+}
+
 .connect-label {
   font-size: 0.78rem;
   font-weight: 600;
+  color: var(--text-secondary);
   color: rgba(231, 238, 247, 0.7);
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -4801,11 +4835,40 @@ button {
   font-size: 0.82rem;
 }
 
+/* 三张图改成"一次只看一张"：并排时每张只有容器 1/3 宽，曲线挤在一起没法读。
+   切换按钮在 SVCCharts 里，这里只负责布局。 */
 .svc-charts-layout {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
   min-height: 240px;
+}
+
+.svc-chart-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.svc-chart-tab {
+  min-height: 26px;
+  padding: 3px 10px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-card);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.svc-chart-tab:hover {
+  background: var(--surface-page);
+  color: var(--text-primary);
+}
+
+.svc-chart-tab.is-active {
+  border-color: var(--action-primary);
+  background: color-mix(in srgb, var(--action-primary) 12%, transparent);
+  color: var(--text-primary);
 }
 
 .svc-curvature-wrap,
@@ -4869,11 +4932,45 @@ button {
 .arm-tracker-controls {
   top: 8px;
   left: 8px;
-  right: 8px;
+  right: auto;               /* 折叠时只有标题那么宽 ✓ */
+  max-width: calc(100% - 16px);
   flex-wrap: wrap;
   padding: 7px 8px;
   border-radius: 10px;
   font-size: 11px;
+}
+
+/* 折叠：默认收起，只显示「摄像头设置」一行 ✓（省空间；展开后铺满宽度）*/
+.arm-tracker-controls > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.arm-tracker-controls > summary::-webkit-details-marker {
+  display: none;
+}
+
+.arm-tracker-controls > summary::before {
+  content: "▸ ";
+  opacity: 0.6;
+}
+
+.arm-tracker-controls[open] > summary::before {
+  content: "▾ ";
+}
+
+/* 展开时标题独占一行，控件在下面换行排列 ✓ */
+.arm-tracker-controls[open] {
+  right: 8px;
+  flex-wrap: wrap;
+}
+
+.arm-tracker-controls[open] > summary {
+  width: 100%;
+  margin-bottom: 2px;
 }
 
 .arm-tracker-controls label {
@@ -5244,39 +5341,91 @@ button {
 /* ---- 顶层命令反馈横幅 ----
  * 命令结果（成功 / 未使能警告 / 失败原因）统一显示在页面内容区顶部，
  * 与「回放提示」同层同形，用户点完按钮抬眼就能看到。 */
+/**
+ * **浮动提示条** ✓ —— 悬浮在内容之上 ✓，不挤占布局 ✓（原来是页面里的普通块 ✗，
+ * 出现时会把 3D 面板 / 曲线整体顶下去 ✗）。
+ *
+ * 配色走**浅色玻璃**：低饱和透明白 + 细边框 + 左侧一道彩色竖条 ✓，
+ * 深色主题下显得干净 ✓，不再用浓重三色渐变 ✗（现场反馈：太丑 ✓）。
+ */
 .page-notice {
+  position: fixed;
+  top: 68px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 90;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-  padding: 9px 12px;
-  border: 1px solid color-mix(in srgb, var(--status-info) 45%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--status-info) 12%, transparent);
-  color: var(--status-info);
-  font-size: 12px;
-  line-height: 1.5;
+  gap: 14px;
+  max-width: min(720px, 88vw);
+  padding: 10px 16px 10px 20px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.10);
+  color: rgba(240, 246, 255, 0.96);
+  font-size: 12.5px;
+  line-height: 1.55;
+  backdrop-filter: blur(18px) saturate(120%);
+  box-shadow:
+    0 14px 36px rgba(0, 0, 0, 0.42),
+    0 1px 0 rgba(255, 255, 255, 0.16) inset;
+  animation: page-notice-in 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  overflow: hidden;
+}
+
+/* 左侧竖条：唯一的色相来源 ✓（细、不发光、不抢眼 ✓） */
+.page-notice::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+@keyframes page-notice-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
 }
 
 .page-notice.is-ok {
-  border-color: color-mix(in srgb, var(--status-ok) 45%, transparent);
-  background: color-mix(in srgb, var(--status-ok) 12%, transparent);
-  color: var(--status-ok);
+  border-color: rgba(140, 232, 214, 0.34);
+  background: rgba(255, 255, 255, 0.11);
+  color: rgba(238, 252, 249, 0.97);
+}
+
+.page-notice.is-ok::before {
+  background: #7fdfd0;
 }
 
 .page-notice.is-warn {
-  border-color: color-mix(in srgb, var(--status-warning) 55%, transparent);
-  background: color-mix(in srgb, var(--status-warning) 16%, transparent);
-  color: var(--status-warning);
+  border-color: rgba(246, 214, 150, 0.34);
+  background: rgba(255, 255, 255, 0.11);
+  color: rgba(255, 249, 238, 0.97);
+}
+
+.page-notice.is-warn::before {
+  background: #f2cf8b;
 }
 
 .page-notice.is-error {
-  border-color: color-mix(in srgb, var(--status-error) 50%, transparent);
-  background: color-mix(in srgb, var(--status-error) 14%, transparent);
-  color: var(--status-error);
+  border-color: rgba(246, 170, 170, 0.36);
+  background: rgba(255, 255, 255, 0.11);
+  color: rgba(255, 240, 240, 0.97);
 }
 
+.page-notice.is-error::before {
+  background: #f0a2a2;
+}
 /* 极简回放条：按钮放大到能轻松点中（原来是通用 .playback-btn，太小）。 */
 .playback-bar.is-minimal .playback-btn,
 .playback-bar.is-minimal .playback-btn.primary {

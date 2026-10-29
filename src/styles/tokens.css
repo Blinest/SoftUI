@@ -10,10 +10,50 @@
 .shell,
 .login-shell,
 .theme-light {
+  /* ⚠️ 这里曾被压深到 #dfe8f1，想给卡片纹理腾出"到纯白"的空间。
+     实测代价太大：页面变深 → 卡片与背景对比度变大，而半透明卡片透出更深的页面色
+     → 整片发灰。已恢复原值。纹理振幅改由 tools/make_card_grain.py 的
+     LIGHT_SPAN 控制，不要再动这个颜色。 */
   --surface-page: #edf2f6;
   --surface-sidebar: #e4eaf0;
   --surface-panel: #ffffff;
   --surface-overlay: #ffffff;
+  /* 菜单滑块：半透明玻璃胶囊。分主题给值 —— 玻璃的关键是「底色透明度 + 边缘高光」，
+     这两个量在浅底和深底上不能是同一个数，所以不写死在组件里。 */
+  --glass-pill-bg: rgba(255, 255, 255, 0.58);
+  --glass-pill-sheen-top: rgba(255, 255, 255, 0.72);
+  --glass-pill-sheen-bottom: rgba(255, 255, 255, 0.1);
+  --glass-pill-rim-strong: rgba(255, 255, 255, 0.95);
+  --glass-pill-rim-soft: rgba(255, 255, 255, 0.32);
+  --glass-pill-shadow: rgba(16, 24, 32, 0.16);
+  --glass-pill-glow: rgba(47, 120, 184, 0.34);
+  --glass-pill-glow-soft: rgba(47, 120, 184, 0.2);
+  /* 磨砂玻璃卡片。三样一起才有"磨砂"感（详见 layouts.css 的 .tilt-card）：
+   * 半透镜底色 + 背后提亮 + 细微颗粒。第一版只把底色调到 78% 白，压在本来就接近
+   * 白的页面上只差 4/255，等于没改；纯色底上 blur 也无物可糊。 */
+  --glass-card-blur: 24px;
+  /* 受光面：**CSS 的整块渐变**（见 layouts.css 的 .tilt-card）。
+     不能烤进贴图 —— 贴图平铺，空间渐变会重复成横条纹。 */
+  --glass-card-sheen: rgba(255, 255, 255, 0.22);
+  /* 边框必须**在浅底上看得见**。原来给的是 rgba(255,255,255,.72) —— 白边框压在
+     近白的卡片上等于没有边，卡片就丢了轮廓，这是"浅色背景还是不行"的主因。
+     改成偏冷的浅灰蓝：浅底上能勾出边界，深底上也不会突兀。 */
+  --glass-card-border: rgba(173, 194, 214, 0.7);
+  --glass-card-highlight: rgba(255, 255, 255, 0.95);
+  /* 投影也加一档：卡片要"浮"在页面之上，玻璃的层次感一半来自这个离开感。 */
+  --glass-card-shadow: rgba(16, 24, 32, 0.18);
+  --glass-card-spot-rgb: 255 255 255;
+  --glass-card-spot-size: 150px;
+  --glass-card-spot-alpha: 0.85;
+  --glass-card-edge: rgba(255, 255, 255, 0.95);
+  /* 颗粒纹：SVG feTurbulence 内联生成，不引图片资源。
+     里面 rect 的 opacity 就是颗粒强度，想更"毛"就调大它。
+     ⚠️ 它必须以 background-blend-mode: overlay 叠加（见 .tilt-card），不能当普通图层。
+     噪点是中灰，按普通图层叠上去是**绝对量混合**：同样强度在深色卡片上会提亮一大截
+     （底色 0.03 → 提亮 2.5 倍，这就是"深色磨砂太强"），在浅色卡片上只暗 5%
+     （0.97 → 几乎看不出，这就是"浅色没磨砂"）。overlay 下中灰等于不变，
+     只有偏离中灰的部分才起作用，强度自动跟着底色走，两边一次就都对了。 */
+  --glass-card-grain: url("data:image/png;base64,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");
   --text-primary: #213241;
   --text-secondary: #5c6d7b;
   --text-muted: #5f6e7a;
@@ -48,6 +88,7 @@
   --control-height: 36px;
 
   /* 别名桥：App.css 里已有若干 var(--text) / var(--muted) 引用。 */
+
   --text: var(--text-primary);
   --muted: var(--text-muted);
 }
@@ -90,6 +131,23 @@
   --status-error: #ff8a8f;
   --status-info: #8bc8ef;
   --status-debug: #c1b6ed;
+
+  /* 磨砂玻璃卡片（暗色）。⚠️ 这组令牌原来**一个都没有** —— 深色主题一直在
+     继承亮色块的值，其中 --glass-card-sheen 是 42% 白，压在深色卡片上就是一层
+     厚厚的乳白，正是"深色磨砂感太强、不细腻"的直接原因；边框也偏亮。 */
+  --glass-card-blur: 24px;
+  --glass-card-sheen: rgba(255, 255, 255, 0.035);
+  --glass-card-border: rgba(255, 255, 255, 0.11);
+  --glass-card-highlight: rgba(255, 255, 255, 0.14);
+  --glass-card-shadow: rgba(0, 0, 0, 0.42);
+  --glass-card-spot-rgb: 255 255 255;
+  --glass-card-spot-size: 150px;
+  --glass-card-spot-alpha: 0.2;
+  --glass-card-edge: rgba(255, 255, 255, 0.5);
+  /* 深色单独一份颗粒：高频细粒、振幅压小。
+     亮色那份是低频大块云雾 —— 低振幅下低频变化才认得出；深色上同样振幅的相对
+     变化大得多，低频反而显糙，所以两边必须分开。 */
+  --glass-card-grain: url("data:image/png;base64,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");
 
   --text: var(--text-primary);
   --muted: var(--text-muted);

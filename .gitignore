@@ -28,3 +28,8 @@ serve/auth.txt
 data/
 *.bak
 *.bak-*
+
+# 历史备份目录与旧模型包：不入库（保留在本地）
+.bak_modelless/
+src-tauri/assets/default.new.tdcrmodel
+src-tauri/assets/default_v2.tdcrmodel

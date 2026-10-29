@@ -1,0 +1,150 @@
+/* 命令面板（⌘K / Ctrl+K）。
+ *
+ * 复用卡片那套玻璃令牌（--glass-card-*），保证它和卡片是同一种"材质"，
+ * 不至于又出现一套独立的玻璃参数、两边各自漂移。 */
+
+.command-palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  /* 背景压暗 + 模糊。这里是整个项目里 backdrop-filter 唯一**真的看得出效果**的地方 ——
+     底下是完整的页面内容，不是纯色，有东西可糊。 */
+  background: rgba(10, 16, 22, 0.42);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+
+.command-palette {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(560px, 100%);
+  max-height: min(62vh, 470px);
+  overflow: hidden;
+  border: 1px solid var(--glass-card-border);
+  border-radius: 10px;
+  background-color: color-mix(in srgb, var(--surface-panel) 78%, transparent);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
+  box-shadow:
+    rgba(0, 0, 0, 0.4) 0 24px 60px,
+    var(--glass-card-highlight) 0 1px 0 inset;
+  color: var(--text-primary);
+}
+
+/* ---- 搜索行 ---- */
+
+.command-palette-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+}
+
+.command-palette-search input {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* 覆盖 base.css 里 input 的 min-height / 边框 / 底色，让它"长在"这一行里 */
+  min-height: 0;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.command-palette-search input:focus {
+  outline: none;
+}
+
+.command-palette-search kbd {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border: 1px solid var(--border-default);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+}
+
+/* ---- 结果列表 ---- */
+
+.command-palette-list {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.command-palette-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  /* 覆盖 base.css 里 button 的 min-height */
+  min-height: 0;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.command-palette-item.is-active {
+  border-color: var(--border-default);
+  background: color-mix(in srgb, var(--action-primary) 16%, transparent);
+  color: var(--text-primary);
+}
+
+.command-palette-text {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 1px;
+  min-width: 0;
+}
+
+.command-palette-text strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.command-palette-text small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 命中高亮。<mark> 默认是亮黄底，跟这套配色不搭，换成强调色描底。 */
+.command-palette-hit {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--action-primary) 30%, transparent);
+  color: inherit;
+}
+
+.command-palette-empty {
+  padding: 22px 12px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 面板本身没有过渡动画，这里只兜底：不给任何 transition。 */
+  .command-palette,
+  .command-palette-item {
+    transition: none;
+  }
+}

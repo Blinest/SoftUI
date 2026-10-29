@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod session;
 pub mod storage;
 pub mod tablecore;
+pub mod vctable;
 pub mod transport;
 
 use serde::{Deserialize, Serialize};
@@ -83,13 +84,19 @@ struct MotorState {
     target_position_mm: f64,
 }
 
+/// 一路张力通道。
+///
+/// 指令集里这不是「三轴传感器」，状态帧的每个 `x/y/z` 三元组其实是**一条通道**：
+///   x = 滤波 + 通道平衡后的张力，y = 原始值，z = 保留（不参与任何展示）。
+/// 所以这里只有「滤波值 / 原始值」两个数，没有第三轴。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SensorState {
     id: u32,
-    raw: [f64; 3],
-    filtered: [f64; 3],
-    alias: [String; 3],
+    /// 原始值：未经滤波与通道平衡。
+    raw_value: f64,
+    /// 滤波 + 通道平衡后的张力。
+    filtered_value: f64,
     unit: String,
     quality: FrameQuality,
 }
@@ -406,7 +413,7 @@ fn make_calib_row(
     } else {
         for i in 0..6 {
             if let Some(s) = frame.sensors.get(i) {
-                let v = s.filtered[0];
+                let v = s.filtered_value;
                 if v.is_finite() {
                     row.tau_n[i] = Some(v);
                 }
@@ -570,18 +577,26 @@ fn adapt_motor(id: u32, motor: &protocol::MotorData) -> MotorState {
         velocity_mm_per_sec: motor.velocity_mm_per_sec,
         acceleration_mm_per_sec2: motor.acceleration_mm_per_sec2,
         running: motor.status != 0,
+        // ⚠️ 报文里**没有**电机目标字段（MotorData 只有 位置/速度/加速度/状态），
+        // 这是一个**硬编码占位**，不是真实目标。界面已不再显示它（改用后端回传的
+        // 真实下发目标），但字段还在类型里，留给需要"近似目标"的旧消费方。
         target_position_mm: motor.position_mm + 1.5,
     }
 }
 
 fn adapt_sensor(id: u32, sensor: &protocol::SensorData, seq: u64) -> SensorState {
-    let raw = [sensor.x, sensor.y, sensor.z];
-    let filtered = [raw[0] * 0.96, raw[1] * 0.95, raw[2] * 0.94];
     SensorState {
         id,
-        raw,
-        filtered,
-        alias: ["X".to_string(), "Y".to_string(), "Z".to_string()],
+        // 固件的口径：**x = 压力传感器的实际值（未滤波），y = 滤波值**。
+        //
+        // ⚠️ 这与指令集文档 §5.1 的写法相反（文档写的是 x=滤波、y=原始）。以固件实际
+        // 报文为准 —— 文档那条我已在笔记里提出来待确认。
+        //
+        // 下面两行是整个上位机里**唯一**做这个映射的地方（前端桩的 adaptSensor 是同源
+        // 副本，两边必须一起改）。映射写错的表现很难查：数值看着都正常，只是"滤波"和
+        // "实际"两列互换了，而滤波值本来就贴近实际值，肉眼几乎看不出。
+        raw_value: sensor.x,
+        filtered_value: sensor.y,
         unit: "N".to_string(),
         quality: if seq % 15 == 0 {
             FrameQuality::Warning
@@ -604,6 +619,19 @@ fn adapt_bend(angle_deg: f64, direction: &str, seq: u64) -> BendState {
     }
 }
 
+/// 上行协议版本的展示文案。
+///
+/// 下位机上电默认发 V1（`0xBB`），上位机发过 `AA 09 01 02` 之后切 V2（`0x55` + 设备 ID）。
+/// 界面上必须显示**实际在跑**的那个 —— 旧实现把 "Legacy V1" 写死，协商成功之后
+/// 仍然显示 V1，等于把唯一的协议状态指示也变成了假信息。
+fn protocol_version_label(version: u8) -> String {
+    if version >= 2 {
+        "V2 (0x55)".to_string()
+    } else {
+        "Legacy V1 (0xBB)".to_string()
+    }
+}
+
 fn make_frame(seq: u64, connected: bool) -> DeviceSnapshot {
     if !connected {
         // 未连接时直接生成最小帧，跳过模拟器 handshake
@@ -614,14 +642,14 @@ fn make_frame(seq: u64, connected: bool) -> DeviceSnapshot {
             }))
             .collect::<Vec<_>>();
         let sensors = (0..6)
-            .map(|i| adapt_sensor((i + 1) as u32, &protocol::SensorData { x: 0.0, y: 0.0, z: 0.0 }, seq))
+            .map(|i| adapt_sensor((i + 1) as u32, &protocol::SensorData { x: 0.0, y: 0.0 }, seq))
             .collect::<Vec<_>>();
         return DeviceSnapshot {
             device_id: "softui-sim-01".to_string(),
             connection_id: "conn-01".to_string(),
             received_at_ms: now_ms(),
             sequence: seq,
-            protocol_version: "Legacy V1".to_string(),
+            protocol_version: "未连接".to_string(),
             system_enabled: false,
             motors,
             sensors,
@@ -660,13 +688,13 @@ fn make_frame(seq: u64, connected: bool) -> DeviceSnapshot {
         connection_id: "conn-01".to_string(),
         received_at_ms: now_ms(),
         sequence: seq,
-        protocol_version: "Legacy V1".to_string(),
+        protocol_version: protocol_version_label(runtime.status().protocol_version),
         system_enabled: connected && status.system_state != 0,
         motors,
         sensors,
         bend: BendSnapshot {
-            section1: adapt_bend(status.bend_angle1_deg, "up", seq),
-            section2: adapt_bend(status.bend_angle2_deg, "right", seq),
+            section1: adapt_bend(status.scale, "up", seq),
+            section2: adapt_bend(status.arm_bend, "right", seq),
         },
         quality: FrameStatus {
             status: quality,
@@ -701,13 +729,14 @@ fn make_device_frame(
         connection_id: record.connection_id.clone(),
         received_at_ms: now_ms(),
         sequence: seq,
-        protocol_version: "Legacy V1".to_string(),
+        // 实际在跑的协议版本：下位机上电发 V1，收到 `AA 09 01 02` 后切 V2。
+        protocol_version: protocol_version_label(runtime.protocol_version),
         system_enabled: status.system_state != 0,
         motors,
         sensors,
         bend: BendSnapshot {
-            section1: adapt_bend(status.bend_angle1_deg, "up", seq),
-            section2: adapt_bend(status.bend_angle2_deg, "right", seq),
+            section1: adapt_bend(status.scale, "up", seq),
+            section2: adapt_bend(status.arm_bend, "right", seq),
         },
         quality: FrameStatus {
             status: if runtime.protocol_errors == 0 {
@@ -1510,6 +1539,1087 @@ fn imported_tables() -> Option<std::sync::Arc<model::ModelTables>> {
 }
 
 /// 持久化文件：与可执行文件同目录的 `model.tdcrmodel`。
+/// **AI 配置**（DeepSeek ✓）—— 存在服务器上 ✓，**前端永远拿不到 Key** ✓。
+///
+/// 为什么不在前端调 API ✗：前端代码是公开的 ✓，Key 会泄露 ✓。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiConfig {
+    api_key: String,
+    #[serde(default = "default_ai_base_url")]
+    base_url: String,
+    #[serde(default = "default_ai_model")]
+    model: String,
+}
+
+fn default_ai_base_url() -> String {
+    "https://api.deepseek.com/chat/completions".to_string()
+}
+
+fn default_ai_model() -> String {
+    "deepseek-chat".to_string()
+}
+
+fn ai_config_path() -> Option<std::path::PathBuf> {
+    let root = std::env::var("SOFTUI_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    Some(root.parent()?.join("ai-config.json"))
+}
+
+/// 读配置 ✓（没有文件时回落到环境变量 ✓，方便部署 ✓）
+fn read_ai_config() -> Result<AiConfig, String> {
+    if let Some(path) = ai_config_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(config) = serde_json::from_str::<AiConfig>(&text) {
+                if !config.api_key.is_empty() {
+                    return Ok(config);
+                }
+            }
+        }
+    }
+    let key = std::env::var("DEEPSEEK_API_KEY").unwrap_or_default();
+    if key.is_empty() {
+        return Err("还没有配置 AI：请在 data/ai-config.json 写入 {\"apiKey\":\"sk-…\"} 或设置 DEEPSEEK_API_KEY".to_string());
+    }
+    Ok(AiConfig {
+        api_key: key,
+        base_url: default_ai_base_url(),
+        model: default_ai_model(),
+    })
+}
+
+/// 保存 AI 配置 ✓（前端只传 Key ✓，不回传 ✗）
+fn save_ai_config(api_key: String, base_url: Option<String>, model: Option<String>) -> Result<bool, String> {
+    let path = ai_config_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    let config = AiConfig {
+        api_key,
+        base_url: base_url.unwrap_or_else(default_ai_base_url),
+        model: model.unwrap_or_else(default_ai_model),
+    };
+    let text = serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| format!("写入失败：{error}"))?;
+    Ok(true)
+}
+
+/// 只告诉前端"配没配"✓，**不返回 Key** ✗
+fn ai_config_status() -> serde_json::Value {
+    match read_ai_config() {
+        Ok(config) => serde_json::json!({
+            "configured": true,
+            "model": config.model,
+            "baseUrl": config.base_url,
+        }),
+        Err(_) => serde_json::json!({ "configured": false }),
+    }
+}
+
+/// **按账号的 Key 表** ✓ —— `data/ai-keys.json`：`{ "user1": "sk-…", … }`
+///
+/// 为什么按账号 ✗：Key 是**账号的配额** ✓，混用会让 A 用掉 B 的额度 ✗。
+/// 没单独配的账号回落到全局 Key ✓（`ai-config.json` 或环境变量 ✓）。
+fn ai_keys_path() -> Option<std::path::PathBuf> {
+    let root = std::env::var("SOFTUI_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    Some(root.parent()?.join("ai-keys.json"))
+}
+
+/// 某个账号自己的 Key + 模型 ✓（**互不干扰** ✗ —— 不再覆盖全局配置 ✓）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AiUserKey {
+    api_key: String,
+    #[serde(default = "default_ai_model")]
+    model: String,
+    #[serde(default)]
+    base_url: Option<String>,
+}
+
+fn read_ai_key_map() -> std::collections::HashMap<String, AiUserKey> {
+    ai_keys_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<std::collections::HashMap<String, AiUserKey>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_ai_key_map(map: &std::collections::HashMap<String, AiUserKey>) -> Result<(), String> {
+    let path = ai_keys_path().ok_or_else(|| "无法定位配置目录".to_string())?;
+    let text = serde_json::to_string_pretty(map).map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| format!("写入失败：{error}"))?;
+    Ok(())
+}
+
+/// 给某个账号设 Key ✓（空字符串 = 删除该账号的 Key ✓）
+fn set_ai_key(
+    username: String,
+    api_key: String,
+    model: Option<String>,
+    base_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut map = read_ai_key_map();
+    if api_key.trim().is_empty() {
+        map.remove(&username);
+    } else {
+        map.insert(
+            username.clone(),
+            AiUserKey {
+                api_key,
+                model: model.unwrap_or_else(default_ai_model),
+                base_url,
+            },
+        );
+    }
+    write_ai_key_map(&map)?;
+    Ok(serde_json::json!({ "ok": true, "username": username }))
+}
+
+/// 某个账号**有没有配自己的 Key** ✓（不返回 Key 本身 ✗）
+fn ai_key_status(username: String) -> serde_json::Value {
+    let map = read_ai_key_map();
+    let own = map.get(&username).filter(|item| !item.api_key.is_empty());
+    let global = read_ai_config().is_ok();
+    serde_json::json!({
+        "username": username,
+        "hasOwnKey": own.is_some(),
+        "hasGlobalKey": global,
+        // 有自己配置时**报自己的模型** ✓（前端用来回填下拉 ✓）
+        "model": own.map(|item| item.model.clone()),
+    })
+}
+
+/// `anchor` 用的系统提示 ✓（把"规则"讲死 ✓，AI 只负责翻译 ✗）
+const AI_POLICY_SYSTEM_PROMPT: &str = r#"你是 SoftUI 柔性臂的**策略编排助手**。把用户的话翻译成 JSON 配置。
+
+## 输出格式（只输出 JSON ✓，不要解释 ✗）
+{
+  "name": "方案名",
+  "timeline": [
+    { "kind": "action" | "switch-model" | "wait", "actionId": "…", "modelId": "…", "durationSec": 10, "note": "…" }
+  ],
+  "interrupts": [
+    { "trigger": "tension-spike", "thresholdN": 5, "windowMs": 2000, "targetKind": "model" | "action", "targetId": "…", "resume": true, "note": "…" }
+  ]
+}
+
+## 规则
+1. **只能使用 context 里列出的 id** ✓，不要编造 ✗
+2. timeline 是**顺序执行** ✓，durationSec = 这一段持续多少秒
+3. 中断**优先于**时间线 ✓，命中时时间线暂停
+4. 用户没提的字段用默认：windowMs=2000、resume=true、durationSec=10
+5. durationSec 必须 > 0 且 ≤ 3600
+"#;
+
+/// **AI 生成策略** ✓ —— 调 DeepSeek ✓，返回**原始 JSON 文本** ✓
+/// （校验在前端做 ✓：前端才知道最新的模型/动作列表 ✓）
+fn ai_compose_policy(
+    prompt: String,
+    context: serde_json::Value,
+    username: Option<String>,
+) -> Result<serde_json::Value, String> {
+    // ⚠ **先看账号自己的** ✓ —— 原来是 `read_ai_config()?` 先跑 ✗，
+    //   全局没配就直接报错 ✓，**账号配了也没用**✗（本次 bug ✓）。
+    let own = username
+        .as_deref()
+        .and_then(|name| read_ai_key_map().get(name).cloned())
+        .filter(|item| !item.api_key.trim().is_empty());
+
+    let config = if let Some(own) = own {
+        AiConfig {
+            api_key: own.api_key,
+            // 账号没填接口地址就用默认 ✓
+            base_url: own
+                .base_url
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(default_ai_base_url),
+            model: own.model,
+        }
+    } else {
+        // 账号没配 → 才回落到全局 ✓
+        read_ai_config()?
+    };
+    let context_text = serde_json::to_string(&context).unwrap_or_else(|_| "{}".to_string());
+    let body = serde_json::json!({
+        "model": config.model,
+        "messages": [
+            { "role": "system", "content": AI_POLICY_SYSTEM_PROMPT },
+            { "role": "user", "content": format!("可用清单：{context_text}\n\n用户需求：{prompt}") }
+        ],
+        "response_format": { "type": "json_object" },
+        "temperature": 0.2
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|error| format!("创建请求失败：{error}"))?;
+
+    let response = client
+        .post(&config.base_url)
+        .bearer_auth(&config.api_key)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("请求失败：{error}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().unwrap_or_default();
+        return Err(format!("接口返回 {status}：{}", text.chars().take(300).collect::<String>()));
+    }
+
+    let payload: serde_json::Value = response.json().map_err(|error| format!("解析失败：{error}"))?;
+    let content = payload
+        .get("choices")
+        .and_then(|choices| choices.get(0))
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .ok_or_else(|| "响应里没有 content".to_string())?;
+
+    // 有些模型会包 ```json … ``` ✓ —— 剥掉 ✓
+    let trimmed = content.trim();
+    let json_text = if let Some(rest) = trimmed.strip_prefix("```json") {
+        rest.trim_end_matches("```").trim()
+    } else if let Some(rest) = trimmed.strip_prefix("```") {
+        rest.trim_end_matches("```").trim()
+    } else {
+        trimmed
+    };
+
+    serde_json::from_str::<serde_json::Value>(json_text)
+        .map_err(|error| format!("返回的不是合法 JSON：{error}"))
+}
+
+/// **界面共享数据**目录（`<状态目录>/ui-store`）✓。
+///
+/// 动作库 / 策略编排原来存在 `localStorage` ✗ —— 那是**每个浏览器一份** ✗，
+/// 多端（手机 ✓ 电脑 ✓ 平板 ✓）就完全不同步 ✗。
+/// 现在落到服务器上的 JSON 文件 ✓，所有端读同一份 ✓。
+fn ui_store_dir() -> Option<std::path::PathBuf> {
+    let root = std::env::var("SOFTUI_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    let dir = root.parent()?.join("ui-store");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// 命名空间白名单 ✓ —— 不接受任意名字 ✗（防路径穿越 ✓）。
+const UI_STORE_NAMESPACES: [&str; 5] = ["motion-actions", "policy-schemes", "policy-log", "log-hidden", "ui-prefs"];
+
+fn ui_store_path(namespace: &str) -> Result<std::path::PathBuf, String> {
+    if !UI_STORE_NAMESPACES.contains(&namespace) {
+        return Err(format!("未知的数据命名空间：{namespace}"));
+    }
+    let dir = ui_store_dir().ok_or_else(|| "无法定位数据目录".to_string())?;
+    Ok(dir.join(format!("{namespace}.json")))
+}
+
+/// 待审批的一条改动 ✓。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingUiChange {
+    /// 文件名（不含扩展名）✓
+    id: String,
+    namespace: String,
+    /// 谁提交的（用户名 ✓）
+    submitted_by: String,
+    submitted_at: String,
+    /// 一句话摘要 ✓（"动作库：3 个动作"✓）
+    summary: String,
+    /// 改动内容 ✓
+    data: serde_json::Value,
+    /// **有变化的条目 id** ✓ —— 和正式数据对比得出 ✓。
+    /// 审批弹窗只列这些 ✓（已同步没动的不要出现 ✗）
+    #[serde(default)]
+    changed_ids: Vec<String>,
+}
+
+fn pending_dir() -> Result<std::path::PathBuf, String> {
+    let dir = ui_store_dir()
+        .ok_or_else(|| "无法定位数据目录".to_string())?
+        .join("pending");
+    std::fs::create_dir_all(&dir).map_err(|error| format!("创建待审批目录失败：{error}"))?;
+    Ok(dir)
+}
+
+/// 提交一条待审批改动 ✓（非 admin 保存时走这里 ✓）。
+fn submit_ui_store(
+    namespace: String,
+    data: serde_json::Value,
+    submitted_by: String,
+) -> Result<PendingUiChange, String> {
+    // 先校验命名空间合法 ✓（非法名字不落盘 ✗）
+    ui_store_path(&namespace)?;
+    let dir = pending_dir()?;
+
+    // ⚠ **同一用户 + 同一命名空间只保留最新一条** ✓
+    // 原来每提交一次就新建一个文件 ✗ —— 前端 500ms 去抖自动保存 ✓，
+    // 用户改十几下就堆十几条待审批 ✗（实测出现 12 条 ✗）。
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(existing) = serde_json::from_str::<PendingUiChange>(&text) {
+                    if existing.namespace == namespace && existing.submitted_by == submitted_by {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let id = format!("{stamp}-{namespace}");
+    let summary = summarize_change(&namespace, &data);
+    let changed_ids = changed_entry_ids(&namespace, &data);
+    let change = PendingUiChange {
+        id: id.clone(),
+        namespace,
+        submitted_by,
+        submitted_at: format!("{stamp}"),
+        summary,
+        data,
+        changed_ids,
+    };
+    let text = serde_json::to_string_pretty(&change).map_err(|error| error.to_string())?;
+    std::fs::write(dir.join(format!("{id}.json")), text)
+        .map_err(|error| format!("写入待审批失败：{error}"))?;
+    Ok(change)
+}
+
+/// 给审批人看的摘要 ✓ —— **和当前正式数据对比** ✓，说明"加了什么/删了什么"。
+///
+/// 原来只报"3 项"✗ —— 审批人根本看不出是新增还是删除 ✗。
+fn summarize_change(namespace: &str, data: &serde_json::Value) -> String {
+    // 读当前正式数据 ✓（没有就当空 ✓）
+    let current = ui_store_path(namespace)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    // 动作库：按 id 对比 ✓
+    if let (Some(new_items), Some(old_items)) = (data.as_array(), current.as_array()) {
+        let key_of = |value: &serde_json::Value| {
+            value
+                .get("id")
+                .and_then(|id| id.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let name_of = |value: &serde_json::Value| {
+            let base = value
+                .get("name")
+                .and_then(|name| name.as_str())
+                .unwrap_or("(未命名)")
+                .to_string();
+            // 带上**采样点数** ✓ —— 审批人据此判断动作大小 ✓
+            match value.get("points").and_then(|points| points.as_array()) {
+                Some(points) => format!("{base}（{} 点）", points.len()),
+                None => base,
+            }
+        };
+        let old_ids: std::collections::HashMap<String, String> =
+            old_items.iter().map(|item| (key_of(item), name_of(item))).collect();
+        let new_ids: std::collections::HashMap<String, String> =
+            new_items.iter().map(|item| (key_of(item), name_of(item))).collect();
+
+        let added: Vec<String> = new_ids
+            .iter()
+            .filter(|(id, _)| !old_ids.contains_key(*id))
+            .map(|(_, name)| name.clone())
+            .collect();
+        let removed: Vec<String> = old_ids
+            .iter()
+            .filter(|(id, _)| !new_ids.contains_key(*id))
+            .map(|(_, name)| name.clone())
+            .collect();
+        let modified = new_ids
+            .iter()
+            .filter(|(id, _)| old_ids.contains_key(*id))
+            .count();
+
+        let mut parts: Vec<String> = Vec::new();
+        if !added.is_empty() {
+            parts.push(format!("新增 {} 个：{}", added.len(), preview_names(&added)));
+        }
+        if !removed.is_empty() {
+            parts.push(format!("删除 {} 个：{}", removed.len(), preview_names(&removed)));
+        }
+        if modified > 0 {
+            parts.push(format!("修改 {modified} 个"));
+        }
+        if parts.is_empty() {
+            return format!("{} 个动作（无实质变化）", new_items.len());
+        }
+        return parts.join(" · ");
+    }
+
+    // 策略编排：报方案数与规则数 ✓
+    if let Some(schemes) = data.get("schemes").and_then(|value| value.as_array()) {
+        let old_count = current
+            .get("schemes")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let rules: usize = schemes
+            .iter()
+            .map(|scheme| {
+                scheme
+                    .get("rules")
+                    .and_then(|value| value.as_array())
+                    .map(|items| items.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        let names: Vec<String> = schemes
+            .iter()
+            .filter_map(|scheme| scheme.get("name").and_then(|name| name.as_str()).map(String::from))
+            .collect();
+        return format!(
+            "{} 个方案（原 {old_count}）· 共 {rules} 条规则 · {}",
+            schemes.len(),
+            preview_names(&names)
+        );
+    }
+
+    summarize_value(data)
+}
+
+/// 找出**和当前正式数据不同**的条目 id ✓。
+///
+/// 不做这个的话 ✗：整个数组都进审批 ✓ → 已同步的没改过的也出现在待审批里 ✗
+/// （用户看到"上传一次又冒出一堆"✗）。
+fn changed_entry_ids(namespace: &str, data: &serde_json::Value) -> Vec<String> {
+    // 两种形状 ✓：动作库是数组 ✓，方案库是 `{ schemes: [...] }` ✓（原来只认数组 ✗）
+    let items_value = if data.is_array() {
+        data.clone()
+    } else if let Some(schemes) = data.get("schemes") {
+        schemes.clone()
+    } else {
+        return Vec::new();
+    };
+    let Some(new_items) = items_value.as_array() else {
+        return Vec::new();
+    };
+    let current = ui_store_path(namespace)
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let old_items: Vec<serde_json::Value> = current
+        .as_ref()
+        .and_then(|value| {
+            if value.is_array() {
+                value.as_array().cloned()
+            } else {
+                value.get("schemes").and_then(|schemes| schemes.as_array()).cloned()
+            }
+        })
+        .unwrap_or_default();
+
+    let key_of = |value: &serde_json::Value| {
+        value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let mut changed: Vec<String> = Vec::new();
+    for item in new_items {
+        let id = key_of(item);
+        if id.is_empty() {
+            continue;
+        }
+        match old_items.iter().find(|old| key_of(old) == id) {
+            // 新增 ✓ 或内容变了 ✓（用 JSON 文本比较 ✓，够用 ✓）
+            None => changed.push(id),
+            Some(old) => {
+                if serde_json::to_string(old).ok() != serde_json::to_string(item).ok() {
+                    changed.push(id);
+                }
+            }
+        }
+    }
+    // 被删掉的：在旧数据里有、新数据里没有 ✓（用 "deleted:<id>" 前缀标记 ✓）
+    let new_ids: Vec<String> = new_items.iter().map(key_of).collect();
+    for old in &old_items {
+        let id = key_of(old);
+        if !id.is_empty() && !new_ids.contains(&id) {
+            changed.push(format!("deleted:{id}"));
+        }
+    }
+    changed
+}
+
+/// 名字太多就截断 ✓（弹窗里看不下 ✗）
+fn preview_names(names: &[String]) -> String {
+    let limit = 3;
+    if names.len() <= limit {
+        return names.join("、");
+    }
+    format!("{}…等 {} 个", names[..limit].join("、"), names.len())
+}
+
+/// 给前端看的摘要 ✓（不用复杂逻辑 ✓，能看到条数就够 ✓）
+fn summarize_value(data: &serde_json::Value) -> String {
+    match data {
+        serde_json::Value::Array(items) => format!("{} 项", items.len()),
+        serde_json::Value::Object(map) => {
+            if let Some(schemes) = map.get("schemes").and_then(|value| value.as_array()) {
+                return format!("{} 个方案", schemes.len());
+            }
+            format!("{} 个字段", map.len())
+        }
+        _ => "单项".to_string(),
+    }
+}
+
+/// 列出所有待审批 ✓（按提交时间倒序 ✓）。
+fn list_pending_ui_store() -> Result<Vec<PendingUiChange>, String> {
+    let dir = pending_dir()?;
+    let mut items: Vec<PendingUiChange> = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|error| format!("读取失败：{error}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(change) = serde_json::from_str::<PendingUiChange>(&text) {
+                items.push(change);
+            }
+        }
+    }
+    items.sort_by(|a, b| b.id.cmp(&a.id));
+    Ok(items)
+}
+
+/// **按条目批准** ✓ —— 只把选中的那几条写进正式数据，其余继续待批 ✓。
+///
+/// 为什么需要 ✗：一条待审批里打包了**整个数组** ✓，一次批准等于全批 ✗；
+/// 审批人想"这个留下、那个驳回"就做不到 ✓。
+fn approve_ui_store_entry(
+    id: String,
+    entry_id: String,
+) -> Result<Vec<PendingUiChange>, String> {
+    let dir = pending_dir()?;
+    let path = dir.join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path).map_err(|_| format!("找不到待审批项：{id}"))?;
+    let mut change: PendingUiChange =
+        serde_json::from_str(&text).map_err(|error| format!("解析失败：{error}"))?;
+
+    let namespace = change.namespace.clone();
+    let official = ui_store_path(&namespace)?;
+    let mut official_data: serde_json::Value = std::fs::read_to_string(&official)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Array(Vec::new()));
+
+    // ① 从待审批里**取出**这条 ✓（动作库是数组 ✓，方案库是 `{schemes:[…]}` ✓）
+    let is_scheme_payload = !change.data.is_array() && change.data.get("schemes").is_some();
+    let mut picked: Option<serde_json::Value> = None;
+    {
+        let items = if is_scheme_payload {
+            change.data.get_mut("schemes").and_then(|value| value.as_array_mut())
+        } else {
+            change.data.as_array_mut()
+        };
+        if let Some(items) = items {
+            if let Some(index) = items.iter().position(|item| {
+                item.get("id").and_then(|value| value.as_str()) == Some(entry_id.as_str())
+            }) {
+                picked = Some(items.remove(index));
+            }
+        }
+    }
+    let Some(picked) = picked else {
+        return Err(format!("待审批里没有条目：{entry_id}"));
+    };
+
+    // ② 写进正式数据 ✓（同 id 覆盖 ✓，没有就追加 ✓）
+    if is_scheme_payload {
+        if !official_data.is_object() {
+            official_data = serde_json::json!({ "schemes": [], "activeId": "" });
+        }
+        if let Some(items) = official_data
+            .get_mut("schemes")
+            .and_then(|value| value.as_array_mut())
+        {
+            match items.iter().position(|item| {
+                item.get("id").and_then(|value| value.as_str()) == Some(entry_id.as_str())
+            }) {
+                Some(index) => items[index] = picked,
+                None => items.push(picked),
+            }
+        }
+    } else {
+        if !official_data.is_array() {
+            official_data = serde_json::Value::Array(Vec::new());
+        }
+        if let Some(items) = official_data.as_array_mut() {
+            match items.iter().position(|item| {
+                item.get("id").and_then(|value| value.as_str()) == Some(entry_id.as_str())
+            }) {
+                Some(index) => items[index] = picked,
+                None => items.push(picked),
+            }
+        }
+    }
+
+    // ⚠ **从待审批的 changed_ids 里移除**已批准的这条 ✗
+    // 不移的话 ✓：后面驳回时会把整批 id 都写进驳回通知 ✗
+    // → 用户界面**所有条目**都显示"已驳回"✗（这就是本次 bug ✓）
+    change.changed_ids.retain(|id| id != &entry_id);
+    let text_out = serde_json::to_string_pretty(&official_data).map_err(|e| e.to_string())?;
+    std::fs::write(&official, text_out).map_err(|error| format!("写入失败：{error}"))?;
+
+    // ③ 待审批里还剩不剩条目 ✓
+    let remaining = if is_scheme_payload {
+        change
+            .data
+            .get("schemes")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len())
+            .unwrap_or(0)
+    } else {
+        change.data.as_array().map(|items| items.len()).unwrap_or(0)
+    };
+    if remaining == 0 {
+        let _ = std::fs::remove_file(&path);
+    } else {
+        let text = serde_json::to_string_pretty(&change).map_err(|e| e.to_string())?;
+        std::fs::write(&path, text).map_err(|error| format!("回写失败：{error}"))?;
+    }
+
+    list_pending_ui_store()
+}
+
+/// 批准 ✓ —— 把内容写入正式文件，再删掉待审批。
+fn approve_ui_store(id: String) -> Result<Vec<PendingUiChange>, String> {
+    let dir = pending_dir()?;
+    let path = dir.join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path).map_err(|_| format!("找不到待审批项：{id}"))?;
+    let change: PendingUiChange =
+        serde_json::from_str(&text).map_err(|error| format!("解析失败：{error}"))?;
+    set_ui_store(change.namespace, change.data)?;
+    std::fs::remove_file(&path).map_err(|error| format!("删除待审批失败：{error}"))?;
+    list_pending_ui_store()
+}
+
+/// 一条**驳回通知** ✓ —— 让提交者知道"我的改动被驳回了"。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RejectionNotice {
+    id: String,
+    namespace: String,
+    submitted_by: String,
+    summary: String,
+    rejected_at: String,
+    /// **被驳回的条目 id** ✓ —— 前端据此把对应动作标成"已驳回" ✓
+    #[serde(default)]
+    entry_ids: Vec<String>,
+}
+
+fn rejections_path() -> Result<std::path::PathBuf, String> {
+    Ok(ui_store_dir()
+        .ok_or_else(|| "无法定位数据目录".to_string())?
+        .join("rejections.json"))
+}
+
+fn read_rejections() -> Vec<RejectionNotice> {
+    rejections_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Vec<RejectionNotice>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_rejections(items: &[RejectionNotice]) -> Result<(), String> {
+    let path = rejections_path()?;
+    let text = serde_json::to_string_pretty(items).map_err(|error| error.to_string())?;
+    std::fs::write(path, text).map_err(|error| format!("写入失败：{error}"))
+}
+
+/// 读驳回通知 ✓（前端轮询 ✓）
+fn list_rejections() -> Vec<RejectionNotice> {
+    read_rejections()
+}
+
+/// **清空某命名空间的驳回通知** ✓ —— 提交者一改动就调 ✓
+/// （标记是"上一次被驳回"✓，改了就不该再挂着 ✗）
+fn clear_rejections(namespace: String) -> Vec<RejectionNotice> {
+    let mut items = read_rejections();
+    items.retain(|item| item.namespace != namespace);
+    let _ = write_rejections(&items);
+    items
+}
+
+/// 前端确认已读 ✓ → 删掉通知 ✓
+fn acknowledge_rejection(id: String) -> Vec<RejectionNotice> {
+    let mut items = read_rejections();
+    items.retain(|item| item.id != id);
+    let _ = write_rejections(&items);
+    items
+}
+
+/// 驳回 ✓ —— 只删掉待审批，不动正式文件。
+fn reject_ui_store(id: String) -> Result<Vec<PendingUiChange>, String> {
+    let dir = pending_dir()?;
+    let path = dir.join(format!("{id}.json"));
+    if path.exists() {
+        // 先读出来 ✓ —— 要记下"谁提交的、改了什么"✓ 才能通知他 ✓
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(change) = serde_json::from_str::<PendingUiChange>(&text) {
+                let mut notices = read_rejections();
+                notices.push(RejectionNotice {
+                    id: format!("{}-reject", change.id),
+                    namespace: change.namespace,
+                    submitted_by: change.submitted_by,
+                    summary: change.summary,
+                    rejected_at: change.submitted_at,
+                    entry_ids: change.changed_ids.clone(),
+                });
+                // 只留最近 50 条 ✓（不无限增长 ✗）
+                if notices.len() > 50 {
+                    let keep = notices.len() - 50;
+                    notices.drain(0..keep);
+                }
+                write_rejections(&notices)?;
+            }
+        }
+        std::fs::remove_file(&path).map_err(|error| format!("删除失败：{error}"))?;
+    }
+    list_pending_ui_store()
+}
+
+/// 读共享数据 ✓（文件不存在返回 `null` ✓，不是错误 ✓）。
+fn get_ui_store(namespace: String) -> Result<serde_json::Value, String> {
+    let path = ui_store_path(&namespace)?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| format!("解析失败：{error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Value::Null),
+        Err(error) => Err(format!("读取失败：{error}")),
+    }
+}
+
+/// 写共享数据 ✓ —— **先写临时文件再 rename** ✓（避免写一半断电留下坏文件 ✗）。
+fn set_ui_store(namespace: String, data: serde_json::Value) -> Result<serde_json::Value, String> {
+    let path = ui_store_path(&namespace)?;
+    let text = serde_json::to_string_pretty(&data).map_err(|error| error.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, text).map_err(|error| format!("写入失败：{error}"))?;
+    std::fs::rename(&temp, &path).map_err(|error| format!("提交失败：{error}"))?;
+    // 回读一次 ✓ —— 让前端确认"服务端看到的就是它写的" ✓
+    get_ui_store(namespace)
+}
+
+/// 模型库目录（`<状态目录>/models`）。
+///
+/// 原来只有一个"导入槽"（可执行文件旁的 `model.tdcrmodel`）✗ —— 只能存一个，
+/// 做不了增删改查。现在改成目录，可以并存多个 ✓。
+fn models_dir() -> Option<std::path::PathBuf> {
+    let root = std::env::var("SOFTUI_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    let dir = root.parent()?.join("models");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// 模型库条目（内建预设 + 用户导入的）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelLibraryEntry {
+    /// 内建预设用 preset id；用户模型用文件名（不含扩展名）。
+    id: String,
+    /// 显示名（内建 = 预设 label；用户 = sidecar 里的名字，否则文件名）。
+    name: String,
+    bundle_bytes: usize,
+    summary: String,
+    kappa_limit_per_m: f64,
+    kappa_limit_by_direction: [f64; 8],
+    /// 内建模型**不可删除** ✓。
+    builtin: bool,
+    /// 当前是否生效。
+    selected: bool,
+    /// 用户在导入时填写的臂体参数（内建模型为 null ✓）。
+    params: Option<ModelParams>,
+    /// 臂总长（mm）✓ —— 轨迹规划必须用它 ✗（写死 400 会让别的模型整体偏差 ✗）
+    /// 内建模型来自预设常量 ✓，用户模型来自参数里的臂长 ✓（没填就是 None ✓）。
+    total_length_mm: Option<f64>,
+}
+
+/// 用户模型的显示名 sidecar（`<file>.name`）—— 重命名只改这里，不动包内容 ✓。
+fn model_name_path(model_file: &std::path::Path) -> std::path::PathBuf {
+    let mut name = model_file.as_os_str().to_os_string();
+    name.push(".name");
+    std::path::PathBuf::from(name)
+}
+
+/// 模型包的**臂体参数**（用户在导入时填 ✓，存在 sidecar 里 ✓）。
+///
+/// 为什么不写进 `.tdcrmodel` ✗：那是**标定数据**（二进制、有 MAGIC 校验 ✓），
+/// 改格式会牵连 Rust 解析器和所有旧包 ✗。sidecar 只是**管理用的说明信息** ✓。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelParams {
+    /// 臂长（mm）—— 导入时从包内带出 ✓
+    length_mm: Option<f64>,
+    /// 臂体外径（mm）
+    outer_diameter_mm: Option<f64>,
+    /// 臂体壁厚（mm）
+    wall_thickness_mm: Option<f64>,
+    /// 驱动丝半径（mm）
+    drive_wire_radius_mm: Option<f64>,
+    /// 额定尖端力（N）—— 标定/选型用的说明值 ✓（不参与下发计算 ✗）
+    tip_force_n: Option<f64>,
+    /// 材料（自由文本 / 下拉选填 ✓）
+    material: Option<String>,
+    /// 标定日期（YYYY-MM-DD）
+    calibrated_at: Option<String>,
+    /// 重量（g）
+    weight_g: Option<f64>,
+    /// 备注
+    note: Option<String>,
+}
+
+fn model_params_path(model_file: &std::path::Path) -> std::path::PathBuf {
+    let mut name = model_file.as_os_str().to_os_string();
+    name.push(".params.json");
+    std::path::PathBuf::from(name)
+}
+
+fn read_model_params(model_file: &std::path::Path) -> Option<ModelParams> {
+    let text = std::fs::read_to_string(model_params_path(model_file)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 保存模型参数：内建模型不支持（它们编译在二进制里 ✓，没有 sidecar ✗）。
+/// 内建模型的参数文件（`builtin-<preset id>.params.json` ✓）。
+///
+/// 内建模型**没有 .tdcrmodel 文件** ✗（编译在二进制里 ✓），所以 sidecar 要独立取名 ✓。
+fn builtin_params_path(preset_id: &str) -> Option<std::path::PathBuf> {
+    Some(models_dir()?.join(format!("builtin-{preset_id}.params.json")))
+}
+
+fn save_model_params(id: String, params: ModelParams) -> Result<Vec<ModelLibraryEntry>, String> {
+    let text = serde_json::to_string_pretty(&params).map_err(|e| e.to_string())?;
+    // 内建模型：写 `builtin-<id>.params.json` ✓（原来直接拒绝 ✗）
+    if model::PRESETS.iter().any(|preset| preset.id == id) {
+        let path = builtin_params_path(&id).ok_or_else(|| "无法定位模型库目录".to_string())?;
+        std::fs::write(&path, text).map_err(|e| format!("写入参数失败：{e}"))?;
+        return list_models();
+    }
+    let path = user_model_path(&id).ok_or_else(|| "非法的模型 id".to_string())?;
+    if !path.exists() {
+        return Err(format!("模型不存在：{id}"));
+    }
+    std::fs::write(model_params_path(&path), text).map_err(|e| format!("写入参数失败：{e}"))?;
+    list_models()
+}
+
+/// 列出模型库：内建预设 + 目录里的 `.tdcrmodel`。
+fn list_models() -> Result<Vec<ModelLibraryEntry>, String> {
+    let current = current_model();
+    let current_bytes = current.bundle_bytes;
+    let mut out: Vec<ModelLibraryEntry> = Vec::new();
+
+    for preset in model::PRESETS {
+        // 内建模型加载失败必须**报出来** ✗ —— 静默跳过会让模型"凭空消失"✗
+        let tables = model::ModelTables::from_preset(preset)
+            .map_err(|error| format!("内建模型 {} 加载失败：{error:?}", preset.id))?;
+        {
+            out.push(ModelLibraryEntry {
+                id: preset.id.to_string(),
+                name: preset.name.to_string(),
+                bundle_bytes: tables.bundle_bytes,
+                summary: tables.summary(),
+                kappa_limit_per_m: tables.kappa_limit_per_m,
+                kappa_limit_by_direction: tables.kappa_limit_by_direction(),
+                builtin: true,
+                selected: tables.bundle_bytes == current_bytes,
+                params: builtin_params_path(&preset.id)
+                    .and_then(|path| {
+                        serde_json::from_str::<ModelParams>(&std::fs::read_to_string(path).ok()?).ok()
+                    }),
+                total_length_mm: Some(preset.total_length_mm),
+            });
+        }
+    }
+
+    if let Some(dir) = models_dir() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("tdcrmodel") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else { continue };
+                let Ok(tables) = model::ModelTables::from_bundle(&bytes) else { continue };
+                let stem = path
+                    .file_stem()
+                    .map(|v| v.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "未命名".to_string());
+                let name = std::fs::read_to_string(model_name_path(&path))
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| stem.clone());
+                out.push(ModelLibraryEntry {
+                    id: stem,
+                    name,
+                    bundle_bytes: tables.bundle_bytes,
+                    summary: tables.summary(),
+                    kappa_limit_per_m: tables.kappa_limit_per_m,
+                    kappa_limit_by_direction: tables.kappa_limit_by_direction(),
+                    builtin: false,
+                    selected: tables.bundle_bytes == current_bytes,
+                    params: read_model_params(&path),
+                    total_length_mm: read_model_params(&path).and_then(|p| p.length_mm),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 用户模型的**文件名**（不含扩展名）→ 路径。
+fn user_model_path(id: &str) -> Option<std::path::PathBuf> {
+    // 只允许安全字符，避免 `../` 之类的路径穿越 ✗
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '(' | ')' | ' '))
+        || id.contains("..")
+    {
+        return None;
+    }
+    Some(models_dir()?.join(format!("{id}.tdcrmodel")))
+}
+
+/// 当前选中模型的记录文件（`<模型库>/.selected`）。
+///
+/// **只记 id** ✓ —— 内建预设不该往模型库里复制包 ✗；重启时按这个 id 恢复 ✓。
+fn selection_path() -> Option<std::path::PathBuf> {
+    Some(models_dir()?.join(".selected"))
+}
+
+fn remember_selection(id: &str) {
+    if let Some(path) = selection_path() {
+        let _ = std::fs::write(path, id);
+    }
+}
+
+fn recall_selection() -> Option<String> {
+    let path = selection_path()?;
+    let value = std::fs::read_to_string(path).ok()?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// 删除用户模型。**内建模型不可删** ✓；**当前生效的也不删** ✓（避免正在用的模型消失）。
+fn delete_model(id: String) -> Result<Vec<ModelLibraryEntry>, String> {
+    if model::PRESETS.iter().any(|preset| preset.id == id) {
+        return Err("内建模型不能删除".to_string());
+    }
+    let path = user_model_path(&id).ok_or_else(|| "非法的模型 id".to_string())?;
+    if !path.exists() {
+        return Err(format!("模型不存在：{id}"));
+    }
+    if list_models()?.iter().any(|entry| entry.id == id && entry.selected) {
+        return Err("这个模型正在使用中，请先切换到其它模型再删除".to_string());
+    }
+    std::fs::remove_file(&path).map_err(|error| format!("删除失败：{error}"))?;
+    let _ = std::fs::remove_file(model_name_path(&path));
+    list_models()
+}
+
+/// 重命名用户模型（只改 sidecar，不动包内容 ✓）。
+fn rename_model(id: String, name: String) -> Result<Vec<ModelLibraryEntry>, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    if model::PRESETS.iter().any(|preset| preset.id == id) {
+        return Err("内建模型不能重命名".to_string());
+    }
+    let path = user_model_path(&id).ok_or_else(|| "非法的模型 id".to_string())?;
+    if !path.exists() {
+        return Err(format!("模型不存在：{id}"));
+    }
+    std::fs::write(model_name_path(&path), trimmed).map_err(|error| format!("重命名失败：{error}"))?;
+    list_models()
+}
+
+/// 导出模型包（base64）—— 内建的可导出 ✓（只读）。
+fn export_model(id: String) -> Result<String, String> {
+    let bytes = if let Some(preset) = model::PRESETS.iter().find(|preset| preset.id == id) {
+        preset.bundle.to_vec()
+    } else {
+        let path = user_model_path(&id).ok_or_else(|| "非法的模型 id".to_string())?;
+        std::fs::read(&path).map_err(|error| format!("读取失败：{error}"))?
+    };
+    Ok(base64_encode(&bytes))
+}
+
+/// base64 解码（导入用）。非法字符/长度错误一律报错，不猜 ✗。
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut lut = [255u8; 256];
+    for (index, byte) in TABLE.iter().enumerate() {
+        lut[*byte as usize] = index as u8;
+    }
+    let trimmed = input.trim();
+    if trimmed.len() % 4 != 0 {
+        return Err("base64 长度不是 4 的倍数".to_string());
+    }
+    let mut out = Vec::with_capacity(trimmed.len() / 4 * 3);
+    for chunk in trimmed.as_bytes().chunks(4) {
+        let mut acc = 0u32;
+        let mut pad = 0usize;
+        for (slot, byte) in chunk.iter().enumerate() {
+            if *byte == b'=' {
+                pad += 1;
+                acc <<= 6;
+            } else {
+                let value = lut[*byte as usize];
+                if value == 255 {
+                    return Err(format!("base64 含非法字符：{:?}", *byte as char));
+                }
+                acc = (acc << 6) | value as u32;
+                let _ = slot;
+            }
+        }
+        if pad > 2 {
+            return Err("base64 填充错误".to_string());
+        }
+        out.push((acc >> 16) as u8);
+        if pad < 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(acc as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// 从 base64 导入模型（前端上传走这条 ✓ —— `Vec<u8>` 走 JSON 会被放大 3 倍以上 ✗）。
+fn import_model_base64(data: String, name: Option<String>) -> Result<ModelStatus, String> {
+    let bytes = base64_decode(&data)?;
+    if bytes.is_empty() {
+        return Err("模型包内容为空".to_string());
+    }
+    import_model(bytes, name)
+}
+
 fn persisted_model_path() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     Some(exe.parent()?.join("model.tdcrmodel"))
@@ -1517,6 +2627,35 @@ fn persisted_model_path() -> Option<std::path::PathBuf> {
 
 /// 从磁盘载入上次导入的模型包（没有或损坏则安静跳过）。
 fn try_load_persisted_model() {
+    // ① 优先按 `.selected` 里记的 id 恢复 ✓（内建预设**不复制包**，只记 id）
+    if let Some(id) = recall_selection() {
+        if let Some(preset) = model::ModelPreset::find(&id) {
+            if let Ok(tables) = model::ModelTables::from_preset(preset) {
+                if let Ok(mut guard) = imported_slot().lock() {
+                    *guard = Some((preset.name.to_string(), std::sync::Arc::new(tables)));
+                }
+                return;
+            }
+        }
+        if let Some(path) = user_model_path(&id) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Ok(tables) = model::ModelTables::from_bundle(&bytes) {
+                    let name = std::fs::read_to_string(model_name_path(&path))
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| id.clone());
+                    if let Ok(mut guard) = imported_slot().lock() {
+                        *guard = Some((name, std::sync::Arc::new(tables)));
+                    }
+                    return;
+                }
+            }
+        }
+        // 记的模型没了（被删/被移走）→ 安静回落到内建默认 ✓
+    }
+
+    // ② 老路径兼容：可执行文件旁的 `model.tdcrmodel`
     let Some(path) = persisted_model_path() else { return };
     let Ok(bytes) = std::fs::read(&path) else { return };
     if let Ok(tables) = model::ModelTables::from_bundle(&bytes) {
@@ -1556,7 +2695,11 @@ struct ModelStatus {
     bundle_bytes: usize,
     persisted_path: Option<String>,
     /// UI 侧运动范围上限（1/m）：当前生效模型 κ 表的覆盖边界，由表数据扫出。
+    /// **这是 8 个方向的最小值**（保守口径 ✓，保留兼容）。
     kappa_limit_per_m: f64,
+    /// 8 个方向各自的覆盖上限（0°, 45°, … 315°）。
+    /// 宽的方位可达 ~1.9，窄的仍是 ~1.0 —— 消费侧可用它按方位放宽 ✓。
+    kappa_limit_by_direction: [f64; 8],
 }
 
 fn model_status_of() -> ModelStatus {
@@ -1566,15 +2709,21 @@ fn model_status_of() -> ModelStatus {
         .and_then(|guard| guard.as_ref().map(|(name, tables)| (name.clone(), tables.summary())));
     let (source, name, summary) = match imported {
         Some((name, summary)) => ("imported".to_string(), Some(name), summary),
-        None => ("builtin".to_string(), None, current_model().summary()),
+        None => (
+            "builtin".to_string(),
+            // 内置也有名字 ✓（原来 None ✗ → UI 显示空 ✓）
+            Some(model::PRESETS[0].name.to_string()),
+            current_model().summary(),
+        ),
     };
     ModelStatus {
         source,
         name,
         summary,
-        bundle_bytes: model::DEFAULT_BUNDLE.len(),
+        bundle_bytes: current_model().bundle_bytes,
         persisted_path: persisted_model_path().map(|path| path.to_string_lossy().to_string()),
         kappa_limit_per_m: current_model().kappa_limit_per_m,
+        kappa_limit_by_direction: current_model().kappa_limit_by_direction(),
     }
 }
 
@@ -1586,13 +2735,212 @@ fn model_status() -> ModelStatus {
 
 /// 导入模型包（`.tdcrmodel`）。校验通过后写入可执行文件同目录并立即生效。
 #[cfg_attr(feature = "desktop", tauri::command)]
+/// 可选模型包的信息（供 UI 下拉列表）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPresetInfo {
+    pub id: String,
+    pub name: String,
+    /// 该包支持的两档张力上限（N）。
+    pub gauges: Vec<u8>,
+    pub active: bool,
+}
+
+/// 某个模型 id 支持的张力档位 ✓（导入的模型也要能推出来 ✓）。
+fn preset_tensions_for_id(id: &str) -> Vec<u8> {
+    if let Some(preset) = model::ModelPreset::find(id) {
+        return preset_tensions(preset);
+    }
+    // 导入的模型：从已加载的表**真实档位**推 ✓（新格式读 `META.tau_max` ✓）
+    current_model().tension_limits()
+}
+
+fn preset_tensions(preset: &model::ModelPreset) -> Vec<u8> {
+    // **以模型自身表的真实档位为准** ✓ —— `preset.gauges` 是旧结构（固定两档 ✗），
+    // 新模型只有 20N ✓，按它算会显示成 `[20, 40]` ✗。
+    let actual = model::ModelTables::from_preset(preset)
+        .map(|tables| tables.tension_limits())
+        .unwrap_or_else(|_| vec![20]);
+    let mut out = actual;
+    out.dedup();
+    out
+}
+
+fn model_preset_is_active(preset: &model::ModelPreset) -> bool {
+    match imported_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(label, _)| label.clone()))
+    {
+        Some(label) => label == preset.name,
+        // 没有导入过 = 用的是内置包 ✓（现在只剩一条 ✓）
+        None => preset.id == model::PRESETS[0].id,
+    }
+}
+
+/// 由**驱动丝位移**反查表内形状（12 节点 κ）。
+///
+/// 3D 显示用它替代正向 SDM：SDM 与全阶 Cosserat 表是两套模型，同一组位移
+/// 反推出的形状能差 2 倍以上；而"显示要和表一致"只能直接读表。
+fn shape_from_displacements(displacement_mm: Vec<f64>) -> Result<Vec<f64>, String> {
+    if displacement_mm.len() != 6 {
+        return Err(format!(
+            "需要 6 个驱动丝位移，收到 {} 个",
+            displacement_mm.len()
+        ));
+    }
+    let mut input = [0.0f64; 6];
+    input.copy_from_slice(&displacement_mm);
+    let model = current_model();
+
+    // **新模型优先** ✓ —— 直接用 `KTB1` 的 `dL_mm` 反查 ✓。
+    //
+    // 为什么必须走这里 ✗：新模型的老字段（`pose_40` 等）是**用内置旧臂包垫的**✗，
+    // 拿旧臂的表去反查新臂的位移 ✓ → 形状完全不对 ✓ → **使能后臂体狂抖** ✗（本 bug ✓）。
+    if let Some(vc) = model.vc.as_ref() {
+        let (shape, distance) = vc
+            .shape_12x2_interpolated(input)
+            .ok_or_else(|| "新模型的位移表为空".to_string())?;
+        let nodes = 12.0_f64;
+        let mut out: Vec<f64> = shape.iter().map(|value| *value as f64).collect();
+        out.push(distance);
+        out.push(model.total_length_mm / nodes);
+        return Ok(out);
+    }
+
+    let table = model
+        .display_pose()
+        .map_err(|error| format!("位姿表不可用：{error:?}"))?;
+    let (shape, distance) = table
+        .shape_nearest_by_displacement(input)
+        .ok_or_else(|| "当前模型的形状表为空".to_string())?;
+    // 返回 12×2 的扁平数组；末尾依次是"最近邻距离"和"每段长度(mm)"。
+    // 段长必须跟着模型走 —— 旧臂 445.2、新臂 400，写死会让另一个模型的显示整体缩放偏差。
+    let nodes = posetable::N_SHAPE_NODES.max(1) as f64;
+    // 臂长按**当前模型的名字**反查预设：旧臂 445.2、新臂 400。
+    // 写死任意一个，另一个模型的显示就会整体缩放偏差约 10%。
+    let total_length_mm = imported_slot()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|(label, _)| label.clone()))
+        .and_then(|label| {
+            model::PRESETS
+                .iter()
+                .find(|preset| preset.name == label)
+                .map(|preset| preset.total_length_mm)
+        })
+        .unwrap_or(model.total_length_mm);
+    let mut out: Vec<f64> = shape.iter().map(|value| *value as f64).collect();
+    out.push(distance);
+    out.push(total_length_mm / nodes);
+    Ok(out)
+}
+
+/// **模型下拉列表** ✓ —— 和管理页「模型库」**同源** ✗。
+///
+/// 原来只列 `PRESETS`（2 个内置 ✗）→ 导入的模型在管理页看得见、卡片里看不见 ✗（本 bug ✓）。
+/// 现在改为**遍历 `list_models()`** ✓：内置 + 已导入 ✓，一个入口 ✓。
+fn list_model_presets() -> Vec<ModelPresetInfo> {
+    let current = current_model();
+    let current_bytes = current.bundle_bytes;
+
+    match list_models() {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|entry| ModelPresetInfo {
+                // `summary` 是字符串描述 ✓ —— 档位从模型本身推 ✗
+                gauges: preset_tensions_for_id(&entry.id),
+                active: entry.bundle_bytes == current_bytes,
+                id: entry.id,
+                name: entry.name,
+            })
+            .collect(),
+        // 兜底：加载失败时至少别让下拉空掉 ✓
+        Err(_) => model::PRESETS
+            .iter()
+            .map(|preset| ModelPresetInfo {
+                id: preset.id.to_string(),
+                name: preset.name.to_string(),
+                gauges: {
+                    let mut list = preset_tensions(preset);
+                    list.dedup();
+                    list
+                },
+                active: model_preset_is_active(preset),
+            })
+            .collect(),
+    }
+}
+
+/// 选中一个模型包：内置那条走 `reset_model`（清除导入），其余复用 `import_model`
+/// —— 校验、落盘、热加载、状态返回全都是现成的，不另造一套持久化。
+fn select_model_preset(id: String) -> Result<ModelStatus, String> {
+    // 内建预设
+    if let Some(preset) = model::ModelPreset::find(&id) {
+        if preset.id == "v1-legacy" {
+            remember_selection(&preset.id);
+            return reset_model();
+        }
+        // 臂长不在这里覆盖：`shape_from_displacements` 会按当前模型的**名字**反查预设拿长度。
+        // **不落库** ✓：预设已经被编译进二进制，再存一份只会产生重复条目 ✗
+        remember_selection(&preset.id);
+        return import_model_inner(preset.bundle.to_vec(), Some(preset.name.to_string()), false);
+    }
+    // 模型库里的用户模型：按文件名加载 ✓（原来只能选内建预设 ✗，
+    // 导致"导入的模型切不过去"✗）
+    let path = user_model_path(&id).ok_or_else(|| format!("未知模型：{id}"))?;
+    let bytes = std::fs::read(&path).map_err(|error| format!("读取模型失败：{error}"))?;
+    let name = std::fs::read_to_string(model_name_path(&path))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| id.clone());
+    remember_selection(&id);
+    import_model_inner(bytes, Some(name), false)
+}
+
 fn import_model(bytes: Vec<u8>, name: Option<String>) -> Result<ModelStatus, String> {
+    import_model_inner(bytes, name, true)
+}
+
+/// `persist = false` 时不写入模型库 ✓。
+///
+/// 内建预设**不能**落库 ✗ —— 原来选一次预设就往模型库写一份副本，
+/// 越选越多（用户视角就是"模型重复了"✗）。
+fn import_model_inner(
+    bytes: Vec<u8>,
+    name: Option<String>,
+    persist: bool,
+) -> Result<ModelStatus, String> {
     let tables = model::ModelTables::from_bundle(&bytes)
         .map_err(|error| format!("模型包无效：{error:?}"))?;
     let label = name.unwrap_or_else(|| format!("model.{}", model::EXTENSION));
 
-    if let Some(path) = persisted_model_path() {
-        std::fs::write(&path, &bytes).map_err(|error| format!("写入模型文件失败：{error}"))?;
+    // 写入**模型库目录**（原来写可执行文件旁 ✗ —— 只能存一个、且和状态目录不在一起）
+    if persist {
+        if let Some(dir) = models_dir() {
+        let raw_stem: String = label
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '(' | ')' | ' ') { c } else { '_' })
+            .collect();
+        // 中文/日文名的净化结果会退化成一串 `_` ✗（测试导入-新臂 → ____-__ ✗），
+        // 两个中文名还会**互相覆盖** ✗。可读字符太少就用时间戳兜底 ✓，显示名仍是原文 ✓。
+        let readable = raw_stem.chars().filter(|c| c.is_ascii_alphanumeric()).count();
+        let stem = if readable >= 3 {
+            raw_stem
+        } else {
+            format!(
+                "model-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            )
+        };
+        let file = dir.join(format!("{stem}.tdcrmodel"));
+        std::fs::write(&file, &bytes).map_err(|error| format!("写入模型文件失败：{error}"))?;
+            let _ = std::fs::write(model_name_path(&file), &label);
+        }
     }
     if let Ok(mut guard) = imported_slot().lock() {
         *guard = Some((label, std::sync::Arc::new(tables)));
@@ -1718,10 +3066,13 @@ struct TipPoseShapeResponse {
 /// 否则会出现「预览一个形状、发下去另一个」。
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn lookup_tip_pose_shape(request: TipPoseShapeRequest) -> Result<TipPoseShapeResponse, String> {
-    let kind = match request.table_gauge_n.unwrap_or(60) {
-        40 => posetable::PoseTableKind::Limit40n,
-        _ => posetable::PoseTableKind::Limit60n,
-    };
+    // 档位必须**显式**解析：原来 `_ => Limit60n` 会把 20N 之类的值悄悄兜到 60 档。
+    let model_for_gauge = current_model();
+    let gauge = request
+        .table_gauge_n
+        .unwrap_or_else(|| model_for_gauge.default_tension());
+    let kind = posetable::PoseTableKind::from_tension(gauge)
+        .ok_or_else(|| format!("不支持的张力档位：{gauge}N（可选 20/40/60）"))?;
     let query = posetable::encode_rpy_mm(
         request.position_mm,
         request.roll,
@@ -1731,6 +3082,7 @@ fn lookup_tip_pose_shape(request: TipPoseShapeRequest) -> Result<TipPoseShapeRes
     let model_tables = current_model();
     let shape = model_tables
         .pose(kind)
+        .map_err(|error| format!("位姿表档位不可用：{error:?}"))?
         .lookup_shape(&query)
         .map_err(|error| format!("{error:?}"))?;
 
@@ -1841,24 +3193,45 @@ fn frame_hex(frame: &[u8]) -> String {
         .join(" ")
 }
 
+/// 没有任何真实设备时占位的演示帧 id（见 `make_frame`）。
+const DEMO_DEVICE_ID: &str = "softui-sim-01";
+
+/// 这个 device_id 在本机设备表里吗？也就是：它有一条能真正收到字节的传输通道。
+///
+/// ⚠️ **不能再用 `device_id.starts_with("serial:")` 判断。** 那是"只有服务器本机串口"
+/// 时代留下的条件，而现在有三种传输、id 命名各不相同：
+///   · 服务器本机串口  `serial:{port_name}`（如 `serial:COM3`）
+///   · **Web Serial   `{deviceName}`**（如 `TDCR_v1`）—— 网页端实际用的就是这一种
+///   · 内置模拟设备    `simulator:0`
+/// 按前缀判断会让**后两种设备的每一条指令都被静默丢弃**（`send_frame_to_device` 直接
+/// `Ok(())`），而审计日志照样记"已发送" —— 现场表现为"点了没反应、设备永不确认"，
+/// 而且查日志一切正常。这是实测踩到过的坑。
+fn device_has_transport(state: &State<'_, AppState>, device_id: &str) -> bool {
+    state
+        .devices
+        .lock()
+        .map(|devices| devices.contains(device_id))
+        .unwrap_or(false)
+}
+
 fn send_frame_to_device(
     state: &State<'_, AppState>,
     device_id: &str,
     frame: &[u8],
     priority: device::CommandPriority,
 ) -> Result<(), String> {
-    if !device_id.starts_with("serial:") {
-        return Ok(());
-    }
-
     let mut devices = state
         .devices
         .lock()
         .map_err(|_| "device registry poisoned".to_string())?;
-    devices
-        .send_command(device_id, frame, priority)
-        .map_err(|error| format!("{error:?}"))?;
-    Ok(())
+    match devices.send_command(device_id, frame, priority) {
+        Ok(_) => Ok(()),
+        // 演示帧不是真实设备：接受但不下发，让没有硬件时界面仍能完整演练。
+        Err(device::DeviceRuntimeError::DeviceNotFound(_)) if device_id == DEMO_DEVICE_ID => Ok(()),
+        // 其余"找不到设备"一律**报错**，不再假装成功 ——
+        // 静默成功会让"其实没发出去"和"发出去但设备没响应"完全无法区分。
+        Err(error) => Err(format!("{error:?}")),
+    }
 }
 
 fn runtime_allows_command(status: &device::RuntimeStatus, safety: CommandSafety) -> bool {
@@ -1916,7 +3289,7 @@ fn guard_command_allowed(
         auth::require_permission(&auth_session, required_permission)?;
     }
 
-    if device_id.starts_with("serial:") {
+    if device_has_transport(&state, device_id) {
         let devices = state
             .devices
             .lock()
@@ -2904,6 +4277,17 @@ fn sync_emit(client_id: String, mut event: serde_json::Value) -> Result<u64, Str
 fn frame_ingest(state: State<'_, AppState>, frame: DeviceSnapshot) -> Result<u64, String> {
     let sequence = frame.sequence;
 
+    /**
+     * **帧到了就等价于握手成功** ✓ —— 先推进状态再取 `runtime` ✓，
+     * 这样后面的安全判定拿到的是 `Ready` 而不是 `Handshaking` ✓。
+     * （`P1` 本地解析模式下后端收不到原始字节 ✗，握手态只能由帧驱动 ✓）
+     */
+    if let Ok(mut devices) = state.devices.lock() {
+        devices.note_frame(&frame.device_id);
+        // **接收帧计数**也由这条路径推进 ✓（`P1` 模式下后端读不到原始字节 ✓）
+        devices.note_ingested_frame(&frame.device_id);
+    }
+
     let runtime = {
         let devices = state
             .devices
@@ -2952,7 +4336,7 @@ fn frame_ingest(state: State<'_, AppState>, frame: DeviceSnapshot) -> Result<u64
             pressure: frame
                 .sensors
                 .first()
-                .map(|sensor| sensor.filtered[2])
+                .map(|sensor| sensor.filtered_value)
                 .unwrap_or(0.0),
         };
         control.step_cycle(feedback, safety, 50);
@@ -3372,6 +4756,16 @@ struct DeviceRuntimeStatusView {
     emergency_latched: bool,
     last_error: Option<String>,
     last_error_code: Option<String>,
+    // ── 指令集 V2：多设备上行 ──
+    /// 上行协议版本：1 = Legacy V1（`0xBB`），2 = V2（`0x55` + 设备 ID）。
+    protocol_version: u8,
+    /// 是否已回过版本协商（`AA 09 01 02`）。
+    protocol_negotiated: bool,
+    tension_frames: u64,
+    calibration_events: u64,
+    unknown_frames: u64,
+    last_tension: Option<protocol::TensionFrame>,
+    last_calibration: Option<protocol::CalibrationEvent>,
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -3399,6 +4793,13 @@ fn device_runtime_status(
         emergency_latched: runtime.emergency_latched,
         last_error: runtime.last_error,
         last_error_code: runtime.last_error_code,
+        protocol_version: runtime.protocol_version,
+        protocol_negotiated: runtime.protocol_negotiated,
+        tension_frames: runtime.tension_frames,
+        calibration_events: runtime.calibration_events,
+        unknown_frames: runtime.unknown_frames,
+        last_tension: runtime.last_tension,
+        last_calibration: runtime.last_calibration,
     })
 }
 
@@ -3420,7 +4821,7 @@ fn submit_system_control(
         device::CommandPriority::Normal
     };
 
-    if device_id.starts_with("serial:")
+    if device_has_transport(&state, &device_id)
         && matches!(request.action, SystemControlActionRequest::Disable)
     {
         if let Ok(mut devices) = state.devices.lock() {
@@ -3430,7 +4831,7 @@ fn submit_system_control(
 
     send_frame_to_device(&state, &device_id, &frame, priority)?;
 
-    if device_id.starts_with("serial:") {
+    if device_has_transport(&state, &device_id) {
         if let Ok(mut devices) = state.devices.lock() {
             match request.action {
                 SystemControlActionRequest::Enable => {
@@ -3504,11 +4905,13 @@ fn send_motor_command(
 
     guard_command_allowed(&state, &device_id, CommandSafety::Enabled)?;
 
+    // V2 `0x10` 的数据段是 `addr / dir / dist / vel`，**没有加速度字段** ——
+    // 旧实现多发 2 字节加速度，下位机只读 6 字节，整帧被静默丢弃。
+    // 加速度是模型侧的量，不在本指令里下发。
     let frame = protocol::encode_motor_command(
         request.motor_id,
         request.position_mm,
         request.velocity_mm_per_sec.unwrap_or(10.0),
-        request.acceleration_mm_per_sec2.unwrap_or(3.0),
     )
     .map_err(|error| format!("{error:?}"))?;
 
@@ -3555,6 +4958,126 @@ fn send_home_command(
     )
 }
 
+/// **把位移表索引导出给前端** ✓ —— 前端本地查表用 ✓。
+///
+/// 为什么这么做 ✗：曲率/位姿下发每次都要"后端查表 + 发送"✓，
+/// 查表那一段是一条 RPC 往返（经隧道 200ms+ ✓，排队时更久 ✗）。
+/// 表本身只有 1031 个样本 ✓，导出成 90KB 的索引给前端 ✓ →
+/// 拖动 / 位姿下发 / 动作组全部变成纯本地计算 + 本机直发 ✓ → ms 级 ✓。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VcTableIndex {
+    n: usize,
+    /// 每个样本：`tip`（svc 系 mm ✓）+ `dl`（6 路目标位移 mm ✓）
+    samples: Vec<VcTableIndexSample>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VcTableIndexSample {
+    tip: [f64; 3],
+    dl: [f64; 6],
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn vc_table_index() -> Result<VcTableIndex, String> {
+    let model_tables = current_model();
+    let vc = model_tables
+        .vc
+        .as_ref()
+        .ok_or_else(|| "当前模型不是新格式（缺 KTB1/PTB1）".to_string())?;
+    let rows = vc.dump_index();
+    Ok(VcTableIndex {
+        n: rows.len(),
+        samples: rows
+            .into_iter()
+            .map(|(tip, dl)| VcTableIndexSample { tip, dl })
+            .collect(),
+    })
+}
+
+/// **只记录、不发送**的控制帧 ✓ —— 给"前端本机直发"那条路径用 ✓。
+///
+/// 为什么需要 ✗：本机直连串口后 ✓，指令**已经在浏览器里写进串口**了 ✓，
+/// 后端不需要也不能再发一遍（发了就是双份动作 ✓，相对位移类会走两倍距离 ✗）。
+/// 但后端仍必须知道"这件事发生过" ✓，否则：
+///   · `control_enabled` 停在旧值 ✓ → 远程端（手机/另一台电脑）的指令被
+///     `guard_command_allowed` 拒掉 ✗
+///   · 审计 / 会话录制缺这一帧 ✗ → 复盘时看不到操作 ✗
+///
+/// 所以这里只做三件事：**更新内存状态 ✓、写审计 ✓、写日志 ✓**，绝不碰串口 ✓。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlFrameLogRequest {
+    device_id: Option<String>,
+    /// 指令类别：`system-control` / `home` / `motor` / ……（只用于审计文案 ✓）
+    kind: String,
+    /// 前端实际写出去的帧（十六进制 ✓），用于审计
+    frame_hex: Option<String>,
+    /// 系统控制动作：`enable` / `disable` / `emergencyStop`（其它类别不传 ✓）
+    action: Option<String>,
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn control_frame_log(
+    state: State<'_, AppState>,
+    request: ControlFrameLogRequest,
+) -> Result<RuntimeSnapshot, String> {
+    let device_id = selected_device_id(request.device_id.clone());
+    let frame_hex = request.frame_hex.unwrap_or_default();
+    let label = match request.kind.as_str() {
+        "system-control" => "system control dispatched (browser direct)",
+        "home" => "home command dispatched (browser direct)",
+        "motor" => "motor command dispatched (browser direct)",
+        _ => "control frame dispatched (browser direct)",
+    };
+
+    // ① 状态对账：和 `submit_system_control` 同口径 ✓，但不发帧 ✓
+    if let Some(action) = request.action.as_deref() {
+        if let Ok(mut devices) = state.devices.lock() {
+            match action {
+                "enable" => {
+                    let _ = devices.mark_control_enabled(&device_id, true);
+                }
+                "emergencyStop" => {
+                    let _ = devices.mark_emergency_stopped(&device_id);
+                    if let Ok(mut control) = state.control_runtime.lock() {
+                        control.stop("emergency stop latched");
+                    }
+                }
+                "disable" => {
+                    let _ = devices.mark_control_enabled(&device_id, false);
+                    if let Ok(mut control) = state.control_runtime.lock() {
+                        control.stop("device control is not enabled");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ② 审计 + ③ 日志（和 `audit_control_frame` 的后半段一致 ✓，只是不发帧 ✓）
+    record_control_command(
+        &state,
+        &device_id,
+        label,
+        &frame_hex,
+        &serde_json::json!({ "kind": request.kind, "direct": true }),
+    );
+    state.store.mutate(|data| {
+        data.sequence = data.sequence.saturating_add(1);
+        data.logs.push(log_entry(
+            data.sequence,
+            LogLevel::Info,
+            "control",
+            label,
+            Some(&device_id),
+            Some(&frame_hex),
+        ));
+    });
+    Ok(state.snapshot())
+}
+
 /// 多电机同步位移：一次下发一组目标位移，速度由下位机按位移比例分配。
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn send_multi_motor_command(
@@ -3585,12 +5108,18 @@ fn send_curvature_command(
 ) -> Result<RuntimeSnapshot, String> {
     let device_id = selected_device_id(request.device_id.clone());
     // 1) 全阶 Cosserat 查表：曲率 → 6 丝位移
-    let kind = match request.table_gauge_n.unwrap_or(60) {
-        40 => kappatable::KappaTableKind::Limit40n,
-        _ => kappatable::KappaTableKind::Limit60n,
-    };
+    // 档位同样**显式**解析：原来 `_ => Limit60n` 会把 20N 悄悄兜到 60 档，
+    // 换到新臂（20/40N）后就会报「不含 60N 表」。
+    let model_for_gauge = current_model();
+    let gauge = request
+        .table_gauge_n
+        .unwrap_or_else(|| model_for_gauge.default_tension());
+    let kind = kappatable::KappaTableKind::from_tension(gauge)
+        .ok_or_else(|| format!("不支持的张力档位：{gauge}N（可选 20/40/60）"))?;
     let model_tables = current_model();
-    let table = model_tables.kappa(kind);
+    let table = model_tables
+        .kappa(kind)
+        .map_err(|error| format!("κ 表档位不可用：{error:?}"))?;
     let query = kappatable::features_from_segments(
         request.segment_curvature_per_m,
         request.segment_direction_rad,
@@ -3641,54 +5170,238 @@ fn send_curvature_command(
 
 /// 末端位姿 → 电机位移：走**全阶 Cosserat 位姿查表**（`ik_table.PoseTable` 口径），
 /// 再经 0x04 多电机同步指令下发。取代原先「位姿 → 两段曲率 → 0x05 角度」的内置 PCC 链路。
+/// `send_tip_pose_command` 的返回值。
+///
+/// 除了快照，**把模型查表算出来的 6 路电机目标一起带回去** —— 界面「下发目标」列要显示的
+/// 就是它。刻意放进返回值、而不是让前端再查一次表：实时跟随是逐帧下发的，多一次 RPC
+/// 就多一次往返延迟，而这份数据后端**本来就已经算出来了**（`lookup.displacement_mm`）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TipPoseCommandResult {
+    pub snapshot: RuntimeSnapshot,
+    /// 6 路肌腱的目标位移（mm），顺序对应 `start_address` 起的 6 个电机。
+    /// 定长 6，与 `lookup.displacement_mm` 同型（序列化成 JSON 数组，前端仍按 number[] 读）。
+    pub target_displacement_mm: [f64; 6],
+    /// 与表中最近解的白化距离，越小越接近目标。
+    pub nearest_distance: f64,
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn send_tip_pose_command(
     state: State<'_, AppState>,
     request: TipPoseCommandRequest,
-) -> Result<RuntimeSnapshot, String> {
-    let kind = match request.table_gauge_n.unwrap_or(60) {
-        40 => posetable::PoseTableKind::Limit40n,
-        _ => posetable::PoseTableKind::Limit60n,
-    };
-    let query = posetable::encode_rpy_mm(
-        request.position_mm,
-        request.roll,
-        request.pitch,
-        request.yaw,
-    );
-    let model_tables = current_model();
+) -> Result<TipPoseCommandResult, String> {
     let device_id = selected_device_id(request.device_id.clone());
-    let lookup = match model_tables.pose(kind).lookup(&query) {
-        Ok(lookup) => lookup,
-        Err(error) => {
-            let message = format!("位姿查表失败：{error:?}");
-            record_control_failure(&state, &device_id, &message);
-            return Err(message);
-        }
-    };
-    if !lookup.covered {
+    let model_tables = current_model();
+
+    // ═══════════════════════════════════════════════════════════════
+    // **新模型（KTB1/PTB1/KSB1/KKB1）—— 唯一路径** ✓
+    //
+    // 老臂的 `K40/P40/K20/P20` 逻辑**已全部移除** ✗：
+    //   ① 新模型的老字段是**用旧臂包垫的** ✗ → 查出来的位移是旧臂的 ✓
+    //      → **符号和量级都不对** ✗（向后拉算出负值 ✓ 本 bug ✓）
+    //   ② 现在只剩一台臂 ✓，留两套路只会让人以为"还有人在用旧臂"✗
+    // ═══════════════════════════════════════════════════════════════
+    let vc = model_tables.vc.as_ref().ok_or_else(|| {
+        "当前模型不是新格式（缺 KTB1/PTB1）✗，请重新导入模型包".to_string()
+    })?;
+
+    let (mut displacement_mm, nearest_distance) =
+        vc.interpolate_by_tip_mm(request.position_mm).ok_or_else(|| {
+            "新模型的位移表为空 ✗".to_string()
+        })?;
+
+    if nearest_distance > 120.0 {
         let message = format!(
-            "位姿超出 Cosserat 位姿表覆盖范围：最近邻距离 {:.1} > {:.0}，请把末端目标移回可达空间内",
-            lookup.nearest_distance,
-            posetable::COVERAGE_RADIUS,
+            "位姿超出位移表覆盖范围：最近邻距离 {nearest_distance:.1} > 120，请把末端目标移回可达空间内",
         );
         record_control_failure(&state, &device_id, &message);
         return Err(message);
     }
 
+    // **时间平滑** ✓ —— 和动作库播放时一样的做法 ✓：
+    //   表是离散的 ✓，相邻样本 `dL` 差 1~2mm ✗ → 直接下发会**顿一下** ✗。
+    //   这里对**上一帧下发的量**做低通 ✓（α=0.35 ✓），差 5mm 时约 3 帧收敛 ✓。
+    {
+        let mut guard = last_sent_displacement()
+            .lock()
+            .map_err(|_| "位移缓存锁失败".to_string())?;
+        if let Some(previous) = guard.as_ref() {
+            const ALPHA: f64 = 0.35;
+            for axis in 0..6 {
+                displacement_mm[axis] =
+                    previous[axis] * (1.0 - ALPHA) + displacement_mm[axis] * ALPHA;
+            }
+        }
+        *guard = Some(displacement_mm);
+    }
+    let absolute_mm: [f64; 6] = displacement_mm;
+
     let frame = protocol::encode_multi_motor_command(
         request.start_address.unwrap_or(1),
-        &lookup.displacement_mm,
+        &absolute_mm,
     )
     .map_err(|error| format!("{error:?}"))?;
 
-    audit_control_frame(
+    let snapshot = audit_control_frame(
         state,
         device_id,
         "tip pose command sent",
         frame,
         CommandSafety::Enabled,
-    )
+    )?;
+
+    Ok(TipPoseCommandResult {
+        snapshot,
+        // 回**实际下发**的绝对位移：界面「目标 mm」才和线上那帧对得上
+        target_displacement_mm: absolute_mm,
+        nearest_distance,
+    })
+}
+
+/// **是否允许真实下发** ✗ —— 默认 **关** ✓。
+///
+/// 安全策略第 ② 条 ✓：默认只预览不下发 ✓，必须显式打开 ✓。
+/// 每次进程启动都回到"关" ✓（不持久化 ✗）—— 避免"上次开着，重启还以为安全"✗。
+static DISPATCH_ALLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 查询 / 设置"允许下发" ✓。
+fn set_dispatch_allowed(allowed: bool) -> serde_json::Value {
+    DISPATCH_ALLOWED.store(allowed, std::sync::atomic::Ordering::SeqCst);
+    if !allowed {
+        // 关掉时**顺手清掉平滑缓存** ✓ —— 下次开启时不要被旧值拖住 ✗
+        if let Ok(mut guard) = last_sent_displacement().lock() {
+            *guard = None;
+        }
+    }
+    serde_json::json!({ "dispatchAllowed": allowed })
+}
+
+fn dispatch_allowed() -> bool {
+    DISPATCH_ALLOWED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// **上次下发的 6 路位移** ✓ —— 时间平滑用 ✓。
+///
+/// 为什么需要 ✗：位移表是离散的 ✓，相邻样本差 1~2mm ✗ →
+/// 逐点直接下发会让电机**一顿一顿**✗。对上一帧做低通后就连续了 ✓。
+static LAST_SENT_DISPLACEMENT: std::sync::OnceLock<std::sync::Mutex<Option<[f64; 6]>>> =
+    std::sync::OnceLock::new();
+
+fn last_sent_displacement() -> &'static std::sync::Mutex<Option<[f64; 6]>> {
+    LAST_SENT_DISPLACEMENT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// **只算不发** ✓ —— 返回「这个末端位姿会下发的 6 路位移」✓。
+///
+/// 和 `send_tip_pose_command` 走**完全相同的查表逻辑** ✓（同一档位 ✓、同一 `lookup_shape` ✓），
+/// 区别只有一句：**不编码帧、不写串口** ✗。
+///
+/// 用途：动作库 / 策略编排播放时 ✓，监控卡要显示"目标位移在变"✓，
+/// 但默认**不能真的动** ✗（安全策略：需显式勾选允许下发 ✓）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TipPosePreviewResult {
+    /// 6 路肌腱目标位移（mm）✓（和下发那条**完全一致** ✓）
+    target_displacement_mm: Vec<f64>,
+    /// 最近邻距离 ✓（判断"离表达多远"✓）
+    nearest_distance: f64,
+}
+
+fn preview_tip_pose_command(request: TipPoseCommandRequest) -> Result<TipPosePreviewResult, String> {
+    // **和老臂逻辑彻底脱钩** ✗ —— 新模型只有一个 20N 表 ✓，没有档位概念 ✓
+    let _ = request.table_gauge_n;
+    // ⚠ **不要 `vc.clone()`** ✗ —— 它会深拷贝 1031 个样本 ✗（每次约 200KB ✓）
+    //   拖动控制每秒几十次 ✓ → 就是"帧率变慢"的元凶 ✗（本 bug ✓）。
+    //   先绑定模型 ✓（`current_model()` 返回临时值 ✓，不绑定会被借用检查拒绝 ✓），再借 `vc` ✓。
+    let model_tables = current_model();
+    let vc = model_tables
+        .vc
+        .as_ref()
+        .ok_or_else(|| "当前模型不是新格式（缺 KTB1/PTB1）✗".to_string())?;
+    let (displacement, nearest_distance) = vc
+        .interpolate_by_tip_mm(request.position_mm)
+        .ok_or_else(|| "新模型的位移表为空 ✗".to_string())?;
+    if nearest_distance > 120.0 {
+        return Err(format!("位姿超出覆盖范围：最近邻 {nearest_distance:.1} > 120"));
+    }
+
+    Ok(TipPosePreviewResult {
+        target_displacement_mm: displacement.to_vec(),
+        nearest_distance,
+    })
+}
+
+/// **批量预计算** ✓ —— 播放开始时把整条轨迹的 6 路位移**一次算完** ✓。
+///
+/// 为什么 ✗：逐点调 `preview_tip_pose_command` 时 ✓，每次都要再查一遍表 ✓，
+/// 网络/查表开销叠加 ✓ → 界面"隔很久才跳一下"✗（实测 ✓）。
+/// 一次请求算完 ✓，播放时纯前端查数组 ✓ → **零延迟** ✓。
+///
+/// 参数 `positionsMm` 是末端点的平铺数组 ✓（`[x0,y0,z0, x1,y1,z1, …]` ✓）。
+/// 不可达的点返回 `null` ✓（前端沿用上一个可达点 ✓，不闪 0 ✗）。
+fn preview_tip_pose_batch(
+    positions_mm: Vec<f64>,
+    table_gauge_n: Option<u8>,
+) -> Result<Vec<Option<Vec<f64>>>, String> {
+    // **新模型优先** ✓ —— `KTB1`/`PTB1`/`FTB1` 三段存在时走这条路 ✓
+    //   （`PTB1` 已经是前端坐标系 ✓，不用换轴 ✗）
+    let maybe_vc = current_model();
+    if let Some(vc) = maybe_vc.vc.as_ref() {
+        let mut out = Vec::with_capacity(positions_mm.len() / 3);
+        for chunk in positions_mm.chunks_exact(3) {
+            match vc.interpolate_by_tip_mm([chunk[0], chunk[1], chunk[2]]) {
+                // **`dL_mm` 就是 6 路目标位移** ✓（`KTB1` 的后 6 个分量 ✓）
+                // 阈值按表密度定 ✓：1031 个点摊在臂长 445mm 的空间里 ✓，
+                // 60mm 太紧（边缘全 None ✗），120mm 能覆盖大部分真实轨迹 ✓。
+                Some((dl, distance)) if distance <= 120.0 => {
+                    out.push(Some(dl.to_vec()));
+                }
+                // 太远 = 表里没有附近样本 ✗ → 返回 None ✓（前端沿用上一帧 ✓，不闪 0 ✗）
+                _ => out.push(None),
+            }
+        }
+        return Ok(out);
+    }
+
+    let model_for_gauge = current_model();
+    let gauge: u8 = table_gauge_n.unwrap_or_else(|| model_for_gauge.default_tension());
+    let kind = posetable::PoseTableKind::from_tension(gauge)
+        .ok_or_else(|| format!("不支持的张力档位：{gauge}N（可选 20/40/60）"))?;
+    let model_tables = current_model();
+    let pose_table = model_tables
+        .pose(kind)
+        .map_err(|error| format!("位姿表档位不可用：{error:?}"))?;
+
+    let mut out = Vec::with_capacity(positions_mm.len() / 3);
+    for chunk in positions_mm.chunks_exact(3) {
+        let query = posetable::encode_rpy_mm([chunk[0], chunk[1], chunk[2]], 0.0, 0.0, 0.0);
+        let covered = pose_table
+            .lookup(&query)
+            .map(|lookup| lookup.covered)
+            .unwrap_or(false);
+        if !covered {
+            out.push(None);
+            continue;
+        }
+        out.push(match pose_table.lookup_shape(&query) {
+            Ok(shape) => Some(shape.displacement_mm.to_vec()),
+            Err(_) => None,
+        });
+        // 🔍 诊断（验证完删 ✓）
+        if out.len() <= 4 {
+            if let Ok(shape) = pose_table.lookup_shape(&query) {
+                eprintln!(
+                    "[batch-debug] pos={:?} query[0..3]={:?} nearest={:.1} disp={:?}",
+                    &chunk,
+                    &query[0..3],
+                    shape.nearest_distance,
+                    shape.displacement_mm[0]
+                );
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -3699,6 +5412,8 @@ fn calibrate_sensor(
     guard_permission(&state, auth::Permission::RunCalibration)?;
 
     let device_id = selected_device_id(request.device_id);
+    // V2 `0x23` 砝码校准：`id(1) weight(2)`，重量单位是**克**（下位机收 g×10）。
+    // 旧实现既用 `0xBB` 当**下行**帧头（下行固定 0xAA），又按 ×100 缩放，两处都不对。
     let frame = protocol::encode_sensor_calibration(request.sensor_id, request.calibration_value)
         .map_err(|error| format!("{error:?}"))?;
     audit_control_frame(
@@ -3716,29 +5431,51 @@ fn send_bend_command(
     request: BendCommandRequest,
 ) -> Result<RuntimeSnapshot, String> {
     let device_id = selected_device_id(request.device_id);
-    let frame = protocol::encode_bend_command(
-        request.direction1,
-        request.angle1_deg,
-        request.direction2,
-        request.angle2_deg,
-    )
-    .map_err(|error| format!("{error:?}"))?;
+
+    // V2 `0x40` 单段弯曲：**一段一帧**（`seg(1) dir(1) angle(2)`）。
+    //
+    // 旧实现把两段压进 `AA 05` 的一帧里：`0x05` 在指令集里是「动作组演示」且无数据段，
+    // 而且 `seg` 被写死为 1 —— 第二段永远下发不出去。
+    //
+    // 两帧是**串口上的连续字节**，拼在一起下发与分两次下发等价；拼在一起只是让审计
+    // 日志里一条记录就能看到本次全部下发内容。第二段角度为 0 视为「本段不动」，跳过，
+    // 省得一帧 `0°` 把正在弯曲的臂体往回带。
+    let mut payload = Vec::new();
+    let segments = [
+        (1u8, request.direction1, request.angle1_deg),
+        (2u8, request.direction2, request.angle2_deg),
+    ];
+    for (segment, direction, angle_deg) in segments {
+        if segment == 2 && angle_deg == 0.0 {
+            continue;
+        }
+        // 前端方向码 0 = 朝上，其余（右/下/左）一律按朝下下发。
+        let frame = protocol::encode_single_bend_command(segment, direction == 0, angle_deg)
+            .map_err(|error| format!("{error:?}"))?;
+        payload.extend_from_slice(&frame);
+    }
+
     audit_control_frame(
         state,
         device_id,
         "bend command sent",
-        frame,
+        payload,
         CommandSafety::Enabled,
     )
 }
 
+/// 主动控制 tick：V2 `0x41`（`0x4_` 动作组），无数据段。
+///
+/// 旧实现发 `AA 06 02 02 00` —— 既不是 V1 `0x06`（多电机自定义，`count=2` 却只跟了
+/// 1 字节，长度不自洽），也不属于任何已定义功能码，下位机只会当畸形帧丢弃。
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn send_active_control_tick(
     state: State<'_, AppState>,
     request: ActiveControlRequest,
 ) -> Result<RuntimeSnapshot, String> {
     let device_id = selected_device_id(request.device_id);
-    let frame = protocol::encode_active_control_tick();
+    let frame = protocol::encode_active_control_command()
+        .map_err(|error| format!("{error:?}"))?;
     audit_control_frame(
         state,
         device_id,
@@ -4330,14 +6067,15 @@ mod tests {
     }
 
     #[test]
-    fn simulated_snapshot_uses_legacy_protocol_status() {
+    fn simulated_snapshot_reports_actual_protocol_version() {
         let seq = 64;
         let simulator = transport::SimulatorTransport::with_seed(seq).expect("simulator");
         let mut runtime = device::DeviceRuntime::new(simulator);
         let protocol_status = runtime.handshake().expect("status");
         let snapshot = make_frame(seq, true);
 
-        assert_eq!(snapshot.protocol_version, "Legacy V1");
+        // 模拟设备发的是 V2 帧，标签必须跟着走（旧实现写死 "Legacy V1"）。
+        assert_eq!(snapshot.protocol_version, "V2 (0x55)");
         assert!(snapshot.system_enabled);
         assert_eq!(snapshot.motors.len(), protocol_status.motors.len());
         assert_eq!(snapshot.sensors.len(), protocol_status.sensors.len());
@@ -4346,12 +6084,16 @@ mod tests {
             trunc2(protocol_status.motors[0].position_mm)
         );
         assert_eq!(
-            snapshot.sensors[0].raw[0],
+            snapshot.sensors[0].raw_value,
             protocol_status.sensors[0].x
         );
         assert_eq!(
+            snapshot.sensors[0].filtered_value,
+            protocol_status.sensors[0].y
+        );
+        assert_eq!(
             snapshot.bend.section1.angle_deg,
-            trunc2(protocol_status.bend_angle1_deg)
+            trunc2(protocol_status.scale)
         );
         assert!(snapshot.quality.checksum_ok);
     }
@@ -4382,16 +6124,17 @@ mod tests {
     }
 
     #[test]
-    fn newly_exposed_control_commands_have_legacy_frames() {
+    fn newly_exposed_control_commands_use_v2_frames() {
         let home = protocol::encode_home_command(2, 1).expect("home");
-        let sensor = protocol::encode_sensor_calibration(2, -3.25).expect("sensor");
-        let bend = protocol::encode_bend_command(0, 12.34, 3, 56.78).expect("bend");
-        let active = protocol::encode_active_control_tick();
+        let sensor = protocol::encode_sensor_calibration(2, 3.25).expect("sensor");
+        let bend = protocol::encode_single_bend_command(1, true, 12.34).expect("bend");
+        let active = protocol::encode_active_control_command().expect("active control");
 
-        assert_eq!(frame_hex(&home), "AA 04 06 02 01 00 00 00 00 B7");
-        assert_eq!(frame_hex(&sensor), "BB 03 03 02 FE BB 7C");
-        assert_eq!(frame_hex(&bend), "AA 05 06 00 04 D2 03 16 2E D2");
-        assert_eq!(frame_hex(&active), "AA 06 02 02 00 B4");
+        assert_eq!(frame_hex(&home), "AA 11 06 02 01 00 00 00 00 C4");
+        assert_eq!(frame_hex(&sensor), "AA 23 03 02 00 21 F3");
+        assert_eq!(frame_hex(&bend), "AA 40 04 01 00 04 D2 C5");
+        // 主动控制在 0x4_ 动作组（与 0x40 同组）
+        assert_eq!(frame_hex(&active), "AA 41 00 EB");
     }
 
     #[test]
@@ -4422,8 +6165,8 @@ mod tests {
                 num_sensors: 0,
                 motors: vec![],
                 sensors: vec![],
-                bend_angle1_deg: 0.0,
-                bend_angle2_deg: 0.0,
+                scale: 0.0,
+                arm_bend: 0.0,
                 system_state: 0,
             }),
             received_frames: 1,
@@ -4438,6 +6181,13 @@ mod tests {
             control_enabled: false,
             last_error: None,
             last_error_code: None,
+            protocol_version: 2,
+            protocol_negotiated: true,
+            tension_frames: 0,
+            calibration_events: 0,
+            unknown_frames: 0,
+            last_tension: None,
+            last_calibration: None,
         };
 
         assert!(runtime_allows_command(&runtime, CommandSafety::Connected));
@@ -4477,13 +6227,9 @@ mod tests {
                 acceleration_mm_per_sec2: 1.0,
                 status: 1,
             }],
-            sensors: vec![protocol::SensorData {
-                x: 1.0,
-                y: 2.0,
-                z: 3.0,
-            }],
-            bend_angle1_deg: 4.0,
-            bend_angle2_deg: 5.0,
+            sensors: vec![protocol::SensorData { x: 1.0, y: 2.0 }],
+            scale: 4.0,
+            arm_bend: 5.0,
             system_state: 1,
         };
         let runtime_status = device::RuntimeStatus {
@@ -4501,6 +6247,13 @@ mod tests {
             control_enabled: false,
             last_error: None,
             last_error_code: None,
+            protocol_version: 2,
+            protocol_negotiated: true,
+            tension_frames: 0,
+            calibration_events: 0,
+            unknown_frames: 0,
+            last_tension: None,
+            last_calibration: None,
         };
         let live = vec![make_device_frame(
             &record,
@@ -4542,6 +6295,13 @@ mod tests {
             control_enabled: false,
             last_error: Some("checksum failed".to_string()),
             last_error_code: Some("PROTOCOL_FRAME".to_string()),
+            protocol_version: 1,
+            protocol_negotiated: false,
+            tension_frames: 0,
+            calibration_events: 0,
+            unknown_frames: 0,
+            last_tension: None,
+            last_calibration: None,
         };
 
         let summary = diagnostics_summary(&stats, &[("serial:COM7".to_string(), runtime)]);
@@ -4632,7 +6392,7 @@ fn spawn_device_poller(app_state: &AppState) {
                                 pressure: frame
                                     .sensors
                                     .first()
-                                    .map(|sensor| sensor.filtered[2])
+                                    .map(|sensor| sensor.filtered_value)
                                     .unwrap_or(0.0),
                             };
                             control.step_cycle(feedback, safety, 50);
@@ -4892,6 +6652,90 @@ fn dispatch(
         "current_auth_session" => {
             current_auth_session(st).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
+        "list_models" => list_models()
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "delete_model" => delete_model(arg::<String>(&args, "id")?)
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "rename_model" => rename_model(
+            arg::<String>(&args, "id")?,
+            arg::<String>(&args, "name")?,
+        )
+        .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "import_model_base64" => import_model_base64(
+            arg::<String>(&args, "data")?,
+            arg_opt::<String>(&args, "name")?,
+        )
+        .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "submit_ui_store" => submit_ui_store(
+            arg::<String>(&args, "namespace")?,
+            arg::<serde_json::Value>(&args, "data")?,
+            arg::<String>(&args, "submittedBy")?,
+        )
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "list_rejections" => serde_json::to_value(list_rejections())
+            .map_err(|error| error.to_string()),
+        "clear_rejections" => serde_json::to_value(clear_rejections(
+            arg::<String>(&args, "namespace")?,
+        ))
+        .map_err(|error| error.to_string()),
+        "acknowledge_rejection" => serde_json::to_value(acknowledge_rejection(
+            arg::<String>(&args, "id")?,
+        ))
+        .map_err(|error| error.to_string()),
+        "list_pending_ui_store" => list_pending_ui_store()
+            .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "approve_ui_store_entry" => approve_ui_store_entry(
+            arg::<String>(&args, "id")?,
+            arg::<String>(&args, "entryId")?,
+        )
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "approve_ui_store" => approve_ui_store(arg::<String>(&args, "id")?)
+            .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "reject_ui_store" => reject_ui_store(arg::<String>(&args, "id")?)
+            .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "ai_compose_policy" => ai_compose_policy(
+            arg::<String>(&args, "prompt")?,
+            arg::<serde_json::Value>(&args, "context")?,
+            arg::<Option<String>>(&args, "username").unwrap_or(None),
+        )
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "ai_config_status" => Ok::<serde_json::Value, String>(ai_config_status()),
+        "ai_key_status" => Ok::<serde_json::Value, String>(ai_key_status(
+            arg::<String>(&args, "username")?,
+        )),
+        "set_ai_key" => set_ai_key(
+            arg::<String>(&args, "username")?,
+            arg::<String>(&args, "apiKey")?,
+            arg::<Option<String>>(&args, "model").unwrap_or(None),
+            arg::<Option<String>>(&args, "baseUrl").unwrap_or(None),
+        )
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "save_ai_config" => save_ai_config(
+            arg::<String>(&args, "apiKey")?,
+            arg::<Option<String>>(&args, "baseUrl").unwrap_or(None),
+            arg::<Option<String>>(&args, "model").unwrap_or(None),
+        )
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "purge_logs" => purge_logs_from_state(arg::<Vec<i64>>(&args, "ids")?)
+            .map(|removed| serde_json::json!({ "removed": removed })),
+        "restore_logs" => restore_logs_in_state(arg::<Vec<i64>>(&args, "ids")?)
+            .map(|restored| serde_json::json!({ "restored": restored })),
+        "delete_logs" => delete_logs_from_state(arg::<Vec<i64>>(&args, "ids")?)
+            .map(|removed| serde_json::json!({ "removed": removed })),
+        "get_ui_store" => get_ui_store(arg::<String>(&args, "namespace")?)
+            .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "set_ui_store" => set_ui_store(
+            arg::<String>(&args, "namespace")?,
+            arg::<serde_json::Value>(&args, "data")?,
+        )
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
+        "save_model_params" => save_model_params(
+            arg::<String>(&args, "id")?,
+            arg::<ModelParams>(&args, "params")?,
+        )
+        .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "export_model" => export_model(arg::<String>(&args, "id")?)
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
         "login" => {
             let request: auth::LoginRequest = arg(args, "request")?;
             login(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
@@ -5025,6 +6869,13 @@ fn dispatch(
             let request: HomeCommandRequest = arg(args, "request")?;
             send_home_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
+        "vc_table_index" => vc_table_index()
+            .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string())),
+        "control_frame_log" => {
+            let request: ControlFrameLogRequest = arg(args, "request")?;
+            control_frame_log(st, request)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
         "send_multi_motor_command" => {
             let request: MultiMotorCommandRequest = arg(args, "request")?;
             send_multi_motor_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
@@ -5032,6 +6883,23 @@ fn dispatch(
         "send_curvature_command" => {
             let request: CurvatureCommandRequest = arg(args, "request")?;
             send_curvature_command(st, request).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "preview_tip_pose_batch" => {
+            let positions = arg::<Vec<f64>>(&args, "positionsMm")?;
+            let gauge = arg::<Option<u8>>(&args, "tableGaugeN").unwrap_or(None);
+            preview_tip_pose_batch(positions, gauge)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "set_dispatch_allowed" => Ok::<serde_json::Value, String>(set_dispatch_allowed(
+            arg::<bool>(&args, "allowed")?,
+        )),
+        "dispatch_allowed" => Ok::<serde_json::Value, String>(
+            serde_json::json!({ "dispatchAllowed": dispatch_allowed() }),
+        ),
+        "preview_tip_pose_command" => {
+            let request = arg::<TipPoseCommandRequest>(&args, "request")?;
+            preview_tip_pose_command(request)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "send_tip_pose_command" => {
             let request: TipPoseCommandRequest = arg(args, "request")?;
@@ -5183,10 +7051,48 @@ fn dispatch(
             webserial_open(st, port_name, baud_rate, device_name, client_id)
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
+        "shape_from_displacements" => {
+            let displacement_mm: Vec<f64> = arg(args, "displacementMm")?;
+            shape_from_displacements(displacement_mm)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "list_model_presets" => serde_json::to_value(list_model_presets())
+            .map_err(|error| error.to_string()),
+        "select_model" => {
+            let id: String = arg(args, "id")?;
+            select_model_preset(id).and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
         "webserial_push" => {
             let port_name: String = arg(args, "port_name")?;
             let bytes: Vec<u8> = arg(args, "bytes")?;
             let seq: Option<u64> = arg_opt(args, "seq")?;
+            /**
+             * **字节到后端 = 链路通** ✓ —— 老路径（原始字节上报 ✓）也要推进握手态 ✓。
+             * 只在 `frame_ingest` 里做的话 ✓，走这条路径的设备会永远停在
+             * `Handshaking` ✗（实测 ✓）。
+             */
+            if !bytes.is_empty() {
+                let mut drop_bytes = false;
+                if let Ok(mut devices) = st.devices.lock() {
+                    /**
+                     * **已有客户端在本地解析 → 丢弃原始字节** ✓。
+                     *
+                     * 多端场景下（电脑 + 手机 + 旧标签页 ✓），旧客户端仍会把原始字节推上来 ✗，
+                     * 与本地解析上报的帧同时喂解析器 ✓ → 重复块 / 半包 → 协议错误疯长 ✗。
+                     * 这里直接丢弃 ✓，并且**不再推进握手态**（帧通路已由 ingest 负责 ✓）。
+                     */
+                    if devices.has_recent_ingest(&port_name, 3000) {
+                        drop_bytes = true;
+                    } else {
+                        devices.note_port_activity(&port_name);
+                    }
+                }
+                if drop_bytes {
+                    return Ok(serde_json::json!({
+                        "accepted": 0, "duplicate": true, "gaps": 0, "duplicates": 0,
+                    }));
+                }
+            }
             webserial_push(port_name, bytes, seq)
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
@@ -5376,6 +7282,113 @@ fn handle_rpc(stream: &mut std::net::TcpStream, state: &Arc<AppState>) {
         Err(error) => serde_json::json!({ "ok": false, "error": error }),
     };
     write_json(stream, 200, &payload.to_string());
+}
+
+/// **真删日志** ✓ —— 直接从状态文件里抹掉 ✓（不是"隐藏"✗）。
+///
+/// 为什么直接改文件 ✗：日志随快照一起持久化 ✓，`AppState` 里是内存副本 ✓。
+/// 删完下次持久化会把内存写回去 ✗ → 所以**同时**从文件删 ✓，并让前端刷新快照 ✓。
+fn delete_logs_from_state(ids: Vec<i64>) -> Result<usize, String> {
+    let path = std::env::var("SOFTUI_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取状态失败：{error}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("解析状态失败：{error}"))?;
+
+    let Some(logs) = value.get_mut("logs").and_then(|logs| logs.as_array_mut()) else {
+        return Err("状态文件里没有 logs".to_string());
+    };
+    let wanted: std::collections::HashSet<i64> = ids.into_iter().collect();
+    let mut removed = 0usize;
+    for entry in logs.iter_mut() {
+        let matched = entry
+            .get("id")
+            .and_then(|id| id.as_i64())
+            .map(|id| wanted.contains(&id))
+            .unwrap_or(false);
+        if !matched {
+            continue;
+        }
+        // **软删除** ✓ —— 打 `deleted: true` ✓ 而不是抹掉 ✓
+        //   （日志是审计证据 ✓，误删能恢复 ✓，admin 还能调出来查 ✓）
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("deleted".to_string(), serde_json::Value::Bool(true));
+            object.insert(
+                "deletedAtMs".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0),
+                )),
+            );
+            removed += 1;
+        }
+    }
+
+    let pretty = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    std::fs::write(&path, pretty).map_err(|error| format!("写回失败：{error}"))?;
+    Ok(removed)
+}
+
+/// **彻底删除** ✓ —— 从文件里**真的抹掉** ✓（回收站里的"删除"按钮 ✓）。
+fn purge_logs_from_state(ids: Vec<i64>) -> Result<usize, String> {
+    let path = std::env::var("SOFTUI_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取状态失败：{error}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("解析状态失败：{error}"))?;
+    let Some(logs) = value.get_mut("logs").and_then(|logs| logs.as_array_mut()) else {
+        return Err("状态文件里没有 logs".to_string());
+    };
+    let wanted: std::collections::HashSet<i64> = ids.into_iter().collect();
+    let before = logs.len();
+    logs.retain(|entry| {
+        entry
+            .get("id")
+            .and_then(|id| id.as_i64())
+            .map(|id| !wanted.contains(&id))
+            .unwrap_or(true)
+    });
+    let removed = before - logs.len();
+    let pretty = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    std::fs::write(&path, pretty).map_err(|error| format!("写回失败：{error}"))?;
+    Ok(removed)
+}
+
+/// **恢复软删除的日志** ✓（把 `deleted` 摘掉 ✓）
+fn restore_logs_in_state(ids: Vec<i64>) -> Result<usize, String> {
+    let path = std::env::var("SOFTUI_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
+    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取状态失败：{error}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("解析状态失败：{error}"))?;
+    let Some(logs) = value.get_mut("logs").and_then(|logs| logs.as_array_mut()) else {
+        return Err("状态文件里没有 logs".to_string());
+    };
+    let wanted: std::collections::HashSet<i64> = ids.into_iter().collect();
+    let mut restored = 0usize;
+    for entry in logs.iter_mut() {
+        let matched = entry
+            .get("id")
+            .and_then(|id| id.as_i64())
+            .map(|id| wanted.contains(&id))
+            .unwrap_or(false);
+        if !matched {
+            continue;
+        }
+        if let Some(object) = entry.as_object_mut() {
+            object.remove("deleted");
+            object.remove("deletedAtMs");
+            restored += 1;
+        }
+    }
+    let pretty = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+    std::fs::write(&path, pretty).map_err(|error| format!("写回失败：{error}"))?;
+    Ok(restored)
 }
 
 /// server 模式入口：绑定 127.0.0.1:8787，只暴露 POST /rpc 与 GET /health。
