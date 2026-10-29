@@ -199,6 +199,11 @@ struct LogEntry {
     timestamp_ms: u64,
     device_id: Option<String>,
     frame_hex: Option<String>,
+    /// 软删除标记（回收站）✓ —— 老状态文件没有这两个字段，按"未删除"读入 ✓。
+    #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
+    deleted_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,6 +572,8 @@ fn log_entry(
         timestamp_ms: now_ms(),
         device_id: device_id.map(|value| value.to_string()),
         frame_hex: frame_hex.map(|value| value.to_string()),
+        deleted: false,
+        deleted_at_ms: 0,
     }
 }
 
@@ -1651,6 +1658,7 @@ fn write_ai_key_map(map: &std::collections::HashMap<String, AiUserKey>) -> Resul
 }
 
 /// 给某个账号设 Key ✓（空字符串 = 删除该账号的 Key ✓）
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn set_ai_key(
     username: String,
     api_key: String,
@@ -1675,6 +1683,7 @@ fn set_ai_key(
 }
 
 /// 某个账号**有没有配自己的 Key** ✓（不返回 Key 本身 ✗）
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn ai_key_status(username: String) -> serde_json::Value {
     let map = read_ai_key_map();
     let own = map.get(&username).filter(|item| !item.api_key.is_empty());
@@ -1712,7 +1721,10 @@ const AI_POLICY_SYSTEM_PROMPT: &str = r#"你是 SoftUI 柔性臂的**策略编�
 
 /// **AI 生成策略** ✓ —— 调 DeepSeek ✓，返回**原始 JSON 文本** ✓
 /// （校验在前端做 ✓：前端才知道最新的模型/动作列表 ✓）
-fn ai_compose_policy(
+///
+/// 注意：内部用的是 `reqwest::blocking`，**不能**直接注册成 Tauri 命令
+/// （会卡住 IPC/界面线程）—— 桌面端入口是下面那个 `async` 包装。
+fn ai_compose_policy_blocking(
     prompt: String,
     context: serde_json::Value,
     username: Option<String>,
@@ -1791,6 +1803,21 @@ fn ai_compose_policy(
         .map_err(|error| format!("返回的不是合法 JSON：{error}"))
 }
 
+/// 桌面端命令入口：把阻塞的 HTTP 调用丢到阻塞线程池，避免卡住界面。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+async fn ai_compose_policy(
+    prompt: String,
+    context: serde_json::Value,
+    username: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        ai_compose_policy_blocking(prompt, context, username)
+    })
+    .await
+    .map_err(|error| format!("AI 任务执行失败：{error}"))?
+}
+
 /// **界面共享数据**目录（`<状态目录>/ui-store`）✓。
 ///
 /// 动作库 / 策略编排原来存在 `localStorage` ✗ —— 那是**每个浏览器一份** ✗，
@@ -1845,6 +1872,7 @@ fn pending_dir() -> Result<std::path::PathBuf, String> {
 }
 
 /// 提交一条待审批改动 ✓（非 admin 保存时走这里 ✓）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn submit_ui_store(
     namespace: String,
     data: serde_json::Value,
@@ -2081,6 +2109,7 @@ fn summarize_value(data: &serde_json::Value) -> String {
 }
 
 /// 列出所有待审批 ✓（按提交时间倒序 ✓）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_pending_ui_store() -> Result<Vec<PendingUiChange>, String> {
     let dir = pending_dir()?;
     let mut items: Vec<PendingUiChange> = Vec::new();
@@ -2104,6 +2133,7 @@ fn list_pending_ui_store() -> Result<Vec<PendingUiChange>, String> {
 ///
 /// 为什么需要 ✗：一条待审批里打包了**整个数组** ✓，一次批准等于全批 ✗；
 /// 审批人想"这个留下、那个驳回"就做不到 ✓。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn approve_ui_store_entry(
     id: String,
     entry_id: String,
@@ -2201,6 +2231,7 @@ fn approve_ui_store_entry(
 }
 
 /// 批准 ✓ —— 把内容写入正式文件，再删掉待审批。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn approve_ui_store(id: String) -> Result<Vec<PendingUiChange>, String> {
     let dir = pending_dir()?;
     let path = dir.join(format!("{id}.json"));
@@ -2247,12 +2278,14 @@ fn write_rejections(items: &[RejectionNotice]) -> Result<(), String> {
 }
 
 /// 读驳回通知 ✓（前端轮询 ✓）
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_rejections() -> Vec<RejectionNotice> {
     read_rejections()
 }
 
 /// **清空某命名空间的驳回通知** ✓ —— 提交者一改动就调 ✓
 /// （标记是"上一次被驳回"✓，改了就不该再挂着 ✗）
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn clear_rejections(namespace: String) -> Vec<RejectionNotice> {
     let mut items = read_rejections();
     items.retain(|item| item.namespace != namespace);
@@ -2261,6 +2294,7 @@ fn clear_rejections(namespace: String) -> Vec<RejectionNotice> {
 }
 
 /// 前端确认已读 ✓ → 删掉通知 ✓
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn acknowledge_rejection(id: String) -> Vec<RejectionNotice> {
     let mut items = read_rejections();
     items.retain(|item| item.id != id);
@@ -2269,6 +2303,7 @@ fn acknowledge_rejection(id: String) -> Vec<RejectionNotice> {
 }
 
 /// 驳回 ✓ —— 只删掉待审批，不动正式文件。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn reject_ui_store(id: String) -> Result<Vec<PendingUiChange>, String> {
     let dir = pending_dir()?;
     let path = dir.join(format!("{id}.json"));
@@ -2299,6 +2334,7 @@ fn reject_ui_store(id: String) -> Result<Vec<PendingUiChange>, String> {
 }
 
 /// 读共享数据 ✓（文件不存在返回 `null` ✓，不是错误 ✓）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn get_ui_store(namespace: String) -> Result<serde_json::Value, String> {
     let path = ui_store_path(&namespace)?;
     match std::fs::read_to_string(&path) {
@@ -2310,6 +2346,7 @@ fn get_ui_store(namespace: String) -> Result<serde_json::Value, String> {
 }
 
 /// 写共享数据 ✓ —— **先写临时文件再 rename** ✓（避免写一半断电留下坏文件 ✗）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn set_ui_store(namespace: String, data: serde_json::Value) -> Result<serde_json::Value, String> {
     let path = ui_store_path(&namespace)?;
     let text = serde_json::to_string_pretty(&data).map_err(|error| error.to_string())?;
@@ -2331,6 +2368,36 @@ fn models_dir() -> Option<std::path::PathBuf> {
     let dir = root.parent()?.join("models");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
+}
+
+/// 把旧 desktop 构建落错位置（`%TEMP%\models`）的模型搬到 `<状态目录>/models`。
+///
+/// 只复制、不删除：如果同机还有 server 实例在用临时目录，删掉会把它的模型弄丢 ✗。
+#[cfg(feature = "desktop")]
+fn migrate_legacy_models(state_path: &std::path::Path) {
+    let Some(dir) = state_path.parent().map(|parent| parent.join("models")) else {
+        return;
+    };
+    let legacy = std::env::temp_dir().join("models");
+    if legacy == dir || !legacy.is_dir() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(entries) = std::fs::read_dir(&legacy) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        let target = dir.join(name);
+        if target.exists() {
+            continue;
+        }
+        let _ = std::fs::copy(&path, &target);
+    }
 }
 
 /// 模型库条目（内建预设 + 用户导入的）。
@@ -2409,6 +2476,7 @@ fn builtin_params_path(preset_id: &str) -> Option<std::path::PathBuf> {
     Some(models_dir()?.join(format!("builtin-{preset_id}.params.json")))
 }
 
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn save_model_params(id: String, params: ModelParams) -> Result<Vec<ModelLibraryEntry>, String> {
     let text = serde_json::to_string_pretty(&params).map_err(|e| e.to_string())?;
     // 内建模型：写 `builtin-<id>.params.json` ✓（原来直接拒绝 ✗）
@@ -2426,6 +2494,7 @@ fn save_model_params(id: String, params: ModelParams) -> Result<Vec<ModelLibrary
 }
 
 /// 列出模型库：内建预设 + 目录里的 `.tdcrmodel`。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_models() -> Result<Vec<ModelLibraryEntry>, String> {
     let current = current_model();
     let current_bytes = current.bundle_bytes;
@@ -2524,6 +2593,7 @@ fn recall_selection() -> Option<String> {
 }
 
 /// 删除用户模型。**内建模型不可删** ✓；**当前生效的也不删** ✓（避免正在用的模型消失）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn delete_model(id: String) -> Result<Vec<ModelLibraryEntry>, String> {
     if model::PRESETS.iter().any(|preset| preset.id == id) {
         return Err("内建模型不能删除".to_string());
@@ -2541,6 +2611,7 @@ fn delete_model(id: String) -> Result<Vec<ModelLibraryEntry>, String> {
 }
 
 /// 重命名用户模型（只改 sidecar，不动包内容 ✓）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn rename_model(id: String, name: String) -> Result<Vec<ModelLibraryEntry>, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -2558,6 +2629,7 @@ fn rename_model(id: String, name: String) -> Result<Vec<ModelLibraryEntry>, Stri
 }
 
 /// 导出模型包（base64）—— 内建的可导出 ✓（只读）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn export_model(id: String) -> Result<String, String> {
     let bytes = if let Some(preset) = model::PRESETS.iter().find(|preset| preset.id == id) {
         preset.bundle.to_vec()
@@ -2612,6 +2684,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 }
 
 /// 从 base64 导入模型（前端上传走这条 ✓ —— `Vec<u8>` 走 JSON 会被放大 3 倍以上 ✗）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn import_model_base64(data: String, name: Option<String>) -> Result<ModelStatus, String> {
     let bytes = base64_decode(&data)?;
     if bytes.is_empty() {
@@ -2733,11 +2806,10 @@ fn model_status() -> ModelStatus {
     model_status_of()
 }
 
-/// 导入模型包（`.tdcrmodel`）。校验通过后写入可执行文件同目录并立即生效。
-#[cfg_attr(feature = "desktop", tauri::command)]
 /// 可选模型包的信息（供 UI 下拉列表）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+
 pub struct ModelPresetInfo {
     pub id: String,
     pub name: String,
@@ -2782,6 +2854,7 @@ fn model_preset_is_active(preset: &model::ModelPreset) -> bool {
 ///
 /// 3D 显示用它替代正向 SDM：SDM 与全阶 Cosserat 表是两套模型，同一组位移
 /// 反推出的形状能差 2 倍以上；而"显示要和表一致"只能直接读表。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn shape_from_displacements(displacement_mm: Vec<f64>) -> Result<Vec<f64>, String> {
     if displacement_mm.len() != 6 {
         return Err(format!(
@@ -2840,6 +2913,7 @@ fn shape_from_displacements(displacement_mm: Vec<f64>) -> Result<Vec<f64>, Strin
 ///
 /// 原来只列 `PRESETS`（2 个内置 ✗）→ 导入的模型在管理页看得见、卡片里看不见 ✗（本 bug ✓）。
 /// 现在改为**遍历 `list_models()`** ✓：内置 + 已导入 ✓，一个入口 ✓。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn list_model_presets() -> Vec<ModelPresetInfo> {
     let current = current_model();
     let current_bytes = current.bundle_bytes;
@@ -2899,6 +2973,15 @@ fn select_model_preset(id: String) -> Result<ModelStatus, String> {
     import_model_inner(bytes, Some(name), false)
 }
 
+/// 选中模型（前端调用的命令名是 `select_model`，实现复用 `select_model_preset`）。
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn select_model(id: String) -> Result<ModelStatus, String> {
+    select_model_preset(id)
+}
+
+/// 导入模型包（`.tdcrmodel`）。校验通过后写入模型库并立即生效。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn import_model(bytes: Vec<u8>, name: Option<String>) -> Result<ModelStatus, String> {
     import_model_inner(bytes, name, true)
 }
@@ -2914,7 +2997,17 @@ fn import_model_inner(
 ) -> Result<ModelStatus, String> {
     let tables = model::ModelTables::from_bundle(&bytes)
         .map_err(|error| format!("模型包无效：{error:?}"))?;
-    let label = name.unwrap_or_else(|| format!("model.{}", model::EXTENSION));
+    let mut label = name.unwrap_or_else(|| format!("model.{}", model::EXTENSION));
+    // 前端传的是 `file.name`（**带** `.tdcrmodel`），这里再拼一次扩展名会得到
+    // `xxx.tdcrmodel.tdcrmodel`（实测）。统一去掉尾部扩展名：文件是 `xxx.tdcrmodel`，
+    // 显示名是 `xxx`。
+    let suffix = format!(".{}", model::EXTENSION);
+    if label.to_ascii_lowercase().ends_with(&suffix) {
+        label.truncate(label.len() - suffix.len());
+        if label.trim().is_empty() {
+            label = "model".to_string();
+        }
+    }
 
     // 写入**模型库目录**（原来写可执行文件旁 ✗ —— 只能存一个、且和状态目录不在一起）
     if persist {
@@ -3907,7 +4000,6 @@ fn diagnostics_bundle(state: State<'_, AppState>) -> Result<serde_json::Value, S
 ///
 /// 前端失败会带**同一个 seq** 重试；这里按 seq 忽略重复到达，
 /// 重试因此是安全的 —— 既不会丢字节，也不会把同一块喂两遍给解码器。
-#[cfg(not(feature = "desktop"))]
 #[derive(Default)]
 struct WsMeta {
     last_seq: u64,
@@ -3915,7 +4007,6 @@ struct WsMeta {
     duplicates: u64,
 }
 
-#[cfg(not(feature = "desktop"))]
 fn ws_meta() -> &'static Mutex<std::collections::HashMap<String, WsMeta>> {
     static META: std::sync::OnceLock<Mutex<std::collections::HashMap<String, WsMeta>>> =
         std::sync::OnceLock::new();
@@ -4178,6 +4269,10 @@ fn sync_set_source(client_id: Option<String>) {
         state.source_id = client_id;
     }
 }
+
+/// desktop 只有单窗口，没有多端同步表，数据源标记无处可放 —— 空实现。
+#[cfg(feature = "desktop")]
+fn sync_set_source(_client_id: Option<String>) {}
 
 #[cfg(not(feature = "desktop"))]
 fn sync_hello(client_id: String, label: String) -> Result<u64, String> {
@@ -5308,6 +5403,7 @@ struct TipPosePreviewResult {
     nearest_distance: f64,
 }
 
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn preview_tip_pose_command(request: TipPoseCommandRequest) -> Result<TipPosePreviewResult, String> {
     // **和老臂逻辑彻底脱钩** ✗ —— 新模型只有一个 20N 表 ✓，没有档位概念 ✓
     let _ = request.table_gauge_n;
@@ -5340,6 +5436,7 @@ fn preview_tip_pose_command(request: TipPoseCommandRequest) -> Result<TipPosePre
 ///
 /// 参数 `positionsMm` 是末端点的平铺数组 ✓（`[x0,y0,z0, x1,y1,z1, …]` ✓）。
 /// 不可达的点返回 `null` ✓（前端沿用上一个可达点 ✓，不闪 0 ✗）。
+#[cfg_attr(feature = "desktop", tauri::command)]
 fn preview_tip_pose_batch(
     positions_mm: Vec<f64>,
     table_gauge_n: Option<u8>,
@@ -6445,6 +6542,14 @@ pub fn run() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir())
                 .join("softui-state.json");
+            // 模型库 / AI 配置 / 界面共享数据 / 日志清理这些模块都是**按 `SOFTUI_STATE`
+            // 推导目录**的（见 `models_dir()` 等）。desktop 以前没设它，于是导入的模型
+            // 落在 `%TEMP%\models` 而不是应用数据目录 —— 会被系统清理，也和 `AppState`
+            // 的数据目录分家。这里显式对齐一次。
+            if std::env::var_os("SOFTUI_STATE").is_none() {
+                std::env::set_var("SOFTUI_STATE", &state_path);
+            }
+            migrate_legacy_models(&state_path);
             let app_state = AppState::new(state_path);
             spawn_device_poller(&app_state);
             app.manage(app_state);
@@ -6475,7 +6580,36 @@ pub fn run() {
             list_my_sessions,
             login,
             import_model,
+            import_model_base64,
+            list_models,
+            list_model_presets,
+            save_model_params,
+            select_model,
+            delete_model,
+            rename_model,
+            export_model,
             lookup_tip_pose_shape,
+            shape_from_displacements,
+            vc_table_index,
+            preview_tip_pose_command,
+            preview_tip_pose_batch,
+            control_frame_log,
+            delete_logs,
+            purge_logs,
+            restore_logs,
+            get_ui_store,
+            set_ui_store,
+            submit_ui_store,
+            list_pending_ui_store,
+            approve_ui_store,
+            approve_ui_store_entry,
+            reject_ui_store,
+            list_rejections,
+            clear_rejections,
+            acknowledge_rejection,
+            set_ai_key,
+            ai_key_status,
+            ai_compose_policy,
             model_status,
             reset_model,
             export_model_bundle,
@@ -6693,7 +6827,7 @@ fn dispatch(
             .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
         "reject_ui_store" => reject_ui_store(arg::<String>(&args, "id")?)
             .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
-        "ai_compose_policy" => ai_compose_policy(
+        "ai_compose_policy" => ai_compose_policy_blocking(
             arg::<String>(&args, "prompt")?,
             arg::<serde_json::Value>(&args, "context")?,
             arg::<Option<String>>(&args, "username").unwrap_or(None),
@@ -6716,12 +6850,9 @@ fn dispatch(
             arg::<Option<String>>(&args, "model").unwrap_or(None),
         )
         .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
-        "purge_logs" => purge_logs_from_state(arg::<Vec<i64>>(&args, "ids")?)
-            .map(|removed| serde_json::json!({ "removed": removed })),
-        "restore_logs" => restore_logs_in_state(arg::<Vec<i64>>(&args, "ids")?)
-            .map(|restored| serde_json::json!({ "restored": restored })),
-        "delete_logs" => delete_logs_from_state(arg::<Vec<i64>>(&args, "ids")?)
-            .map(|removed| serde_json::json!({ "removed": removed })),
+        "purge_logs" => purge_logs(st, arg::<Vec<i64>>(&args, "ids")?),
+        "restore_logs" => restore_logs(st, arg::<Vec<i64>>(&args, "ids")?),
+        "delete_logs" => delete_logs(st, arg::<Vec<i64>>(&args, "ids")?),
         "get_ui_store" => get_ui_store(arg::<String>(&args, "namespace")?)
             .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string())),
         "set_ui_store" => set_ui_store(
@@ -7284,111 +7415,90 @@ fn handle_rpc(stream: &mut std::net::TcpStream, state: &Arc<AppState>) {
     write_json(stream, 200, &payload.to_string());
 }
 
-/// **真删日志** ✓ —— 直接从状态文件里抹掉 ✓（不是"隐藏"✗）。
-///
-/// 为什么直接改文件 ✗：日志随快照一起持久化 ✓，`AppState` 里是内存副本 ✓。
-/// 删完下次持久化会把内存写回去 ✗ → 所以**同时**从文件删 ✓，并让前端刷新快照 ✓。
-fn delete_logs_from_state(ids: Vec<i64>) -> Result<usize, String> {
-    let path = std::env::var("SOFTUI_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取状态失败：{error}"))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|error| format!("解析状态失败：{error}"))?;
+/* ── 日志删除 / 恢复 / 彻底清除 ───────────────────────────────────────
+ * 日志是 `AppState.store` 里的内存数据 + 状态文件里的持久化副本。
+ *   只改文件 ✗ —— 下次 `mutate` 会把内存写回去，删除"复活" ✓（旧实现的问题）
+ *   只改内存 ✗ —— 重启后状态文件里还在 ✗
+ * 所以统一走 `store.mutate`：一次同时改内存和落盘 ✓。
+ * ─────────────────────────────────────────────────────────────────── */
 
-    let Some(logs) = value.get_mut("logs").and_then(|logs| logs.as_array_mut()) else {
-        return Err("状态文件里没有 logs".to_string());
-    };
-    let wanted: std::collections::HashSet<i64> = ids.into_iter().collect();
+fn wanted_log_ids(ids: &[i64]) -> std::collections::HashSet<u64> {
+    ids.iter()
+        .filter(|id| **id > 0)
+        .map(|id| *id as u64)
+        .collect()
+}
+
+/// **软删除** ✓ —— 打 `deleted` 标记 ✓，进回收站，可恢复 ✓。
+fn mark_logs_deleted(state: &AppState, ids: &[i64]) -> usize {
+    let wanted = wanted_log_ids(ids);
+    if wanted.is_empty() {
+        return 0;
+    }
+    let now = now_ms();
     let mut removed = 0usize;
-    for entry in logs.iter_mut() {
-        let matched = entry
-            .get("id")
-            .and_then(|id| id.as_i64())
-            .map(|id| wanted.contains(&id))
-            .unwrap_or(false);
-        if !matched {
-            continue;
+    state.store.mutate(|data| {
+        for entry in data.logs.iter_mut() {
+            if wanted.contains(&entry.id) && !entry.deleted {
+                entry.deleted = true;
+                entry.deleted_at_ms = now;
+                removed += 1;
+            }
         }
-        // **软删除** ✓ —— 打 `deleted: true` ✓ 而不是抹掉 ✓
-        //   （日志是审计证据 ✓，误删能恢复 ✓，admin 还能调出来查 ✓）
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("deleted".to_string(), serde_json::Value::Bool(true));
-            object.insert(
-                "deletedAtMs".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0),
-                )),
-            );
-            removed += 1;
-        }
-    }
-
-    let pretty = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-    std::fs::write(&path, pretty).map_err(|error| format!("写回失败：{error}"))?;
-    Ok(removed)
-}
-
-/// **彻底删除** ✓ —— 从文件里**真的抹掉** ✓（回收站里的"删除"按钮 ✓）。
-fn purge_logs_from_state(ids: Vec<i64>) -> Result<usize, String> {
-    let path = std::env::var("SOFTUI_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取状态失败：{error}"))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|error| format!("解析状态失败：{error}"))?;
-    let Some(logs) = value.get_mut("logs").and_then(|logs| logs.as_array_mut()) else {
-        return Err("状态文件里没有 logs".to_string());
-    };
-    let wanted: std::collections::HashSet<i64> = ids.into_iter().collect();
-    let before = logs.len();
-    logs.retain(|entry| {
-        entry
-            .get("id")
-            .and_then(|id| id.as_i64())
-            .map(|id| !wanted.contains(&id))
-            .unwrap_or(true)
     });
-    let removed = before - logs.len();
-    let pretty = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-    std::fs::write(&path, pretty).map_err(|error| format!("写回失败：{error}"))?;
-    Ok(removed)
+    removed
 }
 
-/// **恢复软删除的日志** ✓（把 `deleted` 摘掉 ✓）
-fn restore_logs_in_state(ids: Vec<i64>) -> Result<usize, String> {
-    let path = std::env::var("SOFTUI_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("softui-state.json"));
-    let text = std::fs::read_to_string(&path).map_err(|error| format!("读取状态失败：{error}"))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|error| format!("解析状态失败：{error}"))?;
-    let Some(logs) = value.get_mut("logs").and_then(|logs| logs.as_array_mut()) else {
-        return Err("状态文件里没有 logs".to_string());
-    };
-    let wanted: std::collections::HashSet<i64> = ids.into_iter().collect();
-    let mut restored = 0usize;
-    for entry in logs.iter_mut() {
-        let matched = entry
-            .get("id")
-            .and_then(|id| id.as_i64())
-            .map(|id| wanted.contains(&id))
-            .unwrap_or(false);
-        if !matched {
-            continue;
-        }
-        if let Some(object) = entry.as_object_mut() {
-            object.remove("deleted");
-            object.remove("deletedAtMs");
-            restored += 1;
-        }
+/// **彻底删除** ✓ —— 从内存和状态文件里真的抹掉 ✓。
+fn purge_logs_in_store(state: &AppState, ids: &[i64]) -> usize {
+    let wanted = wanted_log_ids(ids);
+    if wanted.is_empty() {
+        return 0;
     }
-    let pretty = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
-    std::fs::write(&path, pretty).map_err(|error| format!("写回失败：{error}"))?;
-    Ok(restored)
+    let mut removed = 0usize;
+    state.store.mutate(|data| {
+        let before = data.logs.len();
+        data.logs.retain(|entry| !wanted.contains(&entry.id));
+        removed = before - data.logs.len();
+    });
+    removed
+}
+
+/// **恢复软删除的日志** ✓（把标记摘掉 ✓）。
+fn restore_logs_in_store(state: &AppState, ids: &[i64]) -> usize {
+    let wanted = wanted_log_ids(ids);
+    if wanted.is_empty() {
+        return 0;
+    }
+    let mut restored = 0usize;
+    state.store.mutate(|data| {
+        for entry in data.logs.iter_mut() {
+            if wanted.contains(&entry.id) && entry.deleted {
+                entry.deleted = false;
+                entry.deleted_at_ms = 0;
+                restored += 1;
+            }
+        }
+    });
+    restored
+}
+
+/// 软删除日志（进回收站）✓。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn delete_logs(state: State<'_, AppState>, ids: Vec<i64>) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({ "removed": mark_logs_deleted(&state, &ids) }))
+}
+
+/// 彻底删除日志（回收站里的"永久删除"）✓。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn purge_logs(state: State<'_, AppState>, ids: Vec<i64>) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({ "removed": purge_logs_in_store(&state, &ids) }))
+}
+
+/// 从回收站恢复日志 ✓。
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn restore_logs(state: State<'_, AppState>, ids: Vec<i64>) -> Result<serde_json::Value, String> {
+    Ok(serde_json::json!({ "restored": restore_logs_in_store(&state, &ids) }))
 }
 
 /// server 模式入口：绑定 127.0.0.1:8787，只暴露 POST /rpc 与 GET /health。

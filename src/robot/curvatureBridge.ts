@@ -161,7 +161,10 @@ export async function previewTipPoseCommand(
   rpyRad: [number, number, number],
   options: TipPoseOptions,
 ) {
-  return invoke<{ displacementMm: number[]; nearestDistance: number }>(
+  // ⚠ 字段名以 Rust 为准：`TipPosePreviewResult.target_displacement_mm`
+  //   经 `rename_all = "camelCase"` 序列化成 `targetDisplacementMm`。
+  //   之前这里写成 `displacementMm` → 调用方拿到 undefined（本 bug）。
+  return invoke<{ targetDisplacementMm: number[]; nearestDistance: number }>(
     "preview_tip_pose_command",
     {
       request: {

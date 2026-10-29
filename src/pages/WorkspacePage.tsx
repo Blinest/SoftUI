@@ -38,6 +38,8 @@ import { WorkspaceCard } from "../components/WorkspaceCard";
 import { ModelLibraryDialog } from "../components/ModelLibraryDialog";
 import { PolicyRulesCard } from "./PolicyRulesCard";
 import { MotionLibraryCard } from "./MotionLibraryCard";
+import { ShapeCalibrationCard } from "./ShapeCalibrationCard";
+import { TendonIdentifyCard } from "./TendonIdentifyCard";
 import {
   getCurrentActionName,
   getCurrentPlaybackTimes,
@@ -2155,7 +2157,7 @@ export function WorkspacePage({
           const preview = await previewTipPoseCommand(positionMm, tip.rpyRad, {
             deviceId: snapshot.live.selectedDeviceId,
           });
-          displacement = preview.displacementMm;
+          displacement = preview.targetDisplacementMm;
         }
         const directHex = Array.isArray(displacement)
           ? directMultiMotor(displacement, 1)
@@ -3115,6 +3117,22 @@ export function WorkspacePage({
         </button>
       </div>
             </>
+          );
+        case "shapeCalibration":
+          return (
+            <ShapeCalibrationCard
+              deviceId={snapshot.live.selectedDeviceId}
+              ensureMotion={requireSystemEnabled}
+              onNotify={notifyCommand}
+            />
+          );
+        case "tendonIdentify":
+          return (
+            <TendonIdentifyCard
+              deviceId={snapshot.live.selectedDeviceId}
+              ensureMotion={requireSystemEnabled}
+              onNotify={notifyCommand}
+            />
           );
       default:
         return null;

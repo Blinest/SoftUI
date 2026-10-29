@@ -1,6 +1,6 @@
 import {
 
-  Activity, GitBranch, Route, Save, SlidersHorizontal, Table2,
+  Activity, Cable, GitBranch, Route, Ruler, Save, SlidersHorizontal, Table2,
 
 } from "lucide-react";
 
@@ -37,6 +37,10 @@ export const automaticCardRegistry: Record<AutomaticCardId, WorkspaceCardMeta> =
   policyRules: { title: "智能策略编排", icon: GitBranch },
 
   motionLibrary: { title: "动作库", icon: Route },
+
+  shapeCalibration: { title: "典型臂形标定", icon: Ruler },
+
+  tendonIdentify: { title: "驱动丝识别", icon: Cable },
 
 };
 

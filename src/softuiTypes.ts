@@ -75,7 +75,11 @@ export type AutomaticCardId =
   /** 策略编排：按工况自动切换模型 ✓ */
   | "policyRules"
   /** 动作库：拖动记录末端点 → 存成动作 ✓ */
-  | "motionLibrary";
+  | "motionLibrary"
+  /** 典型臂形标定：把臂驱动到已知名义形状，人工量角校验模型 ✓ */
+  | "shapeCalibration"
+  /** 驱动丝识别：单丝点动 → 观察弯曲方向，判断电机线序 ✓ */
+  | "tendonIdentify";
 
 export type PageKey =
   | "Dashboard"

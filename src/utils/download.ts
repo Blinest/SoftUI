@@ -41,6 +41,20 @@ function stamp(ms: number): string {
   return new Date(ms).toLocaleString("zh-CN", { hour12: false });
 }
 
+/**
+ * 文件名用的**本地**时间戳（`YYYY-MM-DD-HH-mm-ss`）。
+ *
+ * ⚠ 不要用 `toISOString()` ✗ —— 那是 **UTC** 时间 ✓，本地 23:43 会写成 15:43 ✓，
+ * 现场按文件名找文件时会怀疑"导出的不是刚才那份"✗（实际踩过 ✓）。
+ */
+export function fileTimestamp(date: Date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `-${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+  );
+}
+
 /** 数值单元格：缺数据或非有限值留空，别把 "NaN" 写进 CSV。 */
 function numberCell(value: number | undefined): string {
   return value != null && Number.isFinite(value) ? value.toFixed(3) : "";

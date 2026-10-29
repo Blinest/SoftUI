@@ -2794,3 +2794,210 @@ tr.is-deleted td { text-decoration: line-through; }
 
 /* 「允许下发电机」勾选后**变红** ✓ —— 这是危险开关 ✓ */
 .is-warn-danger { color: #ff6b6b; font-weight: 600; }
+
+
+/* ---- 典型臂形标定卡片 ---- */
+
+.shape-calib-controls {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.shape-calib-summary {
+  margin-left: auto;
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.shape-calib-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.shape-calib-row {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--border-subtle) 18%, transparent);
+}
+
+.shape-calib-row.is-running {
+  border-color: color-mix(in srgb, #4c9aff 45%, var(--border-subtle));
+}
+
+.shape-calib-row.is-error {
+  border-color: color-mix(in srgb, #ff5c5c 45%, var(--border-subtle));
+}
+
+.shape-calib-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shape-calib-row-head strong {
+  font-size: 13px;
+}
+
+.shape-calib-status {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--border-subtle) 55%, transparent);
+}
+
+.shape-calib-status.is-running {
+  color: #2f6fd0;
+  background: rgba(76, 154, 255, 0.14);
+}
+
+.shape-calib-status.is-done {
+  color: #2f9e5b;
+  background: rgba(47, 158, 91, 0.14);
+}
+
+.shape-calib-status.is-error {
+  color: #d64545;
+  background: rgba(214, 69, 69, 0.14);
+}
+
+.shape-calib-run {
+  margin-left: auto;
+  padding: 2px 9px;
+  font-size: 12px;
+}
+
+.shape-calib-measured {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 14px;
+}
+
+.shape-calib-measured label {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.shape-calib-measured input {
+  width: 116px;
+}
+
+.shape-calib-error {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.shape-calib-error strong {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.shape-calib-error strong.is-good {
+  color: #2f9e5b;
+}
+
+.shape-calib-error strong.is-warn {
+  color: #c08a12;
+}
+
+.shape-calib-error strong.is-bad {
+  color: #d64545;
+}
+
+.shape-calib-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.shape-calib-message {
+  font-size: 11px;
+  color: #d64545;
+}
+
+/* ---- 方向 / 角度标定面板 ---- */
+
+.shape-calib-calib {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border-subtle);
+  border-radius: 10px;
+}
+
+.shape-calib-calib-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shape-calib-calib-head strong {
+  font-size: 13px;
+}
+
+.shape-calib-tag {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--border-subtle) 55%, transparent);
+}
+
+.shape-calib-tag.is-active {
+  color: #2f6fd0;
+  background: rgba(76, 154, 255, 0.14);
+}
+
+.shape-calib-calib-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 12px;
+}
+
+.shape-calib-calib-grid label {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.shape-calib-calib-grid input[type="number"] {
+  width: 92px;
+}
+
+.shape-calib-check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 4px;
+}
+
+.shape-calib-calib-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.shape-calib-measured select {
+  min-width: 132px;
+  padding: 4px 6px;
+}
+
+.shape-calib-measured .shape-calib-error strong {
+  white-space: nowrap;
+}

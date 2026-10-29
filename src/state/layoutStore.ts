@@ -67,6 +67,8 @@ const AUTOMATIC_CARD_IDS: AutomaticCardId[] = [
   "cycleLife",
   "policyRules",
   "motionLibrary",
+  "shapeCalibration",
+  "tendonIdentify",
 ];
 
 /** 卡片尺寸每一维的上限（列 / 行都是 1~4 格）。 */
@@ -200,6 +202,8 @@ export const defaultWorkspaceAutomaticLayout: PageLayout = freezeLayout({
     { id: "cycleLife", size: "2x1", visible: true },
     { id: "policyRules", size: "2x2", visible: true },
     { id: "motionLibrary", size: "2x2", visible: true },
+    { id: "shapeCalibration", size: "2x2", visible: true },
+    { id: "tendonIdentify", size: "2x2", visible: true },
   ],
 });
 
