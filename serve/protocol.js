@@ -280,49 +280,6 @@ export function decodeStatus(data) {
   return { numMotors, numSensors, motors, sensors, bendAngle1Deg, bendAngle2Deg, systemState };
 }
 
-/** 张力感知帧数据段（50 字节）。 */
-export function decodeTension(data) {
-  if (data.length !== 50) throw ProtocolError.InvalidLength;
-
-  const offsetRef = { value: 2 };
-  const sNorm = readI16(data, offsetRef) / SCALE.RATIO;
-  const disturbance = readI16(data, offsetRef) / SCALE.RATIO;
-  const f0 = readI16(data, offsetRef) / SCALE.RATIO;
-  const f1 = readI16(data, offsetRef) / SCALE.RATIO;
-  const fMag = readI16(data, offsetRef) / SCALE.LINEAR;
-
-  const health = [];
-  for (let i = 0; i < 6; i += 1) health.push(data[offsetRef.value++]);
-
-  const shareErr = [];
-  for (let i = 0; i < 6; i += 1) shareErr.push(readI16(data, offsetRef) / SCALE.RATIO);
-
-  const force = [];
-  for (let i = 0; i < 6; i += 1) force.push(readI16(data, offsetRef) / SCALE.LINEAR);
-
-  const balanceGain = [];
-  for (let i = 0; i < 6; i += 1) balanceGain.push(data[offsetRef.value++] / SCALE.LINEAR);
-
-  const calibStatus = data[offsetRef.value++];
-  const calibError = data[offsetRef.value++];
-  if (offsetRef.value !== data.length) throw ProtocolError.InvalidLength;
-
-  return {
-    contact: data[0] !== 0,
-    contactSegment: data[1],
-    sNorm,
-    disturbance,
-    fSeg: [f0, f1],
-    fMag,
-    health,
-    shareErr,
-    force,
-    balanceGain,
-    calibStatus,
-    calibError,
-  };
-}
-
 /** 标定事件帧数据段（3 字节）。 */
 export function decodeCalibration(data) {
   if (data.length !== 3) throw ProtocolError.InvalidLength;
@@ -353,11 +310,9 @@ export function decodeUpFrame(version, device, func, data) {
   if (version === 2) {
     if (device === DEV_SYS) return { kind: "handshake", ...decodeHandshake(data) };
     if (device === DEV_DRIVE) return { kind: "status", ...decodeStatus(data) };
-    if (device === DEV_TENSION) return { kind: "tension", ...decodeTension(data) };
     if (device === DEV_CALIB) return { kind: "calibration", ...decodeCalibration(data) };
   } else {
     if (func === 0x02) return { kind: "status", ...decodeStatus(data) };
-    if (func === 0x03) return { kind: "tension", ...decodeTension(data) };
     if (func === 0x04) return { kind: "calibration", ...decodeCalibration(data) };
   }
   return { kind: "unknown", version, device, func, data: Array.from(data) };

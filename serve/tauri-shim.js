@@ -564,7 +564,6 @@
       data.receivedFrames = local.totalFrames;
       data.protocolErrors = local.droppedFrames;
       if ("unknownFrames" in data) data.unknownFrames = wsUnknownFrames;
-      if ("tensionFrames" in data) data.tensionFrames = wsTensionFrames;
       if ("state" in data && local.totalFrames > 0 && data.state === "handshaking") {
         data.state = "ready"; // 本地已经解出帧了，就不该再显示"握手"
       }
@@ -1181,11 +1180,6 @@
                   }
                   // 张力感知帧（500ms 一帧）与标定事件帧（事件触发）：
                   // 与状态帧不是同一个节拍，不能塞进 wsRing。
-                  if (message.kind === "tension") {
-                    wsLastTension = message;
-                    wsTensionFrames += 1;
-                    return;
-                  }
                   if (message.kind === "calibration") {
                     wsLastCalibration = message;
                     wsCalibrationEvents += 1;
@@ -1235,10 +1229,8 @@
   var wsDirtyFrame = null;
   // 指令集 V2 的另外两类上行帧。界面暂时没有对应面板，但**必须收下来**：
   // 否则以后做面板时会回头怀疑「到底有没有收到」，而那时候串口现场未必还在。
-  var wsLastTension = null;
   var wsLastCalibration = null;
   var wsHandshake = null;
-  var wsTensionFrames = 0;
   var wsCalibrationEvents = 0;
   var wsUnknownFrames = 0;
 
@@ -1685,10 +1677,8 @@
         wsFrameSeq = 0;
         wsErrors = 0;
         wsDirtyFrame = null;
-        wsLastTension = null;
         wsLastCalibration = null;
         wsHandshake = null;
-        wsTensionFrames = 0;
         wsCalibrationEvents = 0;
         wsUnknownFrames = 0;
         if (!wsSyncTimer) wsSyncTimer = setInterval(wsSyncUp, 1000); // 1Hz —— 只给后端留档，界面不吃它
@@ -2312,10 +2302,9 @@
       var proto = wsActive && wsCodec
         ? " · " + (wsCodec.lastVersion() >= 2 ? "V2" : "V1")
         : "";
-      var telemetry = wsTensionFrames > 0 || wsCalibrationEvents > 0 || wsUnknownFrames > 0
-        ? " · τ" + wsTensionFrames +
-          (wsCalibrationEvents > 0 ? " 标定" + wsCalibrationEvents : "") +
-          (wsUnknownFrames > 0 ? " 未知" + wsUnknownFrames : "")
+      // **张力感知帧已移除** ✓ —— 只保留状态帧里的张力通道数据 ✓，徽标不再显示 τ 计数 ✓
+      var telemetry = wsCalibrationEvents > 0 || wsUnknownFrames > 0
+        ? " · ⊙" + wsCalibrationEvents + " · ?" + wsUnknownFrames
         : "";
       var src = SYNC_SOURCE
         ? (SYNC_SOURCE.self ? " · 本端供数" : " · 源:" + (SYNC_SOURCE.label || SYNC_SOURCE.clientId))

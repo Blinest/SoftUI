@@ -84,6 +84,13 @@ import {
 } from "../robot/policyEngine";
 import { directHome, directMultiMotor } from "../robot/directDispatch";
 import { clearLocalTable, ensureLocalTable, hasLocalTable, lookupLocal } from "../robot/localTable";
+import {
+  clearPrecalibration,
+  fetchPrecalibrationRemote,
+  readPrecalibrationLocal,
+  savePrecalibration,
+  type Precalibration,
+} from "../robot/precalibration";
 import { PLAY_REQUEST_KEY, type PlayRequest } from "../robot/motionPlayer";
 import {
   KAPPA_TABLE_COVERAGE_PER_M,
@@ -324,6 +331,7 @@ export function WorkspacePage({
     accelerationMmPerSec2: 3,
   });
   const [sensorDraft, setSensorDraft] = useState({ sensorId: 1, calibrationValue: 0 });
+
   /**
    * 「启动控制系统」的驱动方。
    *
@@ -1668,6 +1676,82 @@ export function WorkspacePage({
     motionAllowed ? undefined : `服务器未同步使能：点击「${label}」不会下发，请先到「控制 → 系统操作」启动控制系统`;
 
   /**
+   * **预校准** ✓ —— 记住"臂体伸直"的六路位移 ✓，之后一键回到该姿态 ✓。
+   *
+   * 与「一键归零」的区别：归零是回到**电机自己的零点** ✓，
+   * 而伸直位置受装配 / 丝长 / 预紧影响 ✓，通常和电机零点差几毫米 ✓ →
+   * 操作员真正要的是"回到我确认过伸直的那个位置" ✓。
+   */
+  const [precalibration, setPrecalibration] = useState<Precalibration | null>(() =>
+    readPrecalibrationLocal(),
+  );
+  /** 本机没有就向后端要一份 ✓（多端共享 ✓）*/
+  useEffect(() => {
+    if (precalibration) return;
+    void fetchPrecalibrationRemote().then((entry) => {
+      if (entry) setPrecalibration(entry);
+    });
+  }, [precalibration]);
+
+  /** **记录当前为伸直位** ✓ —— 用**实测**位置 ✓，不是下发值 ✓ */
+  const recordPrecalibration = useCallback(() => {
+    const motors = [...(snapshotRef.current.live.latest?.motors ?? [])]
+      .sort((left, right) => left.id - right.id)
+      .slice(0, 6);
+    if (motors.length < 6 || !motors.every((motor) => Number.isFinite(motor.positionMm))) {
+      setCommandStatus({
+        tone: "warn",
+        message: "记录失败：还没有读到六路电机的实测位置（先连接设备并等几帧）",
+      });
+      return;
+    }
+    const entry = savePrecalibration(motors.map((motor) => motor.positionMm));
+    setPrecalibration(entry);
+    setCommandStatus({
+      tone: "ok",
+      message: `已记录伸直位：${entry.values.map((value) => value.toFixed(2)).join(" / ")} mm`,
+    });
+  }, []);
+
+  /** **执行预校准** ✓ —— 把六路位移下发回记录值 ✓（绝对位移，幂等 ✓）*/
+  const runPrecalibration = useCallback(() => {
+    if (!precalibration) {
+      setCommandStatus({ tone: "warn", message: "还没有记录伸直位：先把臂体调到伸直再点「记录伸直位」" });
+      return;
+    }
+    if (!requireSystemEnabled("预校准")) return;
+    const values = precalibration.values;
+
+    // **本机直发优先** ✓（ms 级 ✓）；无串口则回退后端中继 ✓
+    const hex = directMultiMotor(values, 1);
+    if (hex) {
+      applyCommandedTargets(values);
+      setCommandStatus({
+        tone: "ok",
+        message: `预校准：已直连串口下发（回到 ${precalibration.recordedAt.slice(0, 19).replace("T", " ")} 记录的伸直位）`,
+      });
+      void invoke("control_frame_log", {
+        request: {
+          deviceId: snapshot.live.selectedDeviceId,
+          kind: "multi-motor",
+          frameHex: hex,
+          action: null,
+        },
+      }).catch(() => undefined);
+      return;
+    }
+    void (async () => {
+      try {
+        await sendMultiMotorCommand(values, { deviceId: snapshot.live.selectedDeviceId });
+        applyCommandedTargets(values);
+        setCommandStatus({ tone: "ok", message: "预校准：已下发（经服务器中继）" });
+      } catch (error) {
+        setCommandStatus({ tone: "error", message: `预校准失败：${errorText(error)}` });
+      }
+    })();
+  }, [precalibration, requireSystemEnabled, sendMultiMotorCommand, snapshot.live.selectedDeviceId]);
+
+  /**
    * **状态标签只说"服务器同步到哪一步"** ✓ —— 不再声称"设备已使能" ✗。
    *
    * 为什么要改 ✗：上位机**无法确认下位机真的使能了** ✓（状态帧 `system_state`
@@ -2975,6 +3059,39 @@ export function WorkspacePage({
           }}>
           <span>一键归零</span>
         </button>
+        {/* **预校准** ✓ —— 回到"操作员确认过伸直"的位移 ✓，不是电机零点 ✓ */}
+        <button type="button" className="ghost-btn"
+          title="把当前实测位置记录为「臂体伸直」的基准位"
+          onClick={recordPrecalibration}>
+          <span>记录伸直位</span>
+        </button>
+        <button type="button" className={blockedClass("primary-btn")}
+          title={
+            precalibration
+              ? blockedHint(
+                  `预校准：回到 ${precalibration.recordedAt.slice(0, 19).replace("T", " ")} 记录的伸直位（` +
+                    precalibration.values.map((value) => value.toFixed(2)).join(" / ") + " mm）",
+                )
+              : "还没有记录伸直位：先把臂体调到伸直，再点「记录伸直位」"
+          }
+          onClick={runPrecalibration}
+          disabled={!precalibration}>
+          <span>预校准</span>
+        </button>
+        {precalibration ? (
+          <span className="precalibration-hint" title="点击可清除已记录的基准位">
+            基准位 {precalibration.values.map((value) => value.toFixed(1)).join(" / ")} mm ·{" "}
+            {precalibration.recordedAt.slice(0, 16).replace("T", " ")}
+            <button type="button" className="ghost-btn precalibration-clear"
+              onClick={() => {
+                clearPrecalibration();
+                setPrecalibration(null);
+                setCommandStatus({ tone: "ok", message: "已清除预校准基准位" });
+              }}>
+              清除
+            </button>
+          </span>
+        ) : null}
       </div>
             </>
           );

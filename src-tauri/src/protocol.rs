@@ -809,11 +809,24 @@ fn decode_up_frame(
         // 判成协议错误。
         (2, DEV_SYS, 0x00) => Ok(UpMessage::Handshake(HandshakeAck::decode(data)?)),
         (2, DEV_DRIVE, _) => Ok(UpMessage::Status(DeviceStatus::decode(data)?)),
-        (2, DEV_TENSION, _) => Ok(UpMessage::Tension(TensionFrame::decode(data)?)),
+        // **张力感知帧已移除** ✓ —— 只保留状态帧里的张力通道数据 ✓。
+        // 帧本身仍按长度切分 ✓（不会打乱后续帧 ✓），只是不再解析成结构 ✓。
+        (2, DEV_TENSION, _) => Ok(UpMessage::Unknown(UpFrame {
+            version: 2,
+            device: DEV_TENSION,
+            function: 0,
+            data: Vec::new(),
+        })),
         (2, DEV_CALIB, _) => Ok(UpMessage::Calibration(CalibrationEvent::decode(data)?)),
         // ── V1：没有设备 ID，只能按功能码分派 ──
         (1, _, 0x02) => Ok(UpMessage::Status(DeviceStatus::decode(data)?)),
-        (1, _, 0x03) => Ok(UpMessage::Tension(TensionFrame::decode(data)?)),
+        // **V1 的张力帧同样移除** ✓
+        (1, _, 0x03) => Ok(UpMessage::Unknown(UpFrame {
+            version: 1,
+            device: DEV_SYS,
+            function: 0x03,
+            data: Vec::new(),
+        })),
         (1, _, 0x04) => Ok(UpMessage::Calibration(CalibrationEvent::decode(data)?)),
         _ => Ok(UpMessage::Unknown(UpFrame {
             version,
