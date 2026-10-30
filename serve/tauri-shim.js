@@ -1681,7 +1681,7 @@
         wsHandshake = null;
         wsCalibrationEvents = 0;
         wsUnknownFrames = 0;
-        if (!wsSyncTimer) wsSyncTimer = setInterval(wsSyncUp, 1000); // 1Hz —— 只给后端留档，界面不吃它
+        if (!wsSyncTimer) wsSyncTimer = setInterval(wsSyncUp, 2000); // 2s —— 只给后端留档，界面不吃它
         wsTxLoop(); // 命令：挂起式长轮询，不再 20ms 一轮
         if (wsFlushTimer) clearInterval(wsFlushTimer);
         wsFlushTimer = setInterval(wsFlushRx, 100); // 接收：有数据才发，100ms 一拍
@@ -1839,7 +1839,8 @@
       });
   }
 
-  setInterval(syncTick, 1000);
+  /** **多端同步轮询 1s → 3s** ✓ —— 只是"谁在哪一页"的信息 ✓，不必秒级 ✓ */
+  setInterval(syncTick, 3000);
   setTimeout(syncTick, 800);
 
   /* ── 通用 UI 状态同步 ────────────────────────────────────────────────

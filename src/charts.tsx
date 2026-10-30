@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown } from "lucide-react";
 import uPlot from "uplot";
+import { hasLocalPort } from "./robot/directDispatch";
 import "uplot/dist/uPlot.min.css";
 import { ChartLayout } from "./layouts/ChartLayout";
 import { ChannelSidebar } from "./components/layout/ResponsiveRail";
@@ -710,7 +711,20 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
   );
   const playbackMode = selectedSessionId !== "live";
 
-  // 实时模式：独立高频拉取曲线窗口（100ms），不再依赖整份快照的 charts 字段。
+  /**
+   * 实时曲线的数据来源 ✓ —— **能本地就本地** ✓。
+   *
+   * 曲线解析（`chartsFromFrames` ✓、曲率分布 ✓、统计摘要 ✓）全部在浏览器里算 ✓，
+   * 数据来源分两种情况：
+   *   · **本端持有串口**（电脑插着设备）→ `fetch_live_window` 被 shim 拦成本地应答 ✓
+   *     → **零网络请求** ✓，250ms 刷新无成本 ✓
+   *   · **本端没有串口**（手机 / 另一台电脑）→ 只能问后端 ✓ →
+   *     240 帧一次几百 KB ✗ → 4Hz 一天几十 GB ✗（流量异常的一大来源 ✓）
+   *
+   * 所以远端把刷新降到 **2s** ✓：曲线是"看趋势"✓，不必 4Hz；
+   * 真要高刷就在持串口那台机器上看 ✓。
+   */
+  const localSource = hasLocalPort();
   useEffect(() => {
     if (selectedSessionId !== "live" || paused) return;
     let cancelled = false;
@@ -728,17 +742,13 @@ export default function ChartsPage({ snapshot }: { snapshot: RuntimeSnapshot }) 
       }
     };
     void fetchWindow();
-    /**
-     * **曲线窗口轮询 10Hz → 4Hz** ✓ —— 源站是 HTTP/1.1 ✓，
-     * Cloudflare 到源站只有约 6 个并发连接 ✗ → 高频轮询会把连接占满 ✓ →
-     * 一次性命令（启动控制系统 / 下发）排队十几秒 ✗（本 bug ✓）。
-     */
-    const timer = window.setInterval(fetchWindow, 250);
+    const intervalMs = localSource ? 250 : 2000;
+    const timer = window.setInterval(fetchWindow, intervalMs);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [paused, selectedSessionId]);
+  }, [paused, selectedSessionId, localSource]);
 
   useEffect(() => {
     void invoke<SessionInfo[]>("list_sessions").then(setSessions).catch(() => setSessions([]));

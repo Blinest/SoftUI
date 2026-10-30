@@ -605,7 +605,12 @@ function AppShell() {
       void fetchLiveLatest().finally(() => {
         pending = false;
       });
-    }, liveFast ? 150 : 500);
+      /**
+       * ⚠ **500ms → 1000ms** ✗ —— 设备 200ms 出一帧 ✓，但界面 1Hz 刷新完全够看 ✓；
+       * 这一项压缩后仍有 ~0.5KB ✓，一天两次/秒就是 80MB+ ✗。
+       * 需要真正高刷的场景（曲线页）另走 `fetch_live_window` ✓。
+       */
+    }, liveFast ? 300 : 1000);
     return () => window.clearInterval(timer);
   }, [fetchLiveLatest, authenticated, liveFast]);
 
@@ -635,7 +640,11 @@ function AppShell() {
   // 1秒轮询已连接设备 — 未认证时不启动
   useEffect(() => {
     if (!authenticated) return;
-    const interval = setInterval(() => { void refreshConnectedDevices(); }, 1000);
+    /**
+   * ⚠ **1s → 5s** ✗ —— 设备列表只在插拔时变 ✓，
+   * 每秒拉一次纯属浪费 ✓（一天十几次请求看着少 ✓，但和别的轮询叠在一起就成倍 ✗）。
+   */
+  const interval = setInterval(() => { void refreshConnectedDevices(); }, 5000);
     return () => clearInterval(interval);
   }, [refreshConnectedDevices, authenticated]);
 
@@ -955,7 +964,7 @@ function AppShell() {
         const list = await invoke<SessionInfo[]>("list_sessions");
         setSessions(list);
       } catch { /* ignore */ }
-    }, 2000);
+    }, 5000);
     return () => clearInterval(interval);
   }, [authenticated]);
 
@@ -991,7 +1000,13 @@ function AppShell() {
     const timer = window.setInterval(() => {
       if (cancelled) return;
       void fetchSnapshot("tick_snapshot");
-    }, 200);
+      /**
+       * ⚠ **200ms → 500ms** ✗ —— 整份快照是**最大的响应** ✓（压缩前 10~100KB ✓），
+       * 5Hz 轮询一天能顶几十 GB 隧道流量 ✗（实测流量异常的来源之一 ✓）。
+       * 播放进度本身走 `fetch_live_latest` ✓，快照只需要跟上
+       * "设备/会话/图表"这类**慢变化** ✓ → 1.5s 一次足够 ✓。
+       */
+    }, 1500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);

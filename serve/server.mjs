@@ -175,13 +175,35 @@ function proxyRpc(req, res) {
         up.on("data", (c) => out.push(c));
         up.on("end", () => {
           const payload = Buffer.concat(out);
-          res.writeHead(up.statusCode || 502, {
+          /**
+           * **RPC 响应 gzip** ✓ —— 这里原来是**原样透传** ✗：
+           *   静态资源有 gzip ✓，但 `/rpc` 的 JSON 一直没压缩 ✗ →
+           *   一个快照 10~100KB 明文 ✓ × 每秒数次轮询 ✓ → 隧道一天几十 GB ✗
+           *   （实测流量异常的直接原因 ✓）。
+           *
+           * 全链路都能吃 gzip ✓：cloudflared 原样转发 `content-encoding` ✓，
+           * 浏览器 / shim 的 fetch 会自动解压 ✓。
+           * 阈值 512B：小响应压缩收益为负，直接透传 ✓。
+           */
+          const acceptGzip = /\bgzip\b/.test(req.headers["accept-encoding"] || "");
+          const headers = {
             "content-type": "application/json; charset=utf-8",
-            "content-length": payload.length,
             "cache-control": "no-store",
             "x-softui-backend": "rust",
-          });
-          res.end(payload);
+          };
+          let body = payload;
+          if (acceptGzip && payload.length > 512) {
+            try {
+              body = zlib.gzipSync(payload);
+              headers["content-encoding"] = "gzip";
+              headers["vary"] = "Accept-Encoding";
+            } catch {
+              body = payload;
+            }
+          }
+          headers["content-length"] = body.length;
+          res.writeHead(up.statusCode || 502, headers);
+          res.end(body);
         });
       },
     );
