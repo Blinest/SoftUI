@@ -2810,7 +2810,39 @@ tr.is-deleted td { text-decoration: line-through; }
 .is-warn-danger { color: #ff6b6b; font-weight: 600; }
 
 
-/* ---- 典型臂形标定卡片 ---- */
+/* ---- 臂体标定卡片 ---- */
+
+.shape-calib-tabs {
+  display: flex;
+  width: max-content;
+  gap: 2px;
+  margin: 12px 12px 0;
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--border-subtle) 35%, transparent);
+}
+
+.shape-calib-tab {
+  min-height: 0;
+  padding: 3px 16px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+  box-shadow: none;
+}
+
+.shape-calib-tab:hover {
+  color: var(--text-primary);
+}
+
+.shape-calib-tab.is-active {
+  background: var(--surface-page);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
 
 .shape-calib-controls {
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2998,6 +3030,18 @@ tr.is-deleted td { text-decoration: line-through; }
   align-items: center;
   gap: 6px;
   padding-bottom: 4px;
+}
+
+/* 全局 input 规则会把这个勾选框拉得又宽又高，必须显式定尺寸。 */
+.shape-calib-check input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  min-width: 14px;
+  min-height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--focus-ring);
 }
 
 .shape-calib-calib-hint {

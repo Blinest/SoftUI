@@ -6,7 +6,7 @@ import { downloadText, fileTimestamp } from "../utils/download";
 import { previewTipPoseCommand } from "../robot/curvatureBridge";
 import { modelTipToPhysicalMm } from "../robot/frameCalibration";
 import { useDisplacementGain } from "../robot/displacementGain";
-import { ARM_LENGTH_MM } from "./ShapeCalibrationCard";
+import { ARM_LENGTH_MM, ShapeCalibrationPanel } from "./ShapeCalibrationCard";
 import type { LiveLatest } from "../softuiTypes";
 
 /**
@@ -32,7 +32,7 @@ interface CalibrationRecord {
   measuredRotDeg: string;
 }
 
-export interface ArmCalibrationCardProps {
+export interface ArmCalibrationPanelProps {
   deviceId: string;
   /** 记录的臂体初态（六路电机位置 mm）；没有它就无法把实测位置还原成模型 dL */
   initialState: number[] | null;
@@ -53,7 +53,7 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-export function ArmCalibrationCard({ deviceId, initialState, onNotify }: ArmCalibrationCardProps) {
+export function ArmCalibrationPanel({ deviceId, initialState, onNotify }: ArmCalibrationPanelProps) {
   const [records, setRecords] = useState<CalibrationRecord[]>([]);
   const [busy, setBusy] = useState(false);
   const [displacementGain, setDisplacementGain] = useDisplacementGain();
@@ -211,7 +211,7 @@ export function ArmCalibrationCard({ deviceId, initialState, onNotify }: ArmCali
   }, [onNotify, records]);
 
   return (
-    <div className="admin-card-content shape-calib">
+    <div className="shape-calib">
       <div className="workspace-form-grid shape-calib-controls">
         <label className="workspace-field">
           <span>位移增益 k</span>
@@ -301,6 +301,70 @@ export function ArmCalibrationCard({ deviceId, initialState, onNotify }: ArmCali
             </div>
           ))
         )}
+      </div>
+    </div>
+  );
+}
+
+type ArmCalibrationTab = "calibrate" | "record";
+
+export interface ArmCalibrationCardProps {
+  deviceId: string;
+  /** 记录的臂体初态（六路电机位置 mm）；相对下发与记录都需要 */
+  initialState: number[] | null;
+  ensureMotion: (what: string) => boolean;
+  onCommandedTargets?: (targets: number[] | null) => void;
+  onNotify: (message: string, tone?: "ok" | "warn" | "error") => void;
+}
+
+/** 臂体标定：一张卡片内切换「标定」与「记录」。 */
+export function ArmCalibrationCard({
+  deviceId,
+  initialState,
+  ensureMotion,
+  onCommandedTargets,
+  onNotify,
+}: ArmCalibrationCardProps) {
+  const [tab, setTab] = useState<ArmCalibrationTab>("calibrate");
+
+  return (
+    <div className="admin-card-content shape-calib">
+      <div className="shape-calib-tabs" role="tablist" aria-label="臂体标定功能">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "calibrate"}
+          className={`shape-calib-tab ${tab === "calibrate" ? "is-active" : ""}`}
+          onClick={() => setTab("calibrate")}
+        >
+          标定
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "record"}
+          className={`shape-calib-tab ${tab === "record" ? "is-active" : ""}`}
+          onClick={() => setTab("record")}
+        >
+          记录
+        </button>
+      </div>
+
+      <div role="tabpanel" aria-label="标定" style={tab === "calibrate" ? undefined : { display: "none" }}>
+        <ShapeCalibrationPanel
+          deviceId={deviceId}
+          initialState={initialState}
+          ensureMotion={ensureMotion}
+          onCommandedTargets={onCommandedTargets}
+          onNotify={onNotify}
+        />
+      </div>
+      <div role="tabpanel" aria-label="记录" style={tab === "record" ? undefined : { display: "none" }}>
+        <ArmCalibrationPanel
+          deviceId={deviceId}
+          initialState={initialState}
+          onNotify={onNotify}
+        />
       </div>
     </div>
   );

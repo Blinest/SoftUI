@@ -28,8 +28,9 @@ const STORAGE_PREFIX = "softui:layout";
  * （否则新卡"凭空消失"，就像后台的「自助注册策略」那样 ✗）。
  * v3 → v4：后台新增 `registration` 卡 ✓
  * v5 → v6：移除「驱动丝识别」卡 ✓
+ * v6 → v7：合并「典型臂形标定」与「臂体标定」 ✓
  */
-const LAYOUT_SCHEMA_VERSION = 6;
+const LAYOUT_SCHEMA_VERSION = 7;
 
 const DASHBOARD_CARD_IDS: DashboardCardId[] = [
   "connection",
@@ -68,7 +69,6 @@ const AUTOMATIC_CARD_IDS: AutomaticCardId[] = [
   "cycleLife",
   "policyRules",
   "motionLibrary",
-  "shapeCalibration",
   "armCalibration",
 ];
 
@@ -203,7 +203,6 @@ export const defaultWorkspaceAutomaticLayout: PageLayout = freezeLayout({
     { id: "cycleLife", size: "2x1", visible: true },
     { id: "policyRules", size: "2x2", visible: true },
     { id: "motionLibrary", size: "2x2", visible: true },
-    { id: "shapeCalibration", size: "2x2", visible: true },
     { id: "armCalibration", size: "2x2", visible: true },
   ],
 });

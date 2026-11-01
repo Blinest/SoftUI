@@ -220,7 +220,7 @@ function mm(value: number | null | undefined, digits = 3): string {
   return value != null && Number.isFinite(value) ? value.toFixed(digits) : "";
 }
 
-export interface ShapeCalibrationCardProps {
+export interface ShapeCalibrationPanelProps {
   deviceId: string;
   /** 记录的臂体初态（六路电机位置 mm）；相对下发模式必需 ✓ */
   initialState: number[] | null;
@@ -231,13 +231,13 @@ export interface ShapeCalibrationCardProps {
   onNotify: (message: string, tone?: "ok" | "warn" | "error") => void;
 }
 
-export function ShapeCalibrationCard({
+export function ShapeCalibrationPanel({
   deviceId,
   initialState,
   ensureMotion,
   onCommandedTargets,
   onNotify,
-}: ShapeCalibrationCardProps) {
+}: ShapeCalibrationPanelProps) {
   const [angleDeg, setAngleDeg] = useState(30);
   const [timeoutMs, setTimeoutMs] = useState(12_000);
   const [rows, setRows] = useState<CalibrationRow[]>(() =>
@@ -722,7 +722,7 @@ export function ShapeCalibrationCard({
   }, [measuredRows]);
 
   return (
-    <div className="admin-card-content shape-calib">
+    <div className="shape-calib">
       <div className="workspace-form-grid shape-calib-controls">
         <label className="workspace-field">
           <span>目标弯曲角(°)</span>

@@ -38,7 +38,7 @@ import { WorkspaceCard } from "../components/WorkspaceCard";
 import { ModelLibraryDialog } from "../components/ModelLibraryDialog";
 import { PolicyRulesCard } from "./PolicyRulesCard";
 import { MotionLibraryCard } from "./MotionLibraryCard";
-import { ShapeCalibrationCard, ARM_LENGTH_MM } from "./ShapeCalibrationCard";
+import { ARM_LENGTH_MM } from "./ShapeCalibrationCard";
 import { physicalTipToModelMm, modelKappaToPhysical } from "../robot/frameCalibration";
 import { useDisplacementGain } from "../robot/displacementGain";
 import { ArmCalibrationCard } from "./ArmCalibrationCard";
@@ -3786,21 +3786,13 @@ export function WorkspacePage({
       </div>
             </>
           );
-        case "shapeCalibration":
-          return (
-            <ShapeCalibrationCard
-              deviceId={snapshot.live.selectedDeviceId}
-              initialState={precalibration?.values ?? null}
-              ensureMotion={requireSystemEnabled}
-              onCommandedTargets={applyCommandedTargets}
-              onNotify={notifyCommand}
-            />
-          );
         case "armCalibration":
           return (
             <ArmCalibrationCard
               deviceId={snapshot.live.selectedDeviceId}
               initialState={precalibration?.values ?? null}
+              ensureMotion={requireSystemEnabled}
+              onCommandedTargets={applyCommandedTargets}
               onNotify={notifyCommand}
             />
           );

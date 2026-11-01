@@ -1,6 +1,6 @@
 import {
 
-  Activity, Crosshair, GitBranch, Route, Ruler, Save, SlidersHorizontal, Table2,
+  Activity, GitBranch, Route, Ruler, Save, SlidersHorizontal, Table2,
 
 } from "lucide-react";
 
@@ -38,9 +38,7 @@ export const automaticCardRegistry: Record<AutomaticCardId, WorkspaceCardMeta> =
 
   motionLibrary: { title: "动作库", icon: Route },
 
-  shapeCalibration: { title: "典型臂形标定", icon: Ruler },
-
-  armCalibration: { title: "臂体标定", icon: Crosshair },
+  armCalibration: { title: "臂体标定", icon: Ruler },
 
 };
 

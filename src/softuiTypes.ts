@@ -30,9 +30,9 @@ export interface CardPlacement {
 /** 布局数据结构版本。卡片集合有增删时递增，见 state/layoutStore.ts。 */
 /**
  * 布局数据结构版本（**卡片集合有增减时必须递增** ✓）
- * v5 → v6：移除「驱动丝识别」卡片 ✓
+ * v6 → v7：合并标定卡片，只保留「臂体标定」 ✓
  */
-export type LayoutSchemaVersion = 6;
+export type LayoutSchemaVersion = 7;
 
 export interface PageLayout {
   schemaVersion: LayoutSchemaVersion;
@@ -76,9 +76,7 @@ export type AutomaticCardId =
   | "policyRules"
   /** 动作库：拖动记录末端点 → 存成动作 ✓ */
   | "motionLibrary"
-  /** 典型臂形标定：把臂驱动到已知名义形状，人工量角校验模型 ✓ */
-  | "shapeCalibration"
-  /** 臂体标定：手动摆姿态 → 记录末端位姿 / 曲率 + 目测角度 ✓ */
+  /** 臂体标定：典型臂形标定 + 手动姿态记录 ✓ */
   | "armCalibration";
 
 export type PageKey =
