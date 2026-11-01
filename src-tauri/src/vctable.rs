@@ -15,8 +15,6 @@
 
 use serde::Serialize;
 
-const KTB_STRIDE: usize = 12;
-const PTB_STRIDE: usize = 12;
 /// 位移分量数 ✓
 const N_TENDONS: usize = 6;
 
@@ -57,6 +55,9 @@ pub struct VcMeta {
     pub n: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tau_max: Option<f64>,
+    /// 生成端声明的 κ 峰值（`META.curvature.kappa_norm_max`，1/m）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kappa_norm_max: Option<f64>,
 }
 
 /// **新格式查表** ✓ —— 按末端位置找最近样本 ✓。
@@ -75,20 +76,15 @@ impl VcTable {
         kkb: Option<&[u8]>,
         meta_raw: Option<&[u8]>,
     ) -> Result<Self, String> {
-        let kappa_force: Vec<[f32; KTB_STRIDE]> = read_rows(ktb)?;
-        let pose: Vec<[f32; PTB_STRIDE]> = read_rows(ptb)?;
+        let (n, tau_rows, dl_rows) = read_tau_dl(ktb)?;
+        let (pose_n, tip_rows, rot_rows) = read_tip_pose(ptb)?;
 
-        if kappa_force.len() != pose.len() {
-            return Err(format!(
-                "行数不一致：KTB1={} PTB1={}",
-                kappa_force.len(),
-                pose.len()
-            ));
+        if n != pose_n {
+            return Err(format!("行数不一致：KTB1={n} PTB1={pose_n}"));
         }
-        if kappa_force.is_empty() {
+        if n == 0 {
             return Err("表是空的".to_string());
         }
-        let n = kappa_force.len();
 
         // 弧长 / 曲率是**每样本一条曲线** ✓，所以按 n 分组 ✓
         let s_rows: Vec<Vec<f32>> = ksb
@@ -102,20 +98,11 @@ impl VcTable {
 
         let mut samples = Vec::with_capacity(n);
         for index in 0..n {
-            let kt = kappa_force[index];
-            let pp = pose[index];
-            let mut tau = [0.0_f32; N_TENDONS];
-            let mut dl_mm = [0.0_f32; N_TENDONS];
-            tau.copy_from_slice(&kt[0..N_TENDONS]);
-            dl_mm.copy_from_slice(&kt[N_TENDONS..KTB_STRIDE]);
-
             samples.push(VcSample {
-                tau,
-                dl_mm,
-                tip_m: [pp[0], pp[1], pp[2]],
-                rot: [
-                    pp[3], pp[4], pp[5], pp[6], pp[7], pp[8], pp[9], pp[10], pp[11],
-                ],
+                tau: tau_rows[index],
+                dl_mm: dl_rows[index],
+                tip_m: tip_rows[index],
+                rot: rot_rows[index],
                 s_m: s_rows[index].clone(),
                 kappa: kappa_rows[index].clone(),
             });
@@ -126,8 +113,12 @@ impl VcTable {
             .map(|value| VcMeta {
                 n,
                 tau_max: value.get("tau_max").and_then(|item| item.as_f64()),
+                kappa_norm_max: value
+                    .get("curvature")
+                    .and_then(|item| item.get("kappa_norm_max"))
+                    .and_then(|item| item.as_f64()),
             })
-            .unwrap_or(VcMeta { n, tau_max: None });
+            .unwrap_or(VcMeta { n, tau_max: None, kappa_norm_max: None });
 
         Ok(Self { samples, meta })
     }
@@ -147,6 +138,67 @@ impl VcTable {
 
     pub fn meta(&self) -> &VcMeta {
         &self.meta
+    }
+
+    /// **κ 表的标量上限**（1/m）—— 整张表里最大的单节点 |κ|。
+    ///
+    /// 新格式模型没有 `K40/K60` 老表 ✗；原来 UI 的“运动范围上限”是从老表算的，
+    /// 所以换成新模型（峰值 9.26）后拖动上限还停在旧臂的 ~1.9 ✗ → 手感完全没变 ✗。
+    pub fn kappa_limit_per_m(&self) -> f64 {
+        // 生成端声明的峰值优先（更保守，且和 META 一致）
+        if let Some(declared) = self.meta.kappa_norm_max {
+            if declared > 0.0 && declared.is_finite() {
+                return declared;
+            }
+        }
+        self.samples
+            .iter()
+            .flat_map(|sample| sample.kappa.chunks_exact(3))
+            .map(|chunk| ((chunk[0] * chunk[0] + chunk[1] * chunk[1]) as f64).sqrt())
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// 8 方向上限：按每个样本的**净 κ 方向**分扇区，取该扇区内最大 |κ|；空扇区用标量补。
+    pub fn kappa_limit_by_direction(&self) -> [f64; 8] {
+        let two_pi = std::f64::consts::TAU;
+        let mut out = [0.0_f64; 8];
+        for sample in &self.samples {
+            let nodes = sample.kappa.len() / 3;
+            if nodes == 0 {
+                continue;
+            }
+            let mut vx = 0.0_f64;
+            let mut vy = 0.0_f64;
+            let mut max_k = 0.0_f64;
+            for index in 0..nodes {
+                let kx = sample.kappa[index * 3] as f64;
+                let ky = sample.kappa[index * 3 + 1] as f64;
+                vx += kx;
+                vy += ky;
+                max_k = max_k.max((kx * kx + ky * ky).sqrt());
+            }
+            if vx.abs() < 1e-9 && vy.abs() < 1e-9 {
+                continue;
+            }
+            // 与前端拖动同一个方向约定：φ = atan2(−kx, ky)
+            let mut phi = (-vx).atan2(vy) % two_pi;
+            if phi < 0.0 {
+                phi += two_pi;
+            }
+            let slot = ((phi / (two_pi / 8.0)).floor() as usize) % 8;
+            out[slot] = out[slot].max(max_k);
+        }
+        let scalar = self.kappa_limit_per_m();
+        for value in out.iter_mut() {
+            if *value <= 0.0 {
+                *value = scalar;
+            }
+            // 单节点的扇区峰值可能比生成端声明的峰值还大 ✗ —— 统一压到标量上限 ✓
+            if scalar > 0.0 && *value > scalar {
+                *value = scalar;
+            }
+        }
+        out
     }
 
     /// **按 6 路位移找最近样本** ✓ —— 3D「使能/实时跟随」用它 ✓。
@@ -374,27 +426,67 @@ impl VcTable {
     }
 }
 
-/// 读"`u32 n` + `n × N × f32`"✓。
-fn read_rows<const N: usize>(bytes: &[u8]) -> Result<Vec<[f32; N]>, String> {
+/// 读 `KTB1`：`u32 n` + `tau(n×6)` + `dL(n×6)`（**按字段分块**存储 ✓）。
+///
+/// ⚠ 这里踩过一个大坑 ✗：段 id 叫 `KTB1`、每样本恰好 12 个数，直觉是"每行 12 个"✗；
+/// 实际导出器是按字段连续写的 ✓（`META.layout` 就写着 `n|tau(n,6)|dL(n,6)`）。
+/// 按"每行 12 个"去读会把 tau 和 dL 拆错 ✓ —— 现象：
+///   · `tau` 出现负值（丝只能拉、不能推）✓；
+///   · `tip` 取到的是旋转矩阵的分量，大半变成单位向量 ✓；
+///   · 按 tip 查表 / 按 dL 反查全部错位 ✓ → 形状、方向、角度全不对 ✓。
+fn read_tau_dl(bytes: &[u8]) -> Result<(usize, Vec<[f32; 6]>, Vec<[f32; 6]>), String> {
     if bytes.len() < 4 {
-        return Err("段太短".to_string());
+        return Err("KTB1 段太短".to_string());
     }
     let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-    let need = 4 + n * N * 4;
+    let need = 4 + n * 12 * 4;
     if bytes.len() < need {
-        return Err(format!("段长度不足：需要 {need}，实际 {}", bytes.len()));
+        return Err(format!("KTB1 段长度不足：需要 {need}，实际 {}", bytes.len()));
     }
-    let mut rows = Vec::with_capacity(n);
+    let mut tau_rows = Vec::with_capacity(n);
+    let mut dl_rows = Vec::with_capacity(n);
     for index in 0..n {
-        let mut row = [0.0_f32; N];
-        let base = 4 + index * N * 4;
-        for slot in 0..N {
-            let offset = base + slot * 4;
-            row[slot] = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let mut tau = [0.0_f32; 6];
+        let mut dl = [0.0_f32; 6];
+        for slot in 0..6 {
+            let tau_offset = 4 + (index * 6 + slot) * 4;
+            tau[slot] = f32::from_le_bytes(bytes[tau_offset..tau_offset + 4].try_into().unwrap());
+            let dl_offset = 4 + (n * 6 + index * 6 + slot) * 4;
+            dl[slot] = f32::from_le_bytes(bytes[dl_offset..dl_offset + 4].try_into().unwrap());
         }
-        rows.push(row);
+        tau_rows.push(tau);
+        dl_rows.push(dl);
     }
-    Ok(rows)
+    Ok((n, tau_rows, dl_rows))
+}
+
+/// 读 `PTB1`：`u32 n` + `p_tip(n×3)` + `R_tip(n×9)`（同样是按字段分块 ✓）。
+fn read_tip_pose(bytes: &[u8]) -> Result<(usize, Vec<[f32; 3]>, Vec<[f32; 9]>), String> {
+    if bytes.len() < 4 {
+        return Err("PTB1 段太短".to_string());
+    }
+    let n = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let need = 4 + n * 12 * 4;
+    if bytes.len() < need {
+        return Err(format!("PTB1 段长度不足：需要 {need}，实际 {}", bytes.len()));
+    }
+    let mut tips = Vec::with_capacity(n);
+    let mut rotations = Vec::with_capacity(n);
+    for index in 0..n {
+        let mut tip = [0.0_f32; 3];
+        let mut rot = [0.0_f32; 9];
+        for slot in 0..3 {
+            let offset = 4 + (index * 3 + slot) * 4;
+            tip[slot] = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        }
+        for slot in 0..9 {
+            let offset = 4 + (n * 3 + index * 9 + slot) * 4;
+            rot[slot] = f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        }
+        tips.push(tip);
+        rotations.push(rot);
+    }
+    Ok((n, tips, rotations))
 }
 
 /// 读"`u32 n` + `u32 nodes` + `n × (nodes × comps) × f32`"✓。

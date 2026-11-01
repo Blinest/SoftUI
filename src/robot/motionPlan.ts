@@ -4,6 +4,7 @@ import {
   modelCurvatureLimitForDirection,
   type CurvatureDistribution,
 } from "../dynamics/svcModel";
+
 import { tipPoseOfDistribution } from "./pose3d";
 import type { MotionPoint } from "./motionDraft";
 
@@ -197,10 +198,10 @@ function row(values: number[]) {
  * 距离 L、名义速度 v_plan、实际 v_real → 行程完成度 ≈ v_real / v_plan ✓，
  * 剩余量在结束时才靠"钉终点"补，过程中必然持续落后 ✗。
  *
- * 目前留 20% 余量取 4 mm/s ✓（电机 5 mm/s 时仍有裕度 ✓）。
- * 想跑快只有两条路：① 继续提高驱动器速度 ② 接受动作时长变长 ✓。
+ * 目前取 **10 mm/s**（现场反馈原 4 mm/s 太慢）。若发现臂体跟不上（动作结束还在追），
+ * 说明固件侧速度上限更低，把这里降回 5~6 即可。
  */
-export const DEFAULT_PLAN_SPEED_MM_PER_S = 4;
+export const DEFAULT_PLAN_SPEED_MM_PER_S = 10;
 
 export interface ModelFeasibility extends PlanResult {
   modelId: string;
@@ -300,7 +301,6 @@ export function planMotion(points: MotionPoint[], options: PlanOptions): PlanRes
       limitsPerM,
     } as never);
     const tip = tipPoseOfDistribution((solved as { distribution: CurvatureDistribution }).distribution.segments);
-    // 和 IK 的 `reached` 同口径：都是 three 系 ✓（y/z 互换 ✓）
     const tipMm: [number, number, number] = mapSvcPointToThreeMm(tip.positionM);
     const error = Math.hypot(tipMm[0] - target[0], tipMm[1] - target[1], tipMm[2] - target[2]);
 

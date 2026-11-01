@@ -38,8 +38,10 @@ import { WorkspaceCard } from "../components/WorkspaceCard";
 import { ModelLibraryDialog } from "../components/ModelLibraryDialog";
 import { PolicyRulesCard } from "./PolicyRulesCard";
 import { MotionLibraryCard } from "./MotionLibraryCard";
-import { ShapeCalibrationCard } from "./ShapeCalibrationCard";
-import { TendonIdentifyCard } from "./TendonIdentifyCard";
+import { ShapeCalibrationCard, ARM_LENGTH_MM } from "./ShapeCalibrationCard";
+import { physicalTipToModelMm, modelKappaToPhysical } from "../robot/frameCalibration";
+import { useDisplacementGain } from "../robot/displacementGain";
+import { ArmCalibrationCard } from "./ArmCalibrationCard";
 import {
   getCurrentActionName,
   getCurrentPlaybackTimes,
@@ -82,11 +84,12 @@ import {
   type PolicyStoreLike,
   type TensionHistory,
 } from "../robot/policyEngine";
-import { directHome, directMultiMotor } from "../robot/directDispatch";
+import { directHome, directMotorCommand, directMultiMotor } from "../robot/directDispatch";
 import { clearLocalTable, ensureLocalTable, hasLocalTable, lookupLocal } from "../robot/localTable";
 import {
   clearPrecalibration,
   fetchPrecalibrationRemote,
+  formatRecordedAt,
   readPrecalibrationLocal,
   savePrecalibration,
   type Precalibration,
@@ -330,7 +333,20 @@ export function WorkspacePage({
     velocityMmPerSec: 2,
     accelerationMmPerSec2: 3,
   });
+  /**
+   * 电机输入框的**原始字符串** ✓ —— 不能直接用 number 状态 ✓。
+   *
+   * 为什么 ✗：`<input type="number">` 在输入 "-" 或 "1." 这种**中间态**时
+   * `event.target.value` 是空串 ✓，再 `Number("")` 变成 0 ✗ → 负号/小数点刚敲进去就被吃掉 ✗
+   * （现场表现：负位移根本输不进去 ✓）。这里保留字符串，提交时才解析 ✓。
+   */
+  const [motorText, setMotorText] = useState({ position: "0", velocity: "2", acceleration: "3" });
   const [sensorDraft, setSensorDraft] = useState({ sensorId: 1, calibrationValue: 0 });
+
+  /** 模型位移 ↔ 实机电机位移的增益（标定：实际曲率偏大就把 k 调大） */
+  const [displacementGain] = useDisplacementGain();
+  const displacementGainRef = useRef(displacementGain);
+  displacementGainRef.current = displacementGain;
 
   /**
    * 「启动控制系统」的驱动方。
@@ -393,17 +409,41 @@ export function WorkspacePage({
         ? false
         : isSystemEnabled;
 
+  /**
+   * **实测电机位置 → 模型 dL 的口径** ✓（与拖动 / 臂体标定一致）。
+   *
+   * 实机每根丝的零点不同 ✗：电机 = 初态 + (dL_straight − dL) ✓，
+   * 所以显示/反查前必须反推 `dL = dL_straight − (实测 − 初态)` ✓。
+   * 不换算的话，3D 里的"实际形状"就是错的 ✗ → 拖动闭环会追着错形状跑 ✗。
+   */
+  const modelInitRef = useRef<number[] | null>(null);
+  const straightDlRef = useRef<number[] | null>(null);
+  const modelFrame = useMemo(() => {
+    if (!latestFrame) return latestFrame;
+    const init = modelInitRef.current;
+    const straight = straightDlRef.current;
+    if (!init || init.length < 6 || !straight || straight.length < 6) return latestFrame;
+    return {
+      ...latestFrame,
+      motors: latestFrame.motors.map((motor, index) => ({
+        ...motor,
+        // 电机 + = 拉紧；k 为位移增益（实际曲率偏大时 k>1，反查要乘回去）
+        positionMm: (straight[index] ?? 0) - displacementGain * (motor.positionMm - (init[index] ?? 0)),
+      })),
+    };
+  }, [latestFrame, displacementGain]);
+
   // 模型推导（SDM）：**兜底用** —— 查表结果没回来时保证显示连续、不跳变。
   const sdmDistribution = useMemo(
-    () => curvatureDistributionFromSnapshot(latestFrame, { basisSegmentCount: 12 }),
-    [latestFrame],
+    () => curvatureDistributionFromSnapshot(modelFrame, { basisSegmentCount: 12 }),
+    [modelFrame],
   );
 
   /** 表驱动形状（12 节点 κ + 段长）。为主，因为它和实机同源。 */
   const [liveTableShape, setLiveTableShape] = useState<TableShape | null>(null);
 
   useEffect(() => {
-    const frame = latestFrame;
+    const frame = modelFrame;
     if (!frame || frame.motors.length === 0) {
       setLiveTableShape(null);
       return;
@@ -422,7 +462,7 @@ export function WorkspacePage({
     return () => {
       cancelled = true;
     };
-  }, [latestFrame]);
+  }, [modelFrame]);
 
   /** 表 → 12 段曲率分布（段长由后端按模型给出，不写死）。 */
   const liveTableDistribution = useMemo<CurvatureDistribution | null>(() => {
@@ -434,8 +474,11 @@ export function WorkspacePage({
       basisSegmentCount: count,
       source: "deviceCurvature",
       segments: Array.from({ length: count }, (_, index) => {
-        const kxPerM = liveTableShape.kxPerM[index] ?? 0;
-        const kyPerM = liveTableShape.kyPerM[index] ?? 0;
+        // 模型坐标系 → 实机全局（绕 z 旋转 90°，见 frameCalibration.ts）
+        const [kxPerM, kyPerM] = modelKappaToPhysical(
+          liveTableShape.kxPerM[index] ?? 0,
+          liveTableShape.kyPerM[index] ?? 0,
+        );
         return {
           index,
           sStartMm: index * segmentMm,
@@ -1463,6 +1506,12 @@ export function WorkspacePage({
    * 行为变化：臂体会**平滑地追着手指走** ✓，而不是瞬间跳到位 ✓；
    * 手指停住时目标不动，臂体继续按 2mm/s 逼近，直到到达 ✓。
    */
+  /**
+   * 拖动跟随的**末端推进速度上限**（mm/s）。
+   *
+   * 保持 2mm/s：不是速度问题 ✗ —— 现场反馈"目标值一直变"才是抖动根源 ✓，
+   * 已在目标侧加死区/固定基准（见 handleDragTarget 与 CurvatureDragPreview）。
+   */
   const DRAG_FOLLOW_MAX_MM_PER_S = 2;
   const DRAG_FOLLOW_TICK_MS = 100;
 
@@ -1571,17 +1620,22 @@ export function WorkspacePage({
       totalLengthMm: tableShape.totalLengthMm,
       basisSegmentCount: tableShape.segmentCount,
       source: "deviceCurvature",
-      segments: tableShape.kxPerM.map((kx, index) => ({
-        index,
-        sStartMm: index * segLen,
-        sEndMm: (index + 1) * segLen,
-        sMidMm: (index + 0.5) * segLen,
-        lengthMm: segLen,
-        kxPerM: kx,
-        kyPerM: tableShape.kyPerM[index] ?? 0,
-        kappaAbsPerM: tableShape.kappaAbsPerM[index] ?? 0,
-        phiRad: tableShape.phiRad[index] ?? 0,
-      })),
+      segments: tableShape.kxPerM.map((kx, index) => {
+        // 和实际形状用同一个坐标系（模型 → 实机绕 z 旋转 90°），
+        // 否则「位姿目标」的预览会和监控区的实际臂形差 90°（现场不一致的来源）。
+        const [kxPerM, kyPerM] = modelKappaToPhysical(kx, tableShape.kyPerM[index] ?? 0);
+        return {
+          index,
+          sStartMm: index * segLen,
+          sEndMm: (index + 1) * segLen,
+          sMidMm: (index + 0.5) * segLen,
+          lengthMm: segLen,
+          kxPerM,
+          kyPerM,
+          kappaAbsPerM: Math.hypot(kxPerM, kyPerM),
+          phiRad: Math.atan2(kyPerM, kxPerM),
+        };
+      }),
     };
   }, [tableShape, tipTargetActive]);
 
@@ -1676,11 +1730,14 @@ export function WorkspacePage({
     motionAllowed ? undefined : `服务器未同步使能：点击「${label}」不会下发，请先到「控制 → 系统操作」启动控制系统`;
 
   /**
-   * **预校准** ✓ —— 记住"臂体伸直"的六路位移 ✓，之后一键回到该姿态 ✓。
+   * **预校准** ✓ —— 记住"臂体初态"的六路位移 ✓，之后一键回到该姿态 ✓。
    *
    * 与「一键归零」的区别：归零是回到**电机自己的零点** ✓，
-   * 而伸直位置受装配 / 丝长 / 预紧影响 ✓，通常和电机零点差几毫米 ✓ →
-   * 操作员真正要的是"回到我确认过伸直的那个位置" ✓。
+   * 而初态位置受装配 / 丝长 / 预紧影响 ✓，通常和电机零点差几毫米 ✓ →
+   * 操作员真正要的是"回到我确认过的那个初态" ✓。
+   *
+   * 初态**只记录一次** ✓：记录后锁定 ✓，要改必须走「重新记录」并确认 ✓
+   * （它是回位目标 ✓，随手改掉会让预校准把臂体带回一个没人确认过的姿态 ✗）。
    */
   const [precalibration, setPrecalibration] = useState<Precalibration | null>(() =>
     readPrecalibrationLocal(),
@@ -1693,7 +1750,29 @@ export function WorkspacePage({
     });
   }, [precalibration]);
 
-  /** **记录当前为伸直位** ✓ —— 用**实测**位置 ✓，不是下发值 ✓ */
+  /** 初态 ← 页面状态：让"实测 → 模型 dL"的换算（显示 / 拖动 / 记录）共用同一口径。 */
+  useEffect(() => {
+    modelInitRef.current = precalibration?.values ?? null;
+  }, [precalibration]);
+
+  /** 伸直位的 6 路 dL：只查一次（有初态后查；查不到就保持 null，退回旧口径）。 */
+  useEffect(() => {
+    if (!precalibration?.values) return;
+    const deviceId = snapshot.live.selectedDeviceId;
+    if (!deviceId) return;
+    let cancelled = false;
+    void previewTipPoseCommand([0, 0, ARM_LENGTH_MM], [0, 0, 0], { deviceId })
+      .then((preview) => {
+        const values = preview.targetDisplacementMm.slice(0, 6);
+        if (!cancelled && values.length >= 6) straightDlRef.current = values;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [precalibration, snapshot.live.selectedDeviceId]);
+
+  /** **记录当前为臂体初态** ✓ —— 用**实测**位置 ✓，不是下发值 ✓ */
   const recordPrecalibration = useCallback(() => {
     const motors = [...(snapshotRef.current.live.latest?.motors ?? [])]
       .sort((left, right) => left.id - right.id)
@@ -1705,18 +1784,78 @@ export function WorkspacePage({
       });
       return;
     }
-    const entry = savePrecalibration(motors.map((motor) => motor.positionMm));
+    const current = motors.map((motor) => motor.positionMm);
+    const previous = precalibration;
+    /**
+     * **只更新"我改过的那几路"** ✓ —— 重新记录时不能把六路一起覆盖 ✗。
+     *
+     * 为什么 ✗：操作员通常只调了一根丝 ✓，其余五路可能因为回差/轻微漂移
+     * 和记录值差零点几毫米 ✗ —— 一起覆盖等于把没动过的电机也"改"了 ✗。
+     * 所以逐路比较：变化超过阈值才写入 ✓，其余保持原值 ✓。
+     */
+    const CHANGE_EPS_MM = 0.2;
+    let values = current;
+    let changedMotors: number[] = [];
+    if (previous && previous.values.length >= 6) {
+      values = previous.values.map((oldValue, index) =>
+        Math.abs(current[index] - oldValue) > CHANGE_EPS_MM ? current[index] : oldValue,
+      );
+      changedMotors = values
+        .map((value, index) => (Math.abs(value - previous.values[index]) > 1e-9 ? index + 1 : 0))
+        .filter((motor) => motor > 0);
+      if (changedMotors.length === 0) {
+        setCommandStatus({
+          tone: "warn",
+          message:
+            `重新记录：六路实测位置与已记录初态相差都 < ${CHANGE_EPS_MM} mm，初态没有变化（未改动）`,
+        });
+        return;
+      }
+    }
+    const entry = savePrecalibration(values);
     setPrecalibration(entry);
+    const allZero = entry.values.every((value) => Math.abs(value) < 0.05);
+    const changedText = changedMotors.length > 0
+      ? `，只更新了电机 ${changedMotors.join(" / ")}（其余保持原值）`
+      : "";
     setCommandStatus({
-      tone: "ok",
-      message: `已记录伸直位：${entry.values.map((value) => value.toFixed(2)).join(" / ")} mm`,
+      tone: allZero ? "warn" : "ok",
+      message:
+        `已记录臂体初态（${formatRecordedAt(entry.recordedAt)}）：` +
+        entry.values.map((value) => value.toFixed(2)).join(" / ") + " mm" +
+        changedText +
+        (allZero ? " —— 六路都是 0.00，可能设备没有上报真实电机位置，先确认再用于预校准" : ""),
     });
-  }, []);
+  }, [precalibration]);
+
+  /**
+   * 记录 / **重新记录**臂体初态。
+   *
+   * 初态是"回位目标" ✓：记录过就锁定 ✓，避免被随手改掉 ✗。
+   * 重新记录时**只更新改动过的那几路** ✓ —— 与实测位置相差 < 0.2mm 的电机保持原值 ✓
+   * （操作员通常只调一根丝 ✓，其余五路的回差/漂移不该被一起写进去 ✗）。
+   * 想整体重置成当前位姿 → 先「清除」再记录 ✓。
+   */
+  const recordInitialState = useCallback(() => {
+    if (precalibration) {
+      const ok = window.confirm(
+        "臂体初态已经记录过：\n" +
+        `· 记录时间：${formatRecordedAt(precalibration.recordedAt)}\n` +
+        `· 初态位移：${precalibration.values.map((value) => value.toFixed(2)).join(" / ")} mm\n\n` +
+        "重新记录**只更新与当前实测位置相差 > 0.2 mm 的那几路**，其余保持原值。\n" +
+        "合并后的结果会成为「预校准」的回位目标。\n" +
+        "请确认臂体运动范围内无障碍。\n\n" +
+        "确定要重新记录吗？",
+      );
+      if (!ok) return;
+    }
+    recordPrecalibration();
+  }, [precalibration, recordPrecalibration]);
 
   /** **执行预校准** ✓ —— 把六路位移下发回记录值 ✓（绝对位移，幂等 ✓）*/
   const runPrecalibration = useCallback(() => {
     if (!precalibration) {
-      setCommandStatus({ tone: "warn", message: "还没有记录伸直位：先把臂体调到伸直再点「记录伸直位」" });
+      setCommandStatus({ tone: "warn", message: "还没有记录臂体初态：先把臂体摆到初态，再点「记录臂体初态」" });
       return;
     }
     if (!requireSystemEnabled("预校准")) return;
@@ -1728,7 +1867,8 @@ export function WorkspacePage({
       applyCommandedTargets(values);
       setCommandStatus({
         tone: "ok",
-        message: `预校准：已直连串口下发（回到 ${precalibration.recordedAt.slice(0, 19).replace("T", " ")} 记录的伸直位）`,
+        message: `预校准：已直连串口下发（回到 ${formatRecordedAt(precalibration.recordedAt)} 记录的臂体初态：` +
+          `${values.map((value) => value.toFixed(2)).join(" / ")} mm）`,
       });
       void invoke("control_frame_log", {
         request: {
@@ -1744,7 +1884,7 @@ export function WorkspacePage({
       try {
         await sendMultiMotorCommand(values, { deviceId: snapshot.live.selectedDeviceId });
         applyCommandedTargets(values);
-        setCommandStatus({ tone: "ok", message: "预校准：已下发（经服务器中继）" });
+        setCommandStatus({ tone: "ok", message: `预校准：已下发（经服务器中继）${values.map((value) => value.toFixed(2)).join(" / ")} mm` });
       } catch (error) {
         setCommandStatus({ tone: "error", message: `预校准失败：${errorText(error)}` });
       }
@@ -1783,6 +1923,21 @@ export function WorkspacePage({
    * 而看数据的人可能在另一台机器上（实测就是"拖动端看得见、观看端永远是 --"）。
    * 走既有 UI 同步槽位，后端单槽转发 —— 所以它确实是"服务器传过来的"。
    */
+  /**
+   * **未到位监测** —— 目标下发后，如果某一路电机"停住了但离目标还差 >1mm"，
+   * 持续 3 秒以上就在顶层提醒一次 ✓（卡滞 / 限位 / 地址错 / 没使能）。
+   *
+   * 为什么不用 `motor.targetPositionMm` ✗：那是后端**占位值**（位置 +1.5mm）✓，
+   * 真正"我们发下去的目标"是 `commandedTargets` ✓。
+   */
+  const targetWatchRef = useRef<{
+    atMs: number;
+    targets: number[];
+    sinceMs: Map<number, number>;
+    alerted: Set<number>;
+  } | null>(null);
+  const arrivalAlertRef = useRef<string | null>(null);
+
   const applyCommandedTargets = useCallback(
     (targets: number[] | null) => {
       // 只有"真是 6 个数的数组"才算拿到了目标值；其余（undefined / 对象 / 空）一律当没有。
@@ -1790,6 +1945,16 @@ export function WorkspacePage({
       // "还没下发过"在界面上长得完全一样，只看到一个 -- 分不出是哪一边空。
       const ok = Array.isArray(targets) && targets.length > 0;
       if (ok) localTargetsRef.current = targets as number[];
+      // 新目标 → 重置未到位计时（旧目标的计时不能算到新目标头上 ✓）
+      targetWatchRef.current = ok
+        ? {
+            atMs: Date.now(),
+            targets: (targets as number[]).slice(0, 6),
+            sinceMs: new Map(),
+            alerted: new Set(),
+          }
+        : null;
+      arrivalAlertRef.current = null;
       setLastTargetsHint(
         ok ? `${targets!.length} 项` : `无（${targets === undefined ? "undefined" : Array.isArray(targets) ? "空数组" : typeof targets}）`,
       );
@@ -1798,6 +1963,79 @@ export function WorkspacePage({
     },
     [publishUi],
   );
+
+  /** 每帧检查一次"停住但没到位"；同一路只提醒一次，全部到位后自动收掉。 */
+  useEffect(() => {
+    const watch = targetWatchRef.current;
+    const frame = latestFrame;
+    if (!watch || !frame || frame.motors.length === 0) return;
+    const now = Date.now();
+    // 目标已经是很久以前发的（>60s）就不再追责 —— 中间可能有人手动动过电机
+    if (now - watch.atMs > 60_000) return;
+
+    let allArrived = true;
+    for (const motor of frame.motors) {
+      const target = watch.targets[motor.id - 1];
+      if (target == null || !Number.isFinite(target)) continue;
+      const gap = Math.abs(target - motor.positionMm);
+      // 还在动（速度明显）就不算"卡住"；停下后仍差 >1mm 才开始计时
+      const moving = Math.abs(motor.velocityMmPerSec) > 0.2;
+      if (gap > 1.0) {
+        allArrived = false;
+        if (!moving) {
+          if (!watch.sinceMs.has(motor.id)) watch.sinceMs.set(motor.id, now);
+          const since = watch.sinceMs.get(motor.id) as number;
+          if (!watch.alerted.has(motor.id) && now - since >= 3_000) {
+            watch.alerted.add(motor.id);
+            const willRetry = motionAllowed;
+            const message =
+              `电机 ${motor.id} 未到位：目标 ${target.toFixed(2)} mm，实际 ${motor.positionMm.toFixed(2)} mm，` +
+              `差 ${gap.toFixed(2)} mm（已停住 ${((now - since) / 1000).toFixed(0)}s）` +
+              ` —— 检查使能 / 卡滞 / 限位 / 电机地址` +
+              (willRetry ? "；已自动重发一次单电机指令" : "（未使能，未重发）");
+            arrivalAlertRef.current = message;
+            setCommandStatus({ tone: "warn", message });
+            /**
+             * **同时补发一次单电机指令** ✓ —— 多电机同步帧偶发丢失/被固件吞掉时，
+             * 单独对这一路再发一次通常就能到位 ✓（`0x10` 单电机定位，绝对目标）。
+             * 每次下发只补发一次 ✓（`alerted` 去重），不会变成无限重试 ✗；
+             * 未使能时不发 ✗（`0x10` 走的是同一套使能校验，发了也会被拒）。
+             */
+            if (motionAllowed) {
+              void invoke("send_motor_command", {
+                request: {
+                  deviceId: frame.deviceId,
+                  motorId: motor.id,
+                  positionMm: target,
+                  velocityMmPerSec: 3,
+                },
+              }).catch((error: unknown) => {
+                console.warn("[workspace] 未到位后重发单电机指令失败", error);
+              });
+            }
+          }
+        } else {
+          // 还在往目标走：清掉计时，等它停下来再判
+          watch.sinceMs.delete(motor.id);
+          watch.alerted.delete(motor.id);
+        }
+      } else {
+        watch.sinceMs.delete(motor.id);
+        watch.alerted.delete(motor.id);
+      }
+    }
+
+    // 之前报过"未到位"，现在都到位了 → 把那条提醒收掉（不覆盖别的提示）
+    if (allArrived && arrivalAlertRef.current) {
+      const previousAlert = arrivalAlertRef.current;
+      arrivalAlertRef.current = null;
+      setCommandStatus((previous) =>
+        previous?.message === previousAlert
+          ? { tone: "ok", message: "六路电机均已到达目标位置" }
+          : previous,
+      );
+    }
+  }, [latestFrame, motionAllowed]);
 
   /**
    * 清空目标：拖动目标、位姿目标、查表结果一起清掉，6 个输入框一并归零。
@@ -1849,7 +2087,37 @@ export function WorkspacePage({
    * 同时把拖动结果的**末端位姿直接写回输入框**：界面上只有一处「目标末端位姿」，
    * 不另开一行文字说明「当前来自拖动」—— 数值本身就是说明。
    */
+  /**
+   * **拖动目标死区**（mm）✓ —— 目标变化小于它就不当作新目标：
+   * 三维闭环每帧都会重新解一次，末位小数会来回抖 ✗；不去抖的话，
+   * 目标一变就重发一帧 → 电机跟着抖（现场"小数点一直跳、臂体抖动"）。
+   */
+  const DRAG_TARGET_DEADBAND_MM = 0.1;
+  const lastAcceptedDragTipRef = useRef<[number, number, number] | null>(null);
+  /** 最近一次收到拖动目标的时刻（ms）—— 超过 500ms 没新目标就认为拖动已结束 */
+  const lastDragTargetAtRef = useRef(0);
+
   const handleDragTarget = useCallback((next: CurvatureDistribution | null) => {
+    if (next) {
+      const tip = tipPoseOfDistribution(next.segments);
+      const point: [number, number, number] = [
+        tip.positionM[0] * 1000,
+        tip.positionM[1] * 1000,
+        tip.positionM[2] * 1000,
+      ];
+      const previous = lastAcceptedDragTipRef.current;
+      if (
+        previous &&
+        Math.hypot(point[0] - previous[0], point[1] - previous[1], point[2] - previous[2]) <
+          DRAG_TARGET_DEADBAND_MM
+      ) {
+        return; // 死区内：不更新目标、不重发
+      }
+      lastAcceptedDragTipRef.current = point;
+      lastDragTargetAtRef.current = Date.now();
+    } else {
+      lastAcceptedDragTipRef.current = null;
+    }
     /**
      * ⚠ **拖动时立刻清掉播放注入** ✗ ——
      * 播放结束后我们**故意保留**最后一帧（`previewOverride` ✓），
@@ -2125,15 +2393,57 @@ export function WorkspacePage({
     [publishUi],
   );
 
+  /** 远端改了电机参数时，把输入框的字符串同步过来（正在输入且数值一致时不覆盖 ✓）。 */
+  useEffect(() => {
+    setMotorText((previous) => ({
+      position:
+        Number(previous.position) === motorDraft.positionMm ? previous.position : String(motorDraft.positionMm),
+      velocity:
+        Number(previous.velocity) === motorDraft.velocityMmPerSec
+          ? previous.velocity
+          : String(motorDraft.velocityMmPerSec),
+      acceleration:
+        Number(previous.acceleration) === motorDraft.accelerationMmPerSec2
+          ? previous.acceleration
+          : String(motorDraft.accelerationMmPerSec2),
+    }));
+  }, [motorDraft.positionMm, motorDraft.velocityMmPerSec, motorDraft.accelerationMmPerSec2]);
+
+  /** 输入框 → 数值（空串 / 只有负号 / 非数字一律按 0）。 */
+  const parseMotorInput = useCallback((raw: string) => {
+    const trimmed = raw.trim();
+    const parsed = Number(trimmed);
+    return trimmed !== "" && Number.isFinite(parsed) ? parsed : 0;
+  }, []);
+
+  /** 当前输入框对应的完整命令（点「发至电机」时用它，避免依赖 state 更新时机）。 */
+  const motorCommandFromInputs = useCallback((): MotorCommandDraft => {
+    return {
+      motorId: motorDraftRef.current.motorId,
+      positionMm: clamp(parseMotorInput(motorText.position), -80, 80),
+      velocityMmPerSec: Math.max(0, parseMotorInput(motorText.velocity)),
+      accelerationMmPerSec2: Math.max(0, parseMotorInput(motorText.acceleration)),
+    };
+  }, [motorText, parseMotorInput]);
+
   const runMotorCommand = useCallback(async (command: MotorCommandDraft, message = "电机命令已发送") => {
     if (!requireSystemEnabled("电机命令")) return;
     try {
       await onSendMotor(command);
+      /**
+       * **单电机指令也要更新「目标值」** ✓ ——
+       * 取消实时跟随后，目标列不再被拖动覆盖 ✓，这里点哪一路、目标就是哪一路的位移量 ✓
+       * （其余几路保持上一次的值，不被清掉 ✗）。
+       */
+      const base = localTargetsRef.current ?? commandedTargets ?? [0, 0, 0, 0, 0, 0];
+      const next = [...base];
+      next[command.motorId - 1] = command.positionMm;
+      applyCommandedTargets(next);
       setCommandStatus({ tone: "ok", message });
     } catch (err) {
       setCommandStatus({ tone: "error", message: errorText(err) });
     }
-  }, [onSendMotor, requireSystemEnabled]);
+  }, [applyCommandedTargets, commandedTargets, onSendMotor, requireSystemEnabled]);
 
   const runWorkspaceCommand = useCallback(async (command: WorkspaceCommand, payload?: WorkspaceCommandPayload, message = "命令已发送") => {
     const motionLabel = WORKSPACE_COMMAND_LABELS[command];
@@ -2382,6 +2692,12 @@ export function WorkspacePage({
   /** 上一次**真正发出去**的末端位置（mm）✓ —— 限速推进的起点 ✓ */
   const dragSentTipRef = useRef<[number, number, number] | null>(null);
   const dragFailStreakRef = useRef(0);
+  /** 上一次真正发出去的电机目标（0.02mm 以内不重发，避免末位抖动带得电机抖） */
+  const lastSentMotorRef = useRef<number[] | null>(null);
+  /** 相对初态基准（拖动与「臂体标定」记录必须同一口径；`straightDlRef` 已在页面顶部声明）*/
+  const precalibrationRef = useRef(precalibration);
+  precalibrationRef.current = precalibration;
+  const dragOffsetWarnedRef = useRef(false);
   const dragDeviceId = snapshot.live.selectedDeviceId;
 
   useEffect(() => {
@@ -2390,6 +2706,8 @@ export function WorkspacePage({
 
   useEffect(() => {
     latestDragRef.current = followSource;
+    // 目标一变就记时间（手势 / 远端也走这条路）—— 500ms 没有新目标就当拖动结束
+    if (followSource) lastDragTargetAtRef.current = Date.now();
     // 目标清空（拖动结束 / 手势丢锁）：连已发送标记一起清掉，
     // 免得下次开跟随先把一个过期目标发出去
     if (!followSource) {
@@ -2413,6 +2731,75 @@ export function WorkspacePage({
   const motionAllowedRef = useRef(motionAllowed);
   motionAllowedRef.current = motionAllowed;
 
+  /**
+   * **第二遍：补发没动的电机** ✓
+   *
+   * 六路同步帧偶发丢帧/被固件吞掉时，只会有个别电机不动 ✗。
+   * 发完 250ms 回读实际位置，对「差 > 0.5mm」的那几路单独补发一次 0x10（单电机绝对定位）✓。
+   * 只补一次：补完还不到位就是机械/使能问题，交给「未到位」监测报 ✓。
+   */
+  const resendTimerRef = useRef<number | null>(null);
+  /** 最近一次真正发帧的时刻 —— 补发只在“已经停下来”之后做，避免拿旧目标把臂拉回去 */
+  const lastSendAtRef = useRef(0);
+  const resendMissingMotors = useCallback(async (targets: number[], deviceId?: string) => {
+    const device = deviceId ?? snapshotRef.current.live.selectedDeviceId;
+    if (!device) return;
+    const motors = [...(snapshotRef.current.live.latest?.motors ?? [])]
+      .sort((left, right) => left.id - right.id)
+      .slice(0, 6);
+    if (motors.length < 6) return;
+    for (const motor of motors) {
+      const target = targets[motor.id - 1];
+      if (target == null) continue;
+      /**
+       * **还在动就不补** ✓ —— 拖动过程中电机本来就在追目标（限速 2mm/s），
+       * 这时“差 0.3mm”是正常的 ✓，补发只会拿一个**旧目标**去拽它 ✗ → 抖动（现场）。
+       */
+      if (Math.abs(motor.velocityMmPerSec) > 0.5) continue;
+      if (Math.abs(motor.positionMm - target) <= 0.3) continue;
+      // 优先走**本机直发**（和拖动泵同一个串口通道，不会和后端中继抢串口）
+      const hex = directMotorCommand(motor.id, target, 3);
+      if (hex) {
+        void invoke("control_frame_log", {
+          request: {
+            deviceId: device,
+            kind: "motor",
+            frameHex: hex,
+            action: null,
+          },
+        }).catch(() => undefined);
+        continue;
+      }
+      try {
+        await invoke("send_motor_command", {
+          request: {
+            deviceId: device,
+            motorId: motor.id,
+            positionMm: target,
+            velocityMmPerSec: 3,
+          },
+        });
+      } catch {
+        /* 单路失败不阻断其它路 */
+      }
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 20));
+    }
+  }, []);
+
+  const scheduleResend = useCallback((targets: number[]) => {
+    if (resendTimerRef.current != null) return; // 已有一个补发在排队
+    resendTimerRef.current = window.setTimeout(() => {
+      resendTimerRef.current = null;
+      /**
+       * **拖动还在进行就不补** ✓ —— 400ms 内又发过新帧，说明目标还在变；
+       * 此时补发用的是**旧目标** ✗ → 会把臂体往回拽 → 抖动（本次现场反馈）。
+       * 等最后一帧之后 400ms 没新帧（= 真的停了），再用**最新**目标补一次 ✓。
+       */
+      if (Date.now() - lastSendAtRef.current < 400) return;
+      void resendMissingMotors(lastSentMotorRef.current ?? targets);
+    }, 400);
+  }, [resendMissingMotors]);
+
   useEffect(() => {
     if (!dragFollowEnabledRef.current || !motionAllowed || !followSource) return;
     /**
@@ -2426,6 +2813,30 @@ export function WorkspacePage({
     dragPumpingRef.current = true;
     void (async () => {
       try {
+        // 统一到“相对初态”：先查一次伸直位 dL，之后每拍把模型 dL 换算成电机目标
+        // 为什么必须统一：拖动原来直接发模型绝对 dL，而「臂体标定」按相对初态记录，
+        // 两者差一个每路恒定的零点偏移 → 记录出来的位姿和拖动目标对不上。
+        if (!straightDlRef.current) {
+          try {
+            const straightPreview = await previewTipPoseCommand(
+              [0, 0, curvatureDistributionRef.current?.totalLengthMm ?? 445.177],
+              [0, 0, 0],
+              { deviceId: dragDeviceId },
+            );
+            const straightValues = straightPreview.targetDisplacementMm.slice(0, 6);
+            if (straightValues.length >= 6) straightDlRef.current = straightValues;
+          } catch {
+            /* 查不到 → 退回旧的绝对口径（并提示一次）*/
+          }
+        }
+        const toMotorTargets = (dl: number[]): number[] | null => {
+          const init = precalibrationRef.current?.values;
+          const straight = straightDlRef.current;
+          if (!init || init.length < 6 || !straight || straight.length < 6) return null;
+          // 电机 + = **拉紧**（位置增大 = 腱变短），所以 dL = dL_straight − (电机 − 初态)
+          // 电机 + = 拉紧；k 为位移增益（实际曲率偏大 → 把下发位移按 k 缩小）
+          return dl.map((value, index) => init[index] + (straight[index] - value) / displacementGainRef.current);
+        };
         for (;;) {
           /**
            * ⚠ **每拍都要重新检查开关** ✗ —— 这是"取消跟随还在发"的根因 ✓：
@@ -2437,6 +2848,13 @@ export function WorkspacePage({
           if (!dragFollowEnabledRef.current || !motionAllowedRef.current) break;
           const target = latestDragRef.current;
           if (!target) break; // 拖动结束
+          /**
+           * **拖动结束就停泵** ✓ —— 松手后三维不再上报目标 ✗，但泵原来一直转 ✓：
+           * 每 100ms 重新查一次表、末位小数一变就重发 ✗ → 松手后目标值还在跳（本 bug ✓）。
+           * 500ms 没有新目标就当拖动结束：**先把最终目标整帧发一次**（跳过 2mm/s 限速）✓，
+           * 再退出 —— 否则限速会把最后一截目标丢掉 → 界面到了、电机还在半路（现场“卡顿/不到位”）✗。
+           */
+          const dragEnded = Date.now() - lastDragTargetAtRef.current > 500;
 
           const tip = tipPoseOfDistribution(target.segments);
           const targetMm: [number, number, number] = [
@@ -2451,7 +2869,7 @@ export function WorkspacePage({
            */
           const sent = dragSentTipRef.current;
           let nextMm = targetMm;
-          if (sent) {
+          if (sent && !dragEnded) {
             const dx = targetMm[0] - sent[0];
             const dy = targetMm[1] - sent[1];
             const dz = targetMm[2] - sent[2];
@@ -2466,35 +2884,90 @@ export function WorkspacePage({
           }
           dragSentTipRef.current = nextMm;
 
+          // 拖动目标是实机全局坐标；查表要换成模型坐标（绕 z 旋转 -90° + y 反向，见 frameCalibration.ts）
+          const modelMm = physicalTipToModelMm(nextMm);
+
           try {
             /**
              * **本地查表 + 直发** ✓ —— 拖动是 10Hz ✓，
              * 走 RPC 会被排队拖慢 ✗，本地表 + 直写串口才是 ms 级 ✓。
              * 表不可用时回退后端 ✓（口径一致 ✓）。
              */
-            const local = lookupLocal(nextMm);
+            const local = lookupLocal(modelMm);
             let sentDirect = false;
             if (local) {
-              const hex = directMultiMotor(local.displacementMm, 1);
-              if (hex) {
-                applyCommandedTargets(local.displacementMm);
-                void invoke("control_frame_log", {
-                  request: {
-                    deviceId: snapshot.live.selectedDeviceId,
-                    kind: "multi-motor",
-                    frameHex: hex,
-                    action: null,
-                  },
-                }).catch(() => undefined);
+              const motorTargets = toMotorTargets(local.displacementMm);
+              if (!motorTargets) {
+                // 没有初态/伸直位基准时，**绝不发绝对 dL** ✗ —— 模型 dL 大量为负，
+                // 电机下限会把它钳到 0 → 六路全"不到位" ✓（现场表现）。
+                if (!dragOffsetWarnedRef.current) {
+                  dragOffsetWarnedRef.current = true;
+                  setCommandStatus({
+                    tone: "warn",
+                    message:
+                      "拖动已暂停：还没有记录臂体初态（或伸直位 dL 没查到），无法把模型位移换算成电机目标。先记录初态再拖",
+                  });
+                }
+                break;
+              }
+              const sendValues = motorTargets.map((value) => Math.round(value * 100) / 100);
+              const previousSent = lastSentMotorRef.current;
+              const unchanged = previousSent != null &&
+                sendValues.every((value, index) => Math.abs(value - (previousSent[index] ?? 0)) < 0.02);
+              if (unchanged) {
+                // 电机目标没变（末位抖动）→ 不再发，避免电机跟着抖
                 sentDirect = true;
+              } else {
+                const hex = directMultiMotor(sendValues, 1);
+                if (hex) {
+                  lastSentMotorRef.current = sendValues;
+                  lastSendAtRef.current = Date.now();
+                  applyCommandedTargets(sendValues);
+                  scheduleResend(sendValues);
+                  void invoke("control_frame_log", {
+                    request: {
+                      deviceId: snapshot.live.selectedDeviceId,
+                      kind: "multi-motor",
+                      frameHex: hex,
+                      action: null,
+                    },
+                  }).catch(() => undefined);
+                sentDirect = true;
+              }
               }
             }
             if (!sentDirect) {
-              const result = await sendTipPoseCommand(nextMm, tip.rpyRad, { deviceId: dragDeviceId });
-              applyCommandedTargets(result.targetDisplacementMm ?? null);
+              // 中继也走同一个口径：先查表 → 换算成电机目标 → 直接发 6 路
+              const preview = await previewTipPoseCommand(modelMm, [0, 0, 0], { deviceId: dragDeviceId });
+              const modelDl = preview.targetDisplacementMm.slice(0, 6);
+              const motorTargets = toMotorTargets(modelDl);
+              if (!motorTargets) {
+                if (!dragOffsetWarnedRef.current) {
+                  dragOffsetWarnedRef.current = true;
+                  setCommandStatus({
+                    tone: "warn",
+                    message:
+                      "拖动已暂停：还没有记录臂体初态（或伸直位 dL 没查到），无法把模型位移换算成电机目标。先记录初态再拖",
+                  });
+                }
+                break;
+              }
+              const quantized = motorTargets.map((value) => Math.round(value * 100) / 100);
+              const previousSent = lastSentMotorRef.current;
+              const unchanged = previousSent != null &&
+                quantized.every((value, index) => Math.abs(value - (previousSent[index] ?? 0)) < 0.02);
+              if (!unchanged) {
+                await sendMultiMotorCommand(quantized, { deviceId: dragDeviceId });
+                applyCommandedTargets(quantized);
+                lastSentMotorRef.current = quantized;
+                lastSendAtRef.current = Date.now();
+                scheduleResend(quantized);
+              }
             }
             dragFailStreakRef.current = 0;
             setDragFollowState((prev) => ({ kind: "sending", sent: prev.sent + 1 }));
+            // 松手后的最后一帧已经按完整目标发了 → 退出泵（补发交给 scheduleResend）
+            if (dragEnded) break;
           } catch (err) {
             dragFailStreakRef.current += 1;
             setDragFollowState((prev) => ({
@@ -2520,7 +2993,7 @@ export function WorkspacePage({
         dragSentTipRef.current = null;   // **停止后清限速起点** ✓（下次拖动重新起算 ✓）
       }
     })();
-  }, [followSource, motionAllowed, dragDeviceId, sendTipPoseCommand, applyCommandedTargets]);
+  }, [followSource, motionAllowed, dragDeviceId, sendTipPoseCommand, applyCommandedTargets, scheduleResend]);
 
   // 循环寿命检测：压力反馈跨过阈值就换向，一个来回计一次。
   useEffect(() => {
@@ -2990,25 +3463,60 @@ export function WorkspacePage({
           </button>
           {/* 一键归中 = **臂体完全伸直**，不是"电机归零" ✗。
               表里"伸直"的位移约 -20mm（松弛量 + 预紧），不是 0 ——
-              所以这里走位姿下发：目标位姿 = 沿 z 轴伸到最大长度、姿态全零，
-              由位姿表算出对应的 6 丝位移。 */}
+              所以先按位姿表算出"沿 z 轴伸到最大长度"的 6 丝位移 ✓，
+              再**走预校准那条通道**下发 ✓：本机直发优先、失败回退后端中继 ✓。
+              ⚠ 不能再用 `send_tip_pose_command` ✗ —— 它对上一帧下发量做低通（α=0.35）✓，
+              单次点击只走 35% 行程 ✗，臂体根本回不到伸直 ✓。 */}
           <button type="button" className={blockedClass("ghost-btn")}
             title={blockedHint("一键归中：臂体完全伸直")}
             onClick={() => {
               void (async () => {
+                if (!requireSystemEnabled("一键归中")) return;
                 try {
                   const straightMm = curvatureDistribution.totalLengthMm;
-                  const result = await sendTipPoseCommand(
+                  // ① 只查表（不发送、不做低通）：得到"伸直"对应的 6 路绝对位移
+                  const preview = await previewTipPoseCommand(
                     [0, 0, straightMm],
                     [0, 0, 0],
                     { deviceId: snapshot.live.selectedDeviceId },
                   );
-                  applyCommandedTargets(result.targetDisplacementMm ?? null);
+                  const values = preview.targetDisplacementMm.slice(0, 6);
+                  if (values.length < 6) throw new Error("模型没有返回 6 路位移");
+
+                  // 与拖动同一口径：模型 dL → 电机目标（初态 + 伸直位偏移）
+                  const init = precalibration?.values ?? null;
+                  const straightDl = straightDlRef.current;
+                  const motorTargets = init && straightDl && straightDl.length >= 6
+                    ? values.map((value, index) => init[index] + (straightDl[index] - value) / displacementGain)
+                    : values;
+
+                  // ② 与预校准**同一条发送通道**：本机直发优先，失败回退后端中继
+                  const hex = directMultiMotor(motorTargets, 1);
+                  if (hex) {
+                    applyCommandedTargets(motorTargets);
+                    void invoke("control_frame_log", {
+                      request: {
+                        deviceId: snapshot.live.selectedDeviceId,
+                        kind: "multi-motor",
+                        frameHex: hex,
+                        action: null,
+                      },
+                    }).catch(() => undefined);
+                    setCommandStatus({
+                      tone: "ok",
+                      message: `已下发一键归中（臂体伸直，末端 z=${straightMm.toFixed(0)}mm，本机直发）`,
+                    });
+                  } else {
+                    await sendMultiMotorCommand(motorTargets, {
+                      deviceId: snapshot.live.selectedDeviceId,
+                    });
+                    applyCommandedTargets(motorTargets);
+                    setCommandStatus({
+                      tone: "ok",
+                      message: `已下发一键归中（臂体伸直，末端 z=${straightMm.toFixed(0)}mm，服务器中继）`,
+                    });
+                  }
                   clearTargets();
-                  setCommandStatus({
-                    tone: "ok",
-                    message: `已下发一键归中（臂体伸直，末端 z=${straightMm.toFixed(0)}mm）`,
-                  });
                 } catch (err) {
                   setCommandStatus({ tone: "error", message: `一键归中失败：${errorText(err)}` });
                 }
@@ -3033,22 +3541,46 @@ export function WorkspacePage({
         </label>
         <label className="workspace-field">
           <span>位移 mm</span>
-          <input type="number" min={-80} max={80} step={0.1} value={motorDraft.positionMm}
-            onChange={(event) => editMotorDraft({ positionMm: clamp(Number(event.target.value), -80, 80) })} />
+          {/* type=text：number 输入框在 "-"、"1." 这种中间态会返回空串，负号/小数点会被吃掉 */}
+          <input type="text" inputMode="decimal" value={motorText.position}
+            onChange={(event) => setMotorText((previous) => ({ ...previous, position: event.target.value }))}
+            onBlur={() => {
+              const value = clamp(parseMotorInput(motorText.position), -80, 80);
+              editMotorDraft({ positionMm: value });
+              setMotorText((previous) => ({ ...previous, position: String(value) }));
+            }} />
         </label>
         <label className="workspace-field">
           <span>速度 mm/s</span>
-          <input type="number" min={0} step={0.1} value={motorDraft.velocityMmPerSec}
-            onChange={(event) => editMotorDraft({ velocityMmPerSec: Number(event.target.value) })} />
+          <input type="text" inputMode="decimal" value={motorText.velocity}
+            onChange={(event) => setMotorText((previous) => ({ ...previous, velocity: event.target.value }))}
+            onBlur={() => {
+              const value = Math.max(0, parseMotorInput(motorText.velocity));
+              editMotorDraft({ velocityMmPerSec: value });
+              setMotorText((previous) => ({ ...previous, velocity: String(value) }));
+            }} />
         </label>
         <label className="workspace-field">
           <span>加速度 mm/s²</span>
-          <input type="number" min={0} step={0.1} value={motorDraft.accelerationMmPerSec2}
-            onChange={(event) => editMotorDraft({ accelerationMmPerSec2: Number(event.target.value) })} />
+          <input type="text" inputMode="decimal" value={motorText.acceleration}
+            onChange={(event) => setMotorText((previous) => ({ ...previous, acceleration: event.target.value }))}
+            onBlur={() => {
+              const value = Math.max(0, parseMotorInput(motorText.acceleration));
+              editMotorDraft({ accelerationMmPerSec2: value });
+              setMotorText((previous) => ({ ...previous, acceleration: String(value) }));
+            }} />
         </label>
         <button type="button" className={blockedClass("primary-btn")}
           title={blockedHint("发至电机")}
-          onClick={() => runMotorCommand(motorDraft)}>
+          onClick={() => {
+            const command = motorCommandFromInputs();
+            editMotorDraft({
+              positionMm: command.positionMm,
+              velocityMmPerSec: command.velocityMmPerSec,
+              accelerationMmPerSec2: command.accelerationMmPerSec2,
+            });
+            void runMotorCommand(command);
+          }}>
           <ArrowRightLeft size={15} /><span>发至电机</span>
         </button>
         <button type="button" className={blockedClass("ghost-btn")}
@@ -3059,34 +3591,53 @@ export function WorkspacePage({
           }}>
           <span>一键归零</span>
         </button>
-        {/* **预校准** ✓ —— 回到"操作员确认过伸直"的位移 ✓，不是电机零点 ✓ */}
+        {/* **预校准** ✓ —— 回到"操作员确认过的臂体初态" ✓，不是电机零点 ✓ */}
         <button type="button" className="ghost-btn"
-          title="把当前实测位置记录为「臂体伸直」的基准位"
-          onClick={recordPrecalibration}>
-          <span>记录伸直位</span>
+          title={
+            precalibration
+              ? "臂体初态已记录。初态是「预校准」的回位目标，已锁定；如需修改请点「重新记录」（需要确认）"
+              : "把当前实测位置记录为臂体初态（预校准的回位目标，只能记录一次）"
+          }
+          onClick={recordInitialState}
+          disabled={Boolean(precalibration)}>
+          <span>{precalibration ? "初态已记录" : "记录臂体初态"}</span>
         </button>
+        {precalibration ? (
+          <button type="button" className="ghost-btn danger"
+            title="重新记录臂体初态（只更新改动过的电机；会弹确认）"
+            onClick={recordInitialState}>
+            <span>重新记录</span>
+          </button>
+        ) : null}
         <button type="button" className={blockedClass("primary-btn")}
           title={
             precalibration
               ? blockedHint(
-                  `预校准：回到 ${precalibration.recordedAt.slice(0, 19).replace("T", " ")} 记录的伸直位（` +
+                  `预校准：回到 ${formatRecordedAt(precalibration.recordedAt)} 记录的臂体初态（` +
                     precalibration.values.map((value) => value.toFixed(2)).join(" / ") + " mm）",
                 )
-              : "还没有记录伸直位：先把臂体调到伸直，再点「记录伸直位」"
+              : "还没有记录臂体初态：先把臂体摆到初态，再点「记录臂体初态」"
           }
           onClick={runPrecalibration}
           disabled={!precalibration}>
           <span>预校准</span>
         </button>
         {precalibration ? (
-          <span className="precalibration-hint" title="点击可清除已记录的基准位">
-            基准位 {precalibration.values.map((value) => value.toFixed(1)).join(" / ")} mm ·{" "}
-            {precalibration.recordedAt.slice(0, 16).replace("T", " ")}
+          <span className="precalibration-hint" title="臂体初态已锁定；清除后「预校准」将不可用">
+            初态 {precalibration.values.map((value) => value.toFixed(1)).join(" / ")} mm ·{" "}
+            {formatRecordedAt(precalibration.recordedAt)}
             <button type="button" className="ghost-btn precalibration-clear"
               onClick={() => {
+                const ok = window.confirm(
+                  "清除臂体初态？\n" +
+                  `· 记录时间：${formatRecordedAt(precalibration.recordedAt)}\n` +
+                  `· 初态位移：${precalibration.values.map((value) => value.toFixed(2)).join(" / ")} mm\n\n` +
+                  "清除后「预校准」将不可用，直到重新记录一份初态。确定要清除吗？",
+                );
+                if (!ok) return;
                 clearPrecalibration();
                 setPrecalibration(null);
-                setCommandStatus({ tone: "ok", message: "已清除预校准基准位" });
+                setCommandStatus({ tone: "ok", message: "已清除臂体初态" });
               }}>
               清除
             </button>
@@ -3239,15 +3790,17 @@ export function WorkspacePage({
           return (
             <ShapeCalibrationCard
               deviceId={snapshot.live.selectedDeviceId}
+              initialState={precalibration?.values ?? null}
               ensureMotion={requireSystemEnabled}
+              onCommandedTargets={applyCommandedTargets}
               onNotify={notifyCommand}
             />
           );
-        case "tendonIdentify":
+        case "armCalibration":
           return (
-            <TendonIdentifyCard
+            <ArmCalibrationCard
               deviceId={snapshot.live.selectedDeviceId}
-              ensureMotion={requireSystemEnabled}
+              initialState={precalibration?.values ?? null}
               onNotify={notifyCommand}
             />
           );

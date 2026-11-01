@@ -79,8 +79,10 @@ export function framesToCsv(frames: DeviceSnapshot[]): string {
     ...Array.from({ length: motorCount }, (_, i) => `电机${i + 1}速度(mm/s)`),
     ...Array.from({ length: sensorCount }, (_, i) => `传感器${i + 1}实际(N)`),
     ...Array.from({ length: sensorCount }, (_, i) => `传感器${i + 1}滤波(N)`),
-    "第1段弯曲角(deg)",
-    "第2段弯曲角(deg)",
+    // ⚠ 这两个字段**不是弯曲角**：状态帧里是 `scale` / `armbend`（见 protocol.rs），
+    // 只在固件自己的弯曲指令流程里才更新；0x11 位移驱动时恒为 20.00 / 0.00。
+    "固件scale",
+    "固件armbend",
     "质量",
   ];
 

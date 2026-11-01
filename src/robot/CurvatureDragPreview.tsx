@@ -100,7 +100,7 @@ const MIN_TARGET_DELTA_MM = 0.4;
  * 编辑模式下放大到 `× 3.2`：拖动编辑默认关闭，打开时就是专门来拖的，
  * 宽容一点远比"抓不住"好。
  */
-const PICK_THRESHOLD_MM = 8.31 * 3.2;   // 只和半径有关，与臂长无关 ✓
+const PICK_THRESHOLD_MM = 8.31 * 5.2;   // 放大识别范围（原来 3.2 倍半径，点偏一点就抓不到）
 
 interface DragSession {
   pointerId: number;
@@ -125,6 +125,8 @@ interface DragSession {
   grabPoint: THREE.Vector3;
   /** 拖拽平面：法线朝相机，保证「拖动方向 = 屏幕方向」。 */
   plane: THREE.Plane;
+  /** 按下那一刻的形状：整个拖动过程都拿它当反解基准（防止目标自追自）。 */
+  base: CurvatureDistribution;
 }
 
 export interface CurvatureDragPreviewProps {
@@ -518,7 +520,9 @@ export function CurvatureDragPreview({
      */
     const lockView = (locked: boolean) => {
       if (session) return; // 拖动进行中不因为一次 prop 变化把 controls 抢回来
-      controls.enabled = !locked;
+      // **编辑模式也允许转视角** ✓ —— 只有真正按在臂体上时（capture 阶段命中）才临时锁住；
+      // 空白处拖动 = 转视角，和普通 3D 视图一致 ✓。
+      controls.enabled = true;
       canvas.style.cursor = locked ? "grab" : "";
     };
     lockRef.current = lockView;
@@ -589,6 +593,7 @@ export function CurvatureDragPreview({
         anchor: hit.point.clone(),
         grabPoint,
         plane,
+        base: pickShape().distribution,
       };
       lastEmitted = null;
       canvas.setPointerCapture(event.pointerId);
@@ -656,10 +661,11 @@ export function CurvatureDragPreview({
       const solved = solveDragToPoint({
         sMm: session.sMm,
         toMm,
-        base: pickShape().distribution,
+        // 固定用按下那一刻的形状当基准：目标不会自己追自己
+        base: session.base,
         lockTipPose: inputRef.current.lockTipPose,
         // 每段按自身方向取上限 ✓（方向表由页面显式传入）
-        limitsPerM: limitsForDistribution(pickShape().distribution, modelCurvatureLimitForDirection(0)),
+        limitsPerM: limitsForDistribution(session.base, modelCurvatureLimitForDirection(0)),
       });
       setSaturated(solved.saturated);
       setTipDriftMm(solved.tipDriftMm);
@@ -704,6 +710,19 @@ export function CurvatureDragPreview({
     canvas.addEventListener("pointerup", finish);
     canvas.addEventListener("pointercancel", finish);
 
+    /**
+     * **命中臂体才锁视角** ✓ —— capture 阶段比 OrbitControls 的目标监听更早，
+     * 所以"按在臂上"那一下不会先被 OrbitControls 拿去转视角 ✓；
+     * 按在空白处则不拦，正常转视角 ✓。
+     */
+    const onPointerDownCapture = (event: PointerEvent) => {
+      if (!inputRef.current.enabled || event.button !== 0) return;
+      if (event.target !== canvas) return;
+      const hit = pickOnBackbone(pickShape(), event);
+      if (hit) controls.enabled = false;
+    };
+    window.addEventListener("pointerdown", onPointerDownCapture, true);
+
     // 初始状态按当前开关取值（组件可能在编辑已开启时才挂载）。
     lockView(inputRef.current.enabled);
 
@@ -713,6 +732,10 @@ export function CurvatureDragPreview({
     let smoothActual: BackboneOutput | null = null;
     let smoothTarget: BackboneOutput | null = null;
     let lastTime = performance.now();
+    /** 末端手柄拖动期间**固定**的基准（按下那一刻的形状），防止目标自追自 */
+    let gizmoDragBase: CurvatureDistribution | null = null;
+    /** 上一次上报的末端（mm）—— 小于 0.02mm 不再重复上报 */
+    let lastEmittedTipMm: [number, number, number] | null = null;
 
     const animate = () => {
       animFrameId = requestAnimationFrame(animate);
@@ -802,6 +825,12 @@ export function CurvatureDragPreview({
         const handleVisible = showTipHandleRef.current;
         gizmoNow.tipGizmoHelper.visible = handleVisible;
         if (gizmoNow.gizmoState.dragging && handleVisible) {
+          /**
+           * **拖动期间基准固定为“按下那一刻的形状”** ✓ ——
+           * 之前每帧都用 `pickShape()`（= 上一帧的目标）当 base ✗ → 反解结果又变成下一帧的 base ✗
+           * → 目标自己追自己：手柄不动、目标也在慢慢漂 ✗（现场"目标值一直变、电机抖"）。
+           */
+          if (!gizmoDragBase) gizmoDragBase = pickShape().distribution;
           const worldP = gizmoNow.tipProxy.getWorldPosition(new THREE.Vector3());
           const localP = worldP.clone().applyEuler(ARM_RENDER_EULER_INV);
 
@@ -814,9 +843,9 @@ export function CurvatureDragPreview({
           let solved = solveDragToPoint({
             sMm: geometry.lengthMm,
             toMm: target,
-            base: pickShape().distribution,
+            base: gizmoDragBase,
             lockTipPose: inputRef.current.lockTipPose,
-            limitsPerM: limitsForDistribution(pickShape().distribution, modelCurvatureLimitForDirection(0)),
+            limitsPerM: limitsForDistribution(gizmoDragBase, modelCurvatureLimitForDirection(0)),
           });
           for (let iter = 0; iter < 2 && !solved.saturated; iter += 1) {
             // tipPoseOfDistribution 吃**段数组**、返回**米**（positionM）
@@ -829,20 +858,36 @@ export function CurvatureDragPreview({
             const retry = solveDragToPoint({
               sMm: geometry.lengthMm,
               toMm: corrected,
-              base: pickShape().distribution,
+              base: gizmoDragBase,
               lockTipPose: inputRef.current.lockTipPose,
-              limitsPerM: limitsForDistribution(pickShape().distribution, modelCurvatureLimitForDirection(0)),
+              limitsPerM: limitsForDistribution(gizmoDragBase, modelCurvatureLimitForDirection(0)),
             });
             if (retry.tipDriftMm >= solved.tipDriftMm) break;    // 没变好就停
             solved = retry;
             target = corrected;
           }
-          setSaturated(solved.saturated);
-          setTipDriftMm(solved.tipDriftMm);
-          setTipDriftRad(solved.tipDriftRad);
-          onChangeRef.current(solved.distribution);
+          const solvedTip = tipPoseOfDistribution(solved.distribution.segments).positionM;
+          const solvedTipMm: [number, number, number] = [
+            solvedTip[0] * 1000,
+            solvedTip[1] * 1000,
+            solvedTip[2] * 1000,
+          ];
+          const movedEnough = !lastEmittedTipMm || Math.hypot(
+            solvedTipMm[0] - lastEmittedTipMm[0],
+            solvedTipMm[1] - lastEmittedTipMm[1],
+            solvedTipMm[2] - lastEmittedTipMm[2],
+          ) >= 0.02;
+          if (movedEnough) {
+            lastEmittedTipMm = solvedTipMm;
+            setSaturated(solved.saturated);
+            setTipDriftMm(solved.tipDriftMm);
+            setTipDriftRad(solved.tipDriftRad);
+            onChangeRef.current(solved.distribution);
+          }
         } else if (handleVisible) {
-          // 空闲时把手柄对齐到**当前末端**（骨骼已含全部变形）
+          // 松手：清掉拖动期间的固定基准与上报缓存，手柄对齐到当前末端
+          gizmoDragBase = null;
+          lastEmittedTipMm = null;
           const handleBones = arm.mesh.skeleton?.bones;
           const tipBoneForHandle = handleBones && handleBones.length > 0 ? handleBones[handleBones.length - 1] : null;
           if (tipBoneForHandle) {
@@ -932,6 +977,7 @@ export function CurvatureDragPreview({
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", finish);
       canvas.removeEventListener("pointercancel", finish);
+      window.removeEventListener("pointerdown", onPointerDownCapture, true);
       lockRef.current = null;
       disposeScene();
       controls.dispose();

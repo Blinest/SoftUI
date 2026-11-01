@@ -211,9 +211,16 @@ impl ModelTables {
         let vc = VcTable::from_sections(ktb, ptb, ksb, kkb, meta)
             .map_err(|error| ModelError::Table(format!("vc: {error}")))?;
 
+        // 新格式模型没有 `K40/K60` 老表 ✗ —— 运动范围上限必须从 **vc 的 κ 表**算 ✓，
+        // 否则会一直沿用内置旧臂的 ~1.9，换模型后拖动手感完全不变 ✗。
+        let vc_kappa_limit = vc.kappa_limit_per_m();
+
         let mut fallback = Self::from_bundle(DEFAULT_BUNDLE)?;
         fallback.vc = Some(vc);
         fallback.bundle_bytes = bytes.len();
+        if vc_kappa_limit > 0.0 {
+            fallback.kappa_limit_per_m = vc_kappa_limit;
+        }
         Ok(fallback)
     }
 
@@ -249,6 +256,10 @@ impl ModelTables {
     }
 
     pub fn kappa_limit_by_direction(&self) -> [f64; 8] {
+        // 新格式：从 vc 的 κ 表按方向统计 ✓（老表根本不存在 ✗）
+        if let Some(vc) = self.vc.as_ref() {
+            return vc.kappa_limit_by_direction();
+        }
         // 与 `kappa_limit_per_m` 同一张表：有 60N 用 60N，否则 40N ✓
         let table = self.kappa_60.as_ref().unwrap_or(&self.kappa_40);
         let mut out = [0.0_f64; 8];
@@ -419,9 +430,35 @@ mod tests {
     fn builtin_bundle_parses() {
         let model = ModelTables::builtin();
         assert_eq!(model.kappa_40.len(), 1200);
-        assert_eq!(model.kappa_60.len(), 1200);
+        // 60N 槽位在新臂包里是**可选的**（旧臂才有），所以比对 Option ✓
+        assert_eq!(model.kappa_60.as_ref().map(|table| table.len()), Some(1200));
         assert_eq!(model.pose_40.len(), 1200);
-        assert_eq!(model.pose_60.len(), 1200);
+        assert_eq!(model.pose_60.as_ref().map(|table| table.len()), Some(1200));
+    }
+
+    /// 守住 `KTB1` / `PTB1` 的**分块**布局 ✓ —— 按"每行 12 个"读会把 tau/dL/tip 全拆错 ✗。
+    ///
+    /// 判据取自物理约束：
+    ///   · 丝只能拉 → `tau` 不应出现负值 ✓；
+    ///   · 末端到基座的距离必然在臂长附近（0.3~0.6 m）✓，不可能是单位向量 ✓。
+    #[test]
+    fn vc_sections_use_block_layout() {
+        let model = ModelTables::builtin();
+        let vc = model.vc.as_ref().expect("内置包应带 KTB1/PTB1");
+        assert!(vc.len() > 100, "样本太少：{}", vc.len());
+        for sample in vc.samples() {
+            for tau in sample.tau {
+                assert!(tau >= -0.01, "tau 出现负值（丝不能推）：{tau}");
+            }
+            let [x, y, z] = sample.tip_m;
+            let norm = (x * x + y * y + z * z).sqrt();
+            assert!(
+                (0.3..0.6).contains(&norm),
+                "tip 模长不合理（多半把 R_tip 当成了位置）：{norm}"
+            );
+            assert!(sample.dl_mm.iter().all(|value| value.is_finite()));
+            assert!(sample.dl_mm.iter().all(|value| value.abs() < 60.0));
+        }
     }
 
     #[test]

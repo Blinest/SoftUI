@@ -2550,8 +2550,12 @@ fn list_models() -> Result<Vec<ModelLibraryEntry>, String> {
                     kappa_limit_by_direction: tables.kappa_limit_by_direction(),
                     builtin: false,
                     selected: tables.bundle_bytes == current_bytes,
+                    // 模型参数是**可选**的；没有参数文件时必须回退到**模型包自己的臂长**
+                    // （vc 表的 s_range），否则轨迹规划会按默认 400mm 算 → 一整条轨迹差 45mm ✗。
                     params: read_model_params(&path),
-                    total_length_mm: read_model_params(&path).and_then(|p| p.length_mm),
+                    total_length_mm: read_model_params(&path)
+                        .and_then(|p| p.length_mm)
+                        .or(Some(tables.total_length_mm)),
                 });
             }
         }
@@ -2855,8 +2859,7 @@ fn model_preset_is_active(preset: &model::ModelPreset) -> bool {
 /// 3D 显示用它替代正向 SDM：SDM 与全阶 Cosserat 表是两套模型，同一组位移
 /// 反推出的形状能差 2 倍以上；而"显示要和表一致"只能直接读表。
 #[cfg_attr(feature = "desktop", tauri::command)]
-fn shape_from_displacements(displacement_mm: Vec<f64>) -> Result<Vec<f64>, String> {
-    if displacement_mm.len() != 6 {
+fn shape_from_displacements(displacement_mm: Vec<f64>) -> Result<Vec<f64>, String> {    if displacement_mm.len() != 6 {
         return Err(format!(
             "需要 6 个驱动丝位移，收到 {} 个",
             displacement_mm.len()
@@ -2907,6 +2910,57 @@ fn shape_from_displacements(displacement_mm: Vec<f64>) -> Result<Vec<f64>, Strin
     out.push(distance);
     out.push(total_length_mm / nodes);
     Ok(out)
+}
+
+/// 标定记录用：由 6 路位移反查**最近样本**的末端位置 + 12 节点曲率。
+///
+/// 与 `shape_from_displacements`（插值、给 3D 显示用）不同 ✗：
+/// 标定要的是**表内真实解** ✓ —— 插值会造出表里没有的中间形状 ✗，
+/// 和"操作员看到的姿态"对不上 ✓。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalibrationPose {
+    /// 末端位置（svc 系 mm）
+    tip_mm: [f64; 3],
+    /// 12 节点 × (kx, ky)，单位 1/m
+    kappa: Vec<f64>,
+    /// 每节点弧长（mm）
+    segment_mm: f64,
+    /// 归一化 dL 距离（越小越接近表内样本）
+    distance: f64,
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn calibration_pose_from_displacements(displacement_mm: Vec<f64>) -> Result<CalibrationPose, String> {
+    if displacement_mm.len() != 6 {
+        return Err(format!(
+            "需要 6 个驱动丝位移，收到 {} 个",
+            displacement_mm.len()
+        ));
+    }
+    let mut input = [0.0f64; 6];
+    input.copy_from_slice(&displacement_mm);
+    let model = current_model();
+    let vc = model
+        .vc
+        .as_ref()
+        .ok_or_else(|| "当前模型不是新格式（缺 KTB1/PTB1）".to_string())?;
+    let (index, distance) = vc
+        .nearest_by_dl(input)
+        .ok_or_else(|| "新模型的位移表为空".to_string())?;
+    let sample = vc
+        .samples()
+        .get(index)
+        .ok_or_else(|| "样本索引越界".to_string())?;
+    let shape = vc
+        .shape_12x2(index)
+        .ok_or_else(|| "该样本缺少曲率数据".to_string())?;
+    Ok(CalibrationPose {
+        tip_mm: sample.tip_svc_mm(),
+        kappa: shape.iter().map(|value| *value as f64).collect(),
+        segment_mm: model.total_length_mm / 12.0,
+        distance,
+    })
 }
 
 /// **模型下拉列表** ✓ —— 和管理页「模型库」**同源** ✗。
@@ -6268,6 +6322,7 @@ mod tests {
             }),
             received_frames: 1,
             protocol_errors: 0,
+            last_ingest_ms: 0,
             sent_commands: 0,
             pending_commands: 0,
             reconnect_attempts: 0,
@@ -6334,6 +6389,7 @@ mod tests {
             last_status: Some(protocol_status.clone()),
             received_frames: 1,
             protocol_errors: 0,
+            last_ingest_ms: 0,
             sent_commands: 0,
             pending_commands: 0,
             reconnect_attempts: 0,
@@ -6382,6 +6438,7 @@ mod tests {
             last_status: None,
             received_frames: 10,
             protocol_errors: 3,
+            last_ingest_ms: 0,
             sent_commands: 5,
             pending_commands: 2,
             reconnect_attempts: 1,
@@ -6590,6 +6647,7 @@ pub fn run() {
             export_model,
             lookup_tip_pose_shape,
             shape_from_displacements,
+            calibration_pose_from_displacements,
             vc_table_index,
             preview_tip_pose_command,
             preview_tip_pose_batch,
@@ -7185,6 +7243,11 @@ fn dispatch(
         "shape_from_displacements" => {
             let displacement_mm: Vec<f64> = arg(args, "displacementMm")?;
             shape_from_displacements(displacement_mm)
+                .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
+        }
+        "calibration_pose_from_displacements" => {
+            let displacement_mm: Vec<f64> = arg(args, "displacementMm")?;
+            calibration_pose_from_displacements(displacement_mm)
                 .and_then(|v| serde_json::to_value(v).map_err(|e| e.to_string()))
         }
         "list_model_presets" => serde_json::to_value(list_model_presets())

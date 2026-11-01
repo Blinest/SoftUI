@@ -1,6 +1,6 @@
 import {
 
-  Activity, Cable, GitBranch, Route, Ruler, Save, SlidersHorizontal, Table2,
+  Activity, Crosshair, GitBranch, Route, Ruler, Save, SlidersHorizontal, Table2,
 
 } from "lucide-react";
 
@@ -40,7 +40,7 @@ export const automaticCardRegistry: Record<AutomaticCardId, WorkspaceCardMeta> =
 
   shapeCalibration: { title: "典型臂形标定", icon: Ruler },
 
-  tendonIdentify: { title: "驱动丝识别", icon: Cable },
+  armCalibration: { title: "臂体标定", icon: Crosshair },
 
 };
 

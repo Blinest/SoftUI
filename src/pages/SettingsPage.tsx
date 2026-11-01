@@ -459,7 +459,7 @@ export function SettingsPage({
                 {
                   key: "curves",
                   label: "曲线",
-                  hint: "最近实时窗口的逐帧 CSV：电机位置/速度、传感器三轴、两段弯曲角",
+                  hint: "最近实时窗口的逐帧 CSV：电机位置/速度、传感器三轴、固件原始状态字（scale / armbend，不是弯曲角）",
                 },
                 {
                   key: "diagnostics",

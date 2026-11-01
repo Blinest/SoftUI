@@ -5,6 +5,8 @@ import { Play, Ruler, Trash2 } from "lucide-react";
 import { SEGMENT_LENGTH_M } from "../dynamics/svcModel";
 import { fetchShapeFromDisplacements } from "../robot/modelBridge";
 import { previewTipPoseCommand, sendMultiMotorCommand } from "../robot/curvatureBridge";
+import { MODEL_FRAME_ROTATION_DEG, physicalTipToModelMm } from "../robot/frameCalibration";
+import { useDisplacementGain } from "../robot/displacementGain";
 import { downloadText, fileTimestamp } from "../utils/download";
 import {
   applyAngleCalibration,
@@ -21,22 +23,7 @@ import {
 import type { DeviceSnapshot, LiveLatest } from "../softuiTypes";
 
 /**
- * 「典型臂形标定」—— 把臂体驱动到几个**已知的名义形状**，
- * 由操作员用角度尺量出实际弯曲角并录入，从而判断模型准不准。
- *
- * 为什么用名义形状而不是自由位姿 ✗：
- *   自由位姿没有独立的"真值"✓，模型说到了就是到了 ✗，测不出系统偏差 ✓。
- *   30° 上/下/左/右是可以用角度尺直接量的 ✓，误差才有意义 ✓。
- *
- * 为什么用 `send_multi_motor_command` 而不是 `send_tip_pose_command` ✗：
- *   后者为了拖动平滑会对上一帧下发量做低通（α=0.35）✓ —— 单个姿态只发一次
- *   只会走 35% 的行程 ✗。这里**先查表拿到目标位移**（`lookup_tip_pose_shape`）✓，
- *   再按位移一次性下发 ✓，每次都是准确的表内解 ✓。
- *
- * 测量数据的三个来源（互相对照）：
- *   1. 人工角度尺（唯一独立基准 ✓）→ 「实测角」输入框
- *   2. 固件回传的两段弯曲角（`frame.bend`）
- *   3. 模型反算角：**实测电机位移 → 查表 → 12 节点 κ 积分**（`shape_from_displacements`）
+ * 「典型臂形标定」：驱动臂体到 4 个名义姿态，录入实测角/方向并导出。
  */
 
 /** 名义臂长（mm）：两段各 `SEGMENT_LENGTH_M`。 */
@@ -100,12 +87,11 @@ export interface CalibrationRow {
   targetMm: number[] | null;
   /** 6 路实测电机位置（mm） */
   actualMm: number[] | null;
-  /** 固件回传：两段弯曲角（deg）与方向 */
-  firmwareAngles: [number | null, number | null];
-  firmwareDirs: [string, string];
   /** 实测位移经模型反算出来的总弯曲角（deg） */
   modelAngleDeg: number | null;
   modelDirectionDeg: number | null;
+  /** 实测位移反算的 12 节点曲率（1/m，节点 0 在根部）；没反算出来就是 null */
+  curvature: { kxPerM: number[]; kyPerM: number[] } | null;
   /**
    * **目标位移**回查模型得到的弯曲角（deg）。
    *
@@ -136,10 +122,9 @@ function emptyRow(shape: (typeof CALIBRATION_SHAPES)[number], angleDeg: number):
     commandedAngleDeg: null,
     targetMm: null,
     actualMm: null,
-    firmwareAngles: [null, null],
-    firmwareDirs: ["", ""],
     modelAngleDeg: null,
     modelDirectionDeg: null,
+    curvature: null,
     modelTargetAngleDeg: null,
     nearestMm: null,
     settledMs: null,
@@ -156,11 +141,14 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** 本次实测位移经模型反查形状 → 总弯曲角 / 方向。 */
+/** 本次实测位移经模型反查形状 → 总弯曲角 / 方向 / 12 节点 κ。 */
 async function modelBendFromDisplacements(displacementMm: number[]): Promise<{
   angleDeg: number;
   directionDeg: number;
   nearest: number;
+  kxPerM: number[];
+  kyPerM: number[];
+  segmentMm: number;
 } | null> {
   if (displacementMm.length < 6) return null;
   const shape = await fetchShapeFromDisplacements(displacementMm.slice(0, 6));
@@ -177,8 +165,16 @@ async function modelBendFromDisplacements(displacementMm: number[]): Promise<{
     sumX += kx * dsMm;
     sumY += ky * dsMm;
   }
-  const directionDeg = ((Math.atan2(-sumX, sumY) * RAD2DEG) % 360 + 360) % 360;
-  return { angleDeg: angleRad * RAD2DEG, directionDeg, nearest: shape.nearest };
+  // 模型坐标系 → 实机全局（绕 z 旋转 90°，见 frameCalibration.ts）
+  const directionDeg = (((Math.atan2(-sumX, sumY) * RAD2DEG + MODEL_FRAME_ROTATION_DEG) % 360) + 360) % 360;
+  return {
+    angleDeg: angleRad * RAD2DEG,
+    directionDeg,
+    nearest: shape.nearest,
+    kxPerM: shape.kxPerM,
+    kyPerM: shape.kyPerM,
+    segmentMm: dsMm,
+  };
 }
 
 /** 下发后等电机稳定：连续 3 次采样（250ms 一次）位移变化 < 0.2mm。 */
@@ -226,12 +222,22 @@ function mm(value: number | null | undefined, digits = 3): string {
 
 export interface ShapeCalibrationCardProps {
   deviceId: string;
+  /** 记录的臂体初态（六路电机位置 mm）；相对下发模式必需 ✓ */
+  initialState: number[] | null;
   /** 未使能时给出提示并返回 false（复用工作台统一的告警文案）。 */
   ensureMotion: (what: string) => boolean;
+  /** 把本次下发的 6 路目标同步给「电机概览」/未到位监测（可选）。 */
+  onCommandedTargets?: (targets: number[] | null) => void;
   onNotify: (message: string, tone?: "ok" | "warn" | "error") => void;
 }
 
-export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: ShapeCalibrationCardProps) {
+export function ShapeCalibrationCard({
+  deviceId,
+  initialState,
+  ensureMotion,
+  onCommandedTargets,
+  onNotify,
+}: ShapeCalibrationCardProps) {
   const [angleDeg, setAngleDeg] = useState(30);
   const [timeoutMs, setTimeoutMs] = useState(12_000);
   const [rows, setRows] = useState<CalibrationRow[]>(() =>
@@ -248,6 +254,24 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
    */
   const [calibration, setCalibration] = useState<ShapeCalibration>(() => loadShapeCalibration());
   const [calibrationNote, setCalibrationNote] = useState<string | null>(null);
+
+  /**
+   * **下发模式**：
+   * - `relative`（默认）：模型 dL 只取**相对量**，叠加到记录的臂体初态上 ✓
+   *   `motor = init + s·(dL_straight − dL_target)`
+   *   为什么必须这样 ✗：模型表里的 dL 是相对模型参考系的 ✓，而实机每根丝的
+   *   装配/预紧零点各不相同 ✗ —— 直接把 dL 当绝对位置发，等于把每根丝都拉到
+   *   模型零点上，方向和幅度都会错 ✓（实测：straight 的 dL 约 12/9/6/7/12/13mm，
+   *   而实机归中后的位置约 6/9.5/2/0/0/6mm，差好几毫米 ✓）。
+   * - `absolute`：旧行为（直接发 dL 绝对位置），仅用于对照 ✓。
+   */
+  const [sendMode, setSendMode] = useState<"relative" | "absolute">("relative");
+  /** 电机正方向是拉紧还是放松：+1 = 位置增大即拉紧（单丝点动实测：+3 朝该丝一侧弯）。 */
+  const [motorSign, setMotorSign] = useState<1 | -1>(1);
+  /** 位移增益（拖动 / 臂体标定共用；实际曲率偏大就调大） */
+  const [displacementGain] = useDisplacementGain();
+  /** 模型在"伸直位"的 6 路 dL（只查一次，缓存 ✓） */
+  const [straightDl, setStraightDl] = useState<number[] | null>(null);
 
   useEffect(() => {
     saveShapeCalibration(calibration);
@@ -271,9 +295,18 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
     );
   }, []);
 
+  /** 模型在"伸直位"的 6 路 dL（只查一次并缓存）。 */
+  const ensureStraightDl = useCallback(async (): Promise<number[]> => {
+    if (straightDl && straightDl.length >= 6) return straightDl;
+    const preview = await previewTipPoseCommand([0, 0, ARM_LENGTH_MM], [0, 0, 0], { deviceId });
+    const values = preview.targetDisplacementMm.slice(0, 6);
+    if (values.length < 6) throw new Error("模型没有返回伸直位的 6 路位移");
+    setStraightDl(values);
+    return values;
+  }, [deviceId, straightDl]);
+
   const runOne = useCallback(
-    async (shape: (typeof CALIBRATION_SHAPES)[number]) => {
-      if (!ensureMotion("典型臂形标定")) return false;
+    async (shape: (typeof CALIBRATION_SHAPES)[number]) => {      if (!ensureMotion("典型臂形标定")) return false;
       if (!deviceId) {
         onNotify("未选择目标设备：请先在左栏连接设备", "warn");
         return false;
@@ -298,37 +331,60 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
         commandedPhiDeg: commandedPhi,
         message:
           `目标末端 ${target.map((value) => value.toFixed(1)).join(" / ")} mm · ` +
-          `下发 ${commandedAngle.toFixed(1)}° @ φ=${commandedPhi.toFixed(0)}°`,
+          `下发 ${commandedAngle.toFixed(1)}° @ φ=${commandedPhi.toFixed(0)}°` +
+          `（${sendMode === "relative" ? "相对初态" : "绝对 dL"}）`,
         measuredAngle: "",
         observedDirection: "",
         modelAngleDeg: null,
         modelTargetAngleDeg: null,
+        curvature: null,
         nearestMm: null,
         settledMs: null,
         atMs: null,
       });
 
       try {
-        // ① 只查表：拿到表内最接近解 + 6 路位移（`preview_tip_pose_command` 走 vc 表）
-        const preview = await previewTipPoseCommand(target, [0, 0, 0], { deviceId });
+        if (sendMode === "relative" && (!initialState || initialState.length < 6)) {
+          throw new Error(
+            "还没有记录臂体初态：先在「控制 → 电机控制」记录初态（臂体伸直时），相对下发拿它当每根丝的零点",
+          );
+        }
+        // ① 只查表：目标位姿是**实机全局坐标**，查表前换成模型坐标（绕 z −90°）
+        const preview = await previewTipPoseCommand(physicalTipToModelMm(target), [0, 0, 0], { deviceId });
         if (!Array.isArray(preview.targetDisplacementMm) || preview.targetDisplacementMm.length < 6) {
           throw new Error("模型没有返回 6 路位移");
         }
+        const modelDl = preview.targetDisplacementMm.slice(0, 6);
+
+        // ①a 相对下发：motor = init + s·(dL_straight − dL_target)
+        //     模型 dL 是相对模型参考系的 ✓，实机每根丝零点不同 ✗ → 只能叠加相对量 ✓
+        let dlStraight: number[] | null = null;
+        let commandValues = modelDl;
+        if (sendMode === "relative") {
+          dlStraight = await ensureStraightDl();
+          const init = initialState as number[];
+          commandValues = modelDl.map(
+            (value, index) =>
+              init[index] + (motorSign * ((dlStraight as number[])[index] - value)) / displacementGain,
+          );
+        }
         updateRow(shape.key, {
-          targetMm: preview.targetDisplacementMm.slice(0, 6),
+          targetMm: commandValues,
           nearestMm: preview.nearestDistance,
         });
 
         // ①b 目标位移本身在表里对应多少度？（区分"表里没有这个角"和"电机没到位"）
         try {
-          const predicted = await modelBendFromDisplacements(preview.targetDisplacementMm);
+          const predicted = await modelBendFromDisplacements(modelDl);
           if (predicted) updateRow(shape.key, { modelTargetAngleDeg: predicted.angleDeg });
         } catch {
           /* 反算失败不影响下发 */
         }
 
-        // ② 按位移下发（不走低通，一次到位）
-        await sendMultiMotorCommand(preview.targetDisplacementMm.slice(0, 6), { deviceId });
+        // ② 下发（相对模式发的是**电机绝对目标**；绝对模式是旧的 dL 直发）
+        await sendMultiMotorCommand(commandValues, { deviceId });
+        // 同步给监控卡 / 未到位监测（目标列要显示真正发下去的值 ✓）
+        onCommandedTargets?.(commandValues);
 
         // ③ 等稳定后采样
         const settled = await waitForStableFrame(deviceId, timeoutMs);
@@ -336,27 +392,52 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
         if (!frame) throw new Error("没有收到设备状态帧");
         const actual = frame.motors.slice(0, 6).map((motor) => motor.positionMm);
 
-        // ④ 实测位移 → 模型反算的总弯曲角（参考值，不是基准）
+        // ④ 实测电机位置 → 还原成模型的 dL → 反算弯曲角
+        //    相对模式下电机位置 = 初态 + s·(dL_straight − dL)，所以反推 dL = dL_straight − s·(实测 − 初态)
+        let inverseInput = actual;
+        if (sendMode === "relative" && initialState && dlStraight) {
+          const init = initialState;
+          const straight = dlStraight;
+          inverseInput = actual.map(
+            (value, index) => straight[index] - motorSign * displacementGain * (value - init[index]),
+          );
+        }
         let modelAngleDeg: number | null = null;
         let modelDirectionDeg: number | null = null;
+        let curvature: { kxPerM: number[]; kyPerM: number[] } | null = null;
         try {
-          const inverted = await modelBendFromDisplacements(actual);
+          const inverted = await modelBendFromDisplacements(inverseInput);
           modelAngleDeg = inverted?.angleDeg ?? null;
           modelDirectionDeg = inverted?.directionDeg ?? null;
+          if (inverted) curvature = { kxPerM: inverted.kxPerM, kyPerM: inverted.kyPerM };
         } catch {
           /* 反算失败不影响本行记录 */
         }
 
+        // 采样时顺便记账：哪一路实际没跟到目标（写进 CSV，事后一眼能看出是不是帧丢通道）
+        const deviations = actual.map((value, index) =>
+          Math.abs(value - (commandValues[index] ?? value)),
+        );
+        const worstGap = deviations.length > 0 ? Math.max(...deviations) : 0;
+        const worstIndex = deviations.indexOf(worstGap);
+        const gapNote = worstGap > 0.5
+          ? `电机 ${worstIndex + 1} 未到位（目标 ${commandValues[worstIndex]?.toFixed(2)}，` +
+            `实际 ${actual[worstIndex]?.toFixed(2)}，差 ${worstGap.toFixed(2)} mm）`
+          : null;
+        const message = [
+          settled.timedOut ? "等待稳定超时，按最后一条状态帧采样" : null,
+          gapNote,
+        ].filter(Boolean).join("；") || null;
+
         updateRow(shape.key, {
           status: "done",
           actualMm: actual,
-          firmwareAngles: [frame.bend.section1.angleDeg, frame.bend.section2.angleDeg],
-          firmwareDirs: [frame.bend.section1.direction, frame.bend.section2.direction],
           modelAngleDeg,
           modelDirectionDeg,
+          curvature,
           settledMs: Math.round(settled.elapsedMs),
           atMs: Date.now(),
-          message: settled.timedOut ? "等待稳定超时，按最后一条状态帧采样" : null,
+          message,
         });
         return true;
       } catch (error) {
@@ -365,7 +446,21 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
         return false;
       }
     },
-    [angleDeg, calibration, deviceId, ensureMotion, onNotify, timeoutMs, updateRow],
+    [
+      angleDeg,
+      calibration,
+      deviceId,
+      ensureMotion,
+      ensureStraightDl,
+      initialState,
+      motorSign,
+      displacementGain,
+      onCommandedTargets,
+      onNotify,
+      sendMode,
+      timeoutMs,
+      updateRow,
+    ],
   );
 
   const runAll = useCallback(async () => {
@@ -427,17 +522,29 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
     runningRef.current = true;
     setRunning(true);
     try {
-      const target: [number, number, number] = [0, 0, ARM_LENGTH_MM];
-      const preview = await previewTipPoseCommand(target, [0, 0, 0], { deviceId });
-      await sendMultiMotorCommand(preview.targetDisplacementMm.slice(0, 6), { deviceId });
-      onNotify("已下发回直臂指令（模型查表）", "ok");
+      if (sendMode === "relative") {
+        if (!initialState || initialState.length < 6) {
+          throw new Error("还没有记录臂体初态：先在「控制 → 电机控制」记录初态（臂体伸直时）");
+        }
+        // 相对模式下"回直臂"就是回到记录的初态本身 ✓（模型 dL 的伸直点 = 初态 ✓）
+        await sendMultiMotorCommand(initialState, { deviceId });
+        onCommandedTargets?.(initialState);
+        onNotify("已下发回直臂指令（回到记录的臂体初态）", "ok");
+      } else {
+        const target: [number, number, number] = [0, 0, ARM_LENGTH_MM];
+        const preview = await previewTipPoseCommand(target, [0, 0, 0], { deviceId });
+        const values = preview.targetDisplacementMm.slice(0, 6);
+        await sendMultiMotorCommand(values, { deviceId });
+        onCommandedTargets?.(values);
+        onNotify("已下发回直臂指令（模型查表·绝对位移）", "ok");
+      }
     } catch (error) {
       onNotify(`回直臂失败：${errorText(error)}`, "error");
     } finally {
       runningRef.current = false;
       setRunning(false);
     }
-  }, [deviceId, ensureMotion, onNotify]);
+  }, [deviceId, ensureMotion, initialState, onCommandedTargets, onNotify, sendMode]);
 
   /* ── 方向 / 角度标定 ───────────────────────────────────────────── */
 
@@ -521,14 +628,21 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
   }, []);
 
   const exportCsv = useCallback(() => {
+    const NODE_COUNT = 12;
+    const SEGMENT_MM = ARM_LENGTH_MM / NODE_COUNT;
     const header = [
       "序号", "姿态", "目标角(deg)", "下发角(deg)",
       "名义方向(deg)", "下发方向(deg)", "实测方向(deg)", "方向误差(deg)",
       ...Array.from({ length: 6 }, (_, index) => `目标M${index + 1}(mm)`),
       ...Array.from({ length: 6 }, (_, index) => `实测M${index + 1}(mm)`),
-      "固件段1角(deg)", "固件段1方向", "固件段2角(deg)", "固件段2方向",
       "模型反算角(deg)", "模型目标角(deg)", "模型反算方向(deg)", "最近邻(mm)",
       "稳定耗时(ms)", "人工实测角(deg)", "角度误差(deg)", "状态", "备注", "时间",
+      // 12 节点曲率（模型反算，实测位移 → dL → 表内插值）
+      "总弯曲角(deg)", "等效曲率(1/m)", "净方向(deg)", "段1平均曲率(1/m)", "段2平均曲率(1/m)",
+      ...Array.from({ length: NODE_COUNT }, (_, index) => `s${index + 1}(mm)`),
+      ...Array.from({ length: NODE_COUNT }, (_, index) => [
+        `k${index + 1}x(1/m)`, `k${index + 1}y(1/m)`, `k${index + 1}(1/m)`,
+      ]).flat(),
     ];
     const lines = [header.map(csvCell).join(",")];
     rows.forEach((row, index) => {
@@ -538,6 +652,34 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
       const observed = Number(row.observedDirection);
       const hasObserved = row.observedDirection.trim() !== "" && Number.isFinite(observed);
       const directionError = hasObserved ? wrapDeg180(observed - row.nominalPhiDeg) : null;
+
+      // ── 12 节点曲率 ──
+      const kx = row.curvature?.kxPerM ?? [];
+      const ky = row.curvature?.kyPerM ?? [];
+      const magnitudeAt = (node: number) =>
+        node < kx.length && node < ky.length ? Math.hypot(kx[node] ?? 0, ky[node] ?? 0) : null;
+      const sectionMean = (from: number, to: number) => {
+        const values = Array.from({ length: to - from }, (_, offset) => magnitudeAt(from + offset))
+          .filter((value): value is number => value != null);
+        return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+      };
+      const equivalentKappa = row.modelAngleDeg != null
+        ? (row.modelAngleDeg * DEG2RAD) / (ARM_LENGTH_MM / 1000)
+        : null;
+      const curvatureCells = [
+        row.modelAngleDeg != null ? mm(row.modelAngleDeg, 2) : "",
+        equivalentKappa != null ? mm(equivalentKappa, 3) : "",
+        row.modelDirectionDeg != null ? mm(row.modelDirectionDeg, 1) : "",
+        mm(sectionMean(0, 6), 3),
+        mm(sectionMean(6, 12), 3),
+        ...Array.from({ length: NODE_COUNT }, (_, node) => mm(SEGMENT_MM * node, 1)),
+        ...Array.from({ length: NODE_COUNT }, (_, node) => [
+          mm(kx[node], 4),
+          mm(ky[node], 4),
+          mm(magnitudeAt(node), 4),
+        ]).flat(),
+      ];
+
       const cells = [
         index + 1,
         row.label,
@@ -549,10 +691,6 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
         directionError != null ? mm(directionError, 1) : "",
         ...Array.from({ length: 6 }, (_, slot) => mm(row.targetMm?.[slot])),
         ...Array.from({ length: 6 }, (_, slot) => mm(row.actualMm?.[slot])),
-        row.firmwareAngles[0] != null ? mm(row.firmwareAngles[0], 2) : "",
-        row.firmwareDirs[0],
-        row.firmwareAngles[1] != null ? mm(row.firmwareAngles[1], 2) : "",
-        row.firmwareDirs[1],
         row.modelAngleDeg != null ? mm(row.modelAngleDeg, 2) : "",
         row.modelTargetAngleDeg != null ? mm(row.modelTargetAngleDeg, 2) : "",
         row.modelDirectionDeg != null ? mm(row.modelDirectionDeg, 1) : "",
@@ -563,6 +701,7 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
         row.status,
         row.message ?? "",
         row.atMs ? new Date(row.atMs).toLocaleString("zh-CN", { hour12: false }) : "",
+        ...curvatureCells,
       ];
       lines.push(cells.map(csvCell).join(","));
     });
@@ -612,16 +751,35 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
             }}
           />
         </label>
+        <label className="workspace-field">
+          <span>下发方式</span>
+          <select
+            value={sendMode}
+            disabled={running}
+            onChange={(event) => setSendMode(event.target.value === "absolute" ? "absolute" : "relative")}
+          >
+            <option value="relative">相对臂体初态（推荐）</option>
+            <option value="absolute">绝对 dL（旧行为，对照用）</option>
+          </select>
+        </label>
+        <label className="workspace-field">
+          <span>电机方向</span>
+          <select
+            value={motorSign}
+            disabled={running}
+            onChange={(event) => setMotorSign(Number(event.target.value) === -1 ? -1 : 1)}
+          >
+            <option value={1}>位置增大 = 拉紧</option>
+            <option value={-1}>位置减小 = 拉紧</option>
+          </select>
+        </label>
       </div>
 
-      <p className="model-params-hint">
-        名义形状按<strong>等曲率圆弧</strong>换算成末端位置，再查表得到 6 路位移。
-        执行后量两个数：<strong>根部与末端切线的夹角</strong>填「实测角」，
-        <strong>实际弯曲方向</strong>填「实测方向」（0=上 90=右 180=下 270=左）。
-        若方向整体转了一个角度、或左右反了，用下面的「方向标定」补偿；
-        若角度按比例偏大/偏小，用「角度标定」补偿。两项都默认恒等，不点就不生效。
-        「模型反算角」是<strong>实测位移</strong>回查模型得到的参考值，不是基准。
-      </p>
+      {sendMode === "relative" && (!initialState || initialState.length < 6) ? (
+        <p className="model-params-hint is-warn">
+          ⚠ 未记录臂体初态，无法相对下发。请先到「控制 → 电机控制」记录初态。
+        </p>
+      ) : null}
 
       <div className="workspace-action-row">
         <button
@@ -710,14 +868,7 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
             按实测角拟合
           </button>
         </div>
-        <p className="shape-calib-calib-hint">
-          方向：实测 = {calibration.direction.mirror ? "−" : ""}下发 + {calibration.direction.offsetDeg.toFixed(1)}°
-          ⇒ 下发 φ′ = {calibration.direction.mirror ? "−" : ""}(φ − {calibration.direction.offsetDeg.toFixed(1)}°)；
-          角度：实测 = {calibration.angle.gain.toFixed(3)} × 下发 + {calibration.angle.offsetDeg.toFixed(2)}°
-          ⇒ 下发 = (目标 − {calibration.angle.offsetDeg.toFixed(2)}°) / {calibration.angle.gain.toFixed(3)}。
-          改完标定要<strong>重新执行</strong>姿态才按新映射走。
-          {calibrationNote ? <><br />{calibrationNote}</> : null}
-        </p>
+        {calibrationNote ? <p className="shape-calib-calib-hint">{calibrationNote}</p> : null}
       </div>
 
       <div className="shape-calib-list">
@@ -796,11 +947,10 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
                     <span>
                       下发 {row.commandedAngleDeg.toFixed(1)}°
                       {row.commandedPhiDeg != null ? ` @ φ=${row.commandedPhiDeg.toFixed(0)}°` : ""}
-                      {`（名义 ${row.targetAngleDeg}° @ φ=${row.nominalPhiDeg}°）`}
                     </span>
                   ) : null}
                   {row.targetMm ? (
-                    <span>目标位移 {row.targetMm.map((value) => value.toFixed(1)).join(" / ")} mm</span>
+                    <span>下发目标(电机) {row.targetMm.map((value) => value.toFixed(1)).join(" / ")} mm</span>
                   ) : null}
                   {row.modelTargetAngleDeg != null ? (
                     <span>模型目标角 {row.modelTargetAngleDeg.toFixed(1)}°</span>
@@ -808,9 +958,6 @@ export function ShapeCalibrationCard({ deviceId, ensureMotion, onNotify }: Shape
                   {row.actualMm ? (
                     <span>实测位移 {row.actualMm.map((value) => value.toFixed(1)).join(" / ")} mm</span>
                   ) : null}
-                  <span>
-                    固件角 {row.firmwareAngles[0]?.toFixed(1) ?? "—"}° / {row.firmwareAngles[1]?.toFixed(1) ?? "—"}°
-                  </span>
                   <span>
                     模型反算 {row.modelAngleDeg != null ? `${row.modelAngleDeg.toFixed(1)}°` : "—"}
                     {row.modelDirectionDeg != null ? ` @ ${row.modelDirectionDeg.toFixed(0)}°` : ""}

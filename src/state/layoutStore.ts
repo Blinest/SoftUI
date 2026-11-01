@@ -27,8 +27,9 @@ const STORAGE_PREFIX = "softui:layout";
  * —— 旧布局里没有新卡的 id，`validateLayout` 会把它判废并回落默认 ✓
  * （否则新卡"凭空消失"，就像后台的「自助注册策略」那样 ✗）。
  * v3 → v4：后台新增 `registration` 卡 ✓
+ * v5 → v6：移除「驱动丝识别」卡 ✓
  */
-const LAYOUT_SCHEMA_VERSION = 5;
+const LAYOUT_SCHEMA_VERSION = 6;
 
 const DASHBOARD_CARD_IDS: DashboardCardId[] = [
   "connection",
@@ -68,7 +69,7 @@ const AUTOMATIC_CARD_IDS: AutomaticCardId[] = [
   "policyRules",
   "motionLibrary",
   "shapeCalibration",
-  "tendonIdentify",
+  "armCalibration",
 ];
 
 /** 卡片尺寸每一维的上限（列 / 行都是 1~4 格）。 */
@@ -203,7 +204,7 @@ export const defaultWorkspaceAutomaticLayout: PageLayout = freezeLayout({
     { id: "policyRules", size: "2x2", visible: true },
     { id: "motionLibrary", size: "2x2", visible: true },
     { id: "shapeCalibration", size: "2x2", visible: true },
-    { id: "tendonIdentify", size: "2x2", visible: true },
+    { id: "armCalibration", size: "2x2", visible: true },
   ],
 });
 

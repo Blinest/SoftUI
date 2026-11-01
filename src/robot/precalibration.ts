@@ -1,11 +1,13 @@
 import { loadUiStore, saveUiStore } from "./uiStore";
 
 /**
- * **预校准** ✓ —— 记住"臂体伸直"时的六路位移 ✓，之后一键回到该姿态 ✓。
+ * **预校准** ✓ —— 记住"臂体初态"的六路位移 ✓，之后一键回到该姿态 ✓。
  *
- * 为什么需要 ✗：`0x11` 的"归零"是**电机自己的零点** ✓，和设备机械上的"伸直"
+ * 为什么需要 ✗：`0x11` 的"归零"是**电机自己的零点** ✓，和设备机械上的"初态"
  * 不一定是同一个位置 ✓（装配、丝长、预紧都会让它偏几毫米 ✓）。
- * 所以操作员要的是"回到我上次确认过伸直的那个位置"✓，而不是回到电机零点 ✓。
+ * 所以操作员要的是"回到我上次确认过的初态"✓，而不是回到电机零点 ✓。
+ *
+ * 初态**只记录一次** ✓：记录后锁定 ✓，重新记录必须经过确认 ✓（见界面）。
  *
  * 存哪儿 ✗：`localStorage` 只在本浏览器有效 ✓ → 换台电脑就没了 ✗。
  * 这里用后端共享存储（`ui-prefs` 命名空间 ✓），手机 / 电脑看到的是同一份 ✓。
@@ -83,8 +85,19 @@ export function savePrecalibration(values: number[], note?: string): Precalibrat
   return entry;
 }
 
-/** **清空预校准** ✓ */
-export function clearPrecalibration() {
+/**
+ * 记录时间 → **本地**可读字符串 ✓。
+ *
+ * `recordedAt` 存的是 `toISOString()`（UTC，带 Z）✓ —— 直接 `slice(0,19)` 显示会少 8 小时 ✗
+ * （现场表现：23:43 记录的，界面显示 15:43 ✗）。
+ */
+export function formatRecordedAt(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+/** **清空预校准** ✓ */export function clearPrecalibration() {
   writeLocal(null);
   void (async () => {
     try {

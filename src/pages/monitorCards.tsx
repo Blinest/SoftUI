@@ -44,8 +44,14 @@ function usePlaybackTargets(enabled: boolean): number[] | null {
       if (next) pushTargetHistory(next);   // 曲线页要用历史 ✓
 
       if (!next) {
-        const override = getPreviewOverride();
-        if (!override) setTargets((prev) => (prev ? null : prev));
+        /**
+         * **播放结束就交还给 `commandedTargets`** ✓ ——
+         * 之前这里还看 `previewOverride`：动作组播完后 3D 会**故意保留**最后一帧 ✗，
+         * 于是目标列永远停在播放值 ✓ → 之后点预校准 / 一键归零，
+         * 指令发了、目标列却不动 ✗（本 bug ✓）。
+         * override 只服务 3D 形位，不能拿来决定"目标值是否显示" ✗。
+         */
+        setTargets((prev) => (prev ? null : prev));
         return;
       }
       setTargets((prev) =>
@@ -187,8 +193,15 @@ export const monitorCardRegistry: Record<string, MonitorCardDefinition> = {
       const shown = playback ?? commandedTargets;
       return motors.length > 0 ? (
       <div className="monitor-summary-grid">
-        {motors.map((motor) => (
-          <div className="monitor-motor-summary-cell" key={motor.id}>
+        {motors.map((motor) => {
+          const target = shown?.[motor.id - 1];
+          const gap = target != null && Number.isFinite(target)
+            ? Math.abs(target - motor.positionMm)
+            : null;
+          // 停住且差 >1mm = "未到位"，格子描红并在下面写清差多少（与顶层提醒同一条判据）
+          const mismatched = gap != null && gap > 1.0 && Math.abs(motor.velocityMmPerSec) <= 0.2;
+          return (
+          <div className={`monitor-motor-summary-cell${mismatched ? " is-mismatch" : ""}`} key={motor.id}>
             <div className="monitor-motor-summary-head">
               <span>电机 {motor.id}</span>
               <i className={`monitor-motor-status-lamp${motor.running ? " is-running" : ""}`} aria-hidden="true" />
@@ -202,9 +215,13 @@ export const monitorCardRegistry: Record<string, MonitorCardDefinition> = {
                 : "--"}
               {playback ? " ▶" : ""}
             </span>
+            {mismatched ? (
+              <small className="monitor-value-mismatch">差 {gap!.toFixed(2)} mm（未到位）</small>
+            ) : null}
             <small>{motor.velocityMmPerSec.toFixed(1)} mm/s</small>
           </div>
-        ))}
+          );
+        })}
       </div>
       ) : (
         <div className="feature-empty-compact">当前设备没有电机数据</div>
