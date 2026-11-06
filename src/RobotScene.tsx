@@ -4,6 +4,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { BackboneOutput } from "./dynamics/svcModel";
 import { dampBackbone, updateBoneChainFromBackbone } from "./robot/kinematics";
+import { getPreviewOverride } from "./robot/previewOverride";
 import { createCableVisuals } from "./robot/cables";
 import { createSlottedSkinnedArm } from "./robot/skinnedArm";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
@@ -398,7 +399,22 @@ export default function RobotScene({
       lastTime = now;
 
       const p = propsRef.current;
-      smoothedBackbone = dampBackbone(smoothedBackbone, p.backbone, 0.2, dt);
+      /**
+       * **和控制页同源** ✓ —— 控制页拖动 / 播放时写的是 `previewOverride` ✓，
+       * 那里**不改设备数据帧** ✗ → 监控页若只读 `props.backbone`（快照派生 ✓），
+       * 表现就是"控制页在动、监控页不动"✗（本问题 ✓）。
+       *
+       * 这里每帧直接读注入 ✓：有注入就跟注入 ✓（阻尼收紧到 0.08，跟得更紧 ✓），
+       * 没有注入再回落到快照派生的实际形状 ✓（阻尼 0.2，和原来一致 ✓）。
+       * 走渲染循环而不是 props ✗ —— 避免 10Hz setState 触发场景重建 ✓。
+       */
+      const injected = getPreviewOverride();
+      smoothedBackbone = dampBackbone(
+        smoothedBackbone,
+        injected ?? p.backbone,
+        injected ? 0.08 : 0.2,
+        dt,
+      );
       updateBoneChainFromBackbone(arm.bones, lengthMm, smoothedBackbone);
       cables.updateBackbone(smoothedBackbone, 6.45, true);
 
